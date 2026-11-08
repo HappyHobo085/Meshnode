@@ -1,0 +1,6 @@
+spikes/**/target/
+spikes/**/build/
+spikes/**/.gradle/
+spikes/**/jniLibs/
+spikes/**/out/
+local.properties

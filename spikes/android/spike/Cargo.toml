@@ -1,0 +1,27 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+hyper = "1"
+iroh = "1.4"
+tokio = { version = "1.54.1", features = ["full"] }
+wasmtime = { version = "50", features = ["pulley"] }
+wasmtime-wasi = "50"
+wasmtime-wasi-http = "50"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[lib]
+name = "spike"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "spike"
+path = "src/bin.rs"

@@ -625,9 +625,9 @@ impl<W: WallClock> Store<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redb::ReadableDatabase;
     use ed25519_dalek::SigningKey;
     use mesh_hlc::{Hlc, ManualClock};
+    use redb::ReadableDatabase;
 
     struct All;
     impl Acceptor for All {

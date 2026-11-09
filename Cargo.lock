@@ -383,6 +383,7 @@ dependencies = [
  "ed25519-dalek",
  "mesh-hlc",
  "mesh-proto",
+ "mesh-store",
  "postcard",
  "proptest",
  "redb",

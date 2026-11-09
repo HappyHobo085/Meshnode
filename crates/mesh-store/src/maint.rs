@@ -358,10 +358,12 @@ impl<W: WallClock> Store<W> {
     /// `removed` is kept so the catch-up that follows still stores ops above a removal
     /// cutoff as invalid. Publishes nothing.
     ///
-    /// **Contract:** callers must not issue local writes between `reset_to_empty` and
-    /// the end of re-applying the items from [`Store::export_unsynced_local_ops`]. A local
-    /// write in between sets `vv[self]` past seqs this store no longer holds, so
-    /// `diff_since` would report the unsynced ops as `Covered` and peers would skip them.
+    /// Local writes are refused with [`StoreError::Rebootstrapping`] from here until
+    /// `vv[self]` is back at `next_seq - 1` (Ruling R18, enforcing the R10 contract): the
+    /// catch-up from the peers plus re-applying the items from
+    /// [`Store::export_unsynced_local_ops`] restore it. A local write in between would set
+    /// `vv[self]` past seqs this store no longer holds, so `diff_since` would report the
+    /// unsynced ops as `Covered` and peers would skip them.
     pub fn reset_to_empty(&self) -> Result<(), StoreError> {
         let _clock = self.lock_clock();
         let tx = self.db.begin_write()?;

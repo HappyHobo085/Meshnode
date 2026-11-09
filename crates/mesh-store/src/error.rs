@@ -17,6 +17,11 @@ pub enum StoreError {
     /// The store file belongs to a different mesh.
     #[error("store belongs to a different mesh")]
     WrongMesh,
+    /// A local write was refused because this node's own ops are not all back yet
+    /// (`vv[self] != next_seq - 1`, e.g. after `reset_to_empty` until the catch-up and the
+    /// re-applied export restore them; Ruling R18). Retry after re-bootstrap completes.
+    #[error("store is re-bootstrapping: local writes wait until this node's own ops are restored")]
+    Rebootstrapping,
     #[error(transparent)]
     Proto(#[from] ProtoError),
 }

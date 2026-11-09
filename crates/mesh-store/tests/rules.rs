@@ -764,6 +764,48 @@ fn echoed_own_ops_raise_next_seq() {
 }
 
 #[test]
+fn own_op_parked_in_pending_is_never_reused() {
+    // Same node key, fresh DB: a peer echoes our seq 1, written when our clock was ahead.
+    let (dir, clock) = setup();
+    let old_dir = tempfile::tempdir().unwrap();
+    let old_clock = ManualClock::new(T0 + DAY_MS);
+    let old = store(old_dir.path(), 1, &old_clock);
+    let echoed = old.set("s", "k", b"old").unwrap();
+    let s = store(dir.path(), 1, &clock);
+    assert_eq!(
+        s.apply(echoed, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Skew)
+    );
+    // Seq 1 is held in pending: a local write must not reuse it.
+    match s.set("s", "k", b"new") {
+        Ok(op) => panic!("local write reused or skipped past a pending own seq: {op:?}"),
+        Err(StoreError::Rebootstrapping) => {}
+        Err(e) => panic!("unexpected error {e}"),
+    }
+    clock.set(T0 + DAY_MS);
+    assert_eq!(s.retry_pending(&AcceptAll).unwrap(), 1);
+    assert_eq!(s.set("s", "k", b"new").unwrap().body.seq, 2);
+}
+
+#[test]
+fn clock_floor_ahead_is_reported() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    assert_eq!(s.clock_floor_ahead_ms(), None);
+    s.set("s", "k", b"1").unwrap();
+    // The wall clock goes back; the HLC floor stays.
+    clock.set(T0 - mesh_hlc::MAX_SKEW_MS);
+    assert_eq!(s.clock_floor_ahead_ms(), None);
+    clock.set(T0 - mesh_hlc::MAX_SKEW_MS - 1);
+    assert_eq!(s.clock_floor_ahead_ms(), Some(mesh_hlc::MAX_SKEW_MS + 1));
+    // Also after a reopen (the floor is persisted).
+    drop(s);
+    clock.set(T0 - DAY_MS);
+    let s = store(dir.path(), 1, &clock);
+    assert_eq!(s.clock_floor_ahead_ms(), Some(DAY_MS));
+}
+
+#[test]
 fn concurrent_writes_converge_in_any_order() {
     let (dir, clock) = setup();
     let a = store(dir.path(), 1, &clock);
@@ -1326,6 +1368,13 @@ fn reset_keeps_seq() {
     );
     assert_eq!(a.last_full_sync_ms().unwrap(), None);
     assert!(!a.is_stale().unwrap());
+    // Re-bootstrapping: own seqs 1..=3 are not back yet (R18).
+    assert!(matches!(
+        a.set("s", "k", b"again"),
+        Err(StoreError::Rebootstrapping)
+    ));
+    // The catch-up brings them back (here: a peer reports them covered).
+    a.apply_covered(a.node_id(), 3, 3, &AcceptAll).unwrap();
     let next = a.set("s", "k", b"again").unwrap();
     assert_eq!(next.body.seq, 4);
     assert!(next.body.hlc > last.body.hlc);
@@ -1333,6 +1382,37 @@ fn reset_keeps_seq() {
     drop(a);
     let a = store(dir.path(), 1, &clock);
     assert_eq!(a.set("s", "k", b"x").unwrap().body.seq, 5);
+}
+
+#[test]
+fn local_write_refused_until_exported_ops_are_reapplied() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"1").unwrap();
+    a.set("s", "j", b"2").unwrap();
+    let items = a.export_unsynced_local_ops().unwrap();
+    a.reset_to_empty().unwrap();
+    assert!(matches!(
+        a.set("s", "k", b"x"),
+        Err(StoreError::Rebootstrapping)
+    ));
+    assert!(matches!(
+        a.delete("s", "k"),
+        Err(StoreError::Rebootstrapping)
+    ));
+    assert!(matches!(
+        a.set_add("s", "m", b"x"),
+        Err(StoreError::Rebootstrapping)
+    ));
+    assert!(matches!(
+        a.purge_namespace("s"),
+        Ok(ops) if ops.is_empty()
+    ));
+    reapply(&a, items);
+    assert_eq!(a.set("s", "k", b"3").unwrap().body.seq, 3);
+    assert_eq!(a.get("s", "j").unwrap(), Some(b"2".to_vec()));
+    // Purge works again too.
+    assert_eq!(a.purge_namespace("s").unwrap().len(), 2);
 }
 
 #[test]
@@ -1604,7 +1684,7 @@ fn removal_retracts_and_restores_older_value() {
 }
 
 #[test]
-fn ops_above_cutoff_arriving_later_are_ignored_but_covered() {
+fn invalid_op_counts_as_covered() {
     let (dir, clock) = setup();
     let x = store(dir.path(), 1, &clock);
     let b = store(dir.path(), 2, &clock);

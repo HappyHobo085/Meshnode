@@ -204,7 +204,9 @@ impl<W: WallClock> Store<W> {
         meta_u64(&m, meta::SYNCED_SELF_SEQ)
     }
 
-    /// Test hook simulating compaction: deletes only the `ops` row of `(origin, seq)`.
+    /// Test hook simulating compaction: deletes only the `ops` row of `(origin, seq)`
+    /// (`test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn __test_drop_op(&self, origin: NodeId, seq: u64) -> Result<(), StoreError> {
         let _clock = self.lock_clock();

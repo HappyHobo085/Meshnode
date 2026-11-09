@@ -1,8 +1,8 @@
 //! Local writes: build, sign, merge and record an op in one transaction.
 
-use crate::apply::change_for;
+use crate::apply::{change_for, vv_get};
 use crate::error::StoreError;
-use crate::tables::{self, META, OPS, OpRow, VV, meta};
+use crate::tables::{self, META, OPS, OpRow, PENDING, VV, meta};
 use crate::{Store, keys, merge, meta_u64_req};
 use mesh_hlc::{Hlc, WallClock};
 use mesh_proto::{OpBody, Payload, SignedOp};
@@ -48,6 +48,11 @@ impl<W: WallClock> Store<W> {
     /// write transaction: reads `next_seq`, ticks the clock, signs, merges, inserts into
     /// `ops`, sets `vv[self] = seq`, and advances `next_seq` / `last_hlc`. After commit,
     /// publishes a local `Change` if the merge changed a row.
+    ///
+    /// Refused with [`StoreError::Rebootstrapping`] while `vv[self] != next_seq - 1`
+    /// (Ruling R18): some of this node's own seqs are not held contiguously (after
+    /// `reset_to_empty`, or with an echoed own op waiting in `pending`), and writing now
+    /// would set `vv[self]` past them, so peers would skip them as covered.
     fn local_write(&self, payload: Payload) -> Result<SignedOp, StoreError> {
         let mut body = OpBody {
             mesh: self.mesh,
@@ -64,12 +69,15 @@ impl<W: WallClock> Store<W> {
             let m = tx.open_table(META)?;
             meta_u64_req(&m, meta::NEXT_SEQ)?
         };
-        // Never overwrite an existing own op (would be equivocation). Unreachable while
-        // apply raises `next_seq` for echoed own ops; kept as a guard.
-        if tx
-            .open_table(OPS)?
-            .get(keys::op_key(&self.node, seq).as_slice())?
-            .is_some()
+        if vv_get(&tx, &self.node)?.checked_add(1) != Some(seq) {
+            return Err(StoreError::Rebootstrapping);
+        }
+        // Never reuse a seq held in `ops` or `pending` (would be equivocation).
+        // Unreachable while apply raises `next_seq` for echoed own ops (stored or
+        // pending); kept as a guard.
+        let k = keys::op_key(&self.node, seq);
+        if tx.open_table(OPS)?.get(k.as_slice())?.is_some()
+            || tx.open_table(PENDING)?.get(k.as_slice())?.is_some()
         {
             return Err(StoreError::corrupt(
                 "meta",

@@ -155,6 +155,18 @@ impl<W: WallClock> Store<W> {
         self.mesh
     }
 
+    /// How far this node's HLC floor (the highest HLC it has issued or observed, persisted
+    /// across restarts) is ahead of its wall clock, if by more than `MAX_SKEW_MS`; `None`
+    /// otherwise. A `Some` means the wall clock was set back (or was far ahead earlier):
+    /// local writes keep working but carry HLCs ahead of real time, and peers defer them as
+    /// skewed until their clocks catch up. The UI should warn the user.
+    pub fn clock_floor_ahead_ms(&self) -> Option<u64> {
+        let clock = self.lock_clock();
+        let floor = clock.last().ms();
+        let wall = clock.wall().now_ms();
+        (floor > wall.saturating_add(mesh_hlc::MAX_SKEW_MS)).then(|| floor - wall)
+    }
+
     /// Locks the clock; held for every write transaction (local writes, apply, retry).
     /// A poisoned lock is recovered: the clock holds no invariant a panic could break
     /// (it only ever moves forward).

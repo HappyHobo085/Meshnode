@@ -14,7 +14,7 @@ use crate::tables::{
 use crate::{Store, keys, merge, meta_u64_req, read};
 use mesh_hlc::{Clock, WallClock};
 use mesh_proto::{MeshId, NodeId, OpBody, Payload, SignedOp};
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, WriteTransaction};
+use redb::{ReadableTable, WriteTransaction};
 
 /// Pending ops older than this (by `first_seen_ms`) are dropped by `retry_pending`.
 pub const PENDING_TTL_MS: u64 = 86_400_000;
@@ -377,6 +377,12 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
     /// the same transaction so a later local write never reuses its seq.
     fn record(&mut self, op: &SignedOp, invalid: bool) -> Result<(), StoreError> {
         insert_op(self.tx, op, self.now_ms, invalid)?;
+        self.raise_next_seq(op)
+    }
+
+    /// If `op` is one of this node's own ops at or above `next_seq`, raises `next_seq`
+    /// past it, so a later local write never reuses its seq.
+    fn raise_next_seq(&mut self, op: &SignedOp) -> Result<(), StoreError> {
         if op.body.origin == self.node {
             let mut m = self.tx.open_table(META)?;
             if op.body.seq >= meta_u64_req(&m, meta::NEXT_SEQ)? {
@@ -391,12 +397,14 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         Ok(())
     }
 
+    /// Stores `op` in `pending`. An own op held there also raises `next_seq` past it.
     fn defer(
         &mut self,
         op: SignedOp,
         reason: DeferReason,
         first_seen_ms: u64,
     ) -> Result<Outcome, StoreError> {
+        self.raise_next_seq(&op)?;
         let k = keys::op_key(&op.body.origin, op.body.seq);
         let row = PendingRow {
             op,
@@ -591,9 +599,11 @@ impl<W: WallClock> Store<W> {
         }
     }
 
-    /// `vv[origin]` (0 if absent). Test helper until `version_vector()` exists.
+    /// `vv[origin]` (0 if absent). Test helper (`test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn vv_of(&self, origin: NodeId) -> Result<u64, StoreError> {
+        use redb::ReadableDatabase;
         let tx = self.db.begin_read()?;
         let vv = tx.open_table(VV)?;
         match vv.get(keys::origin_key(&origin).as_slice())? {
@@ -602,9 +612,11 @@ impl<W: WallClock> Store<W> {
         }
     }
 
-    /// Number of `pending` entries. Test helper.
+    /// Number of `pending` entries. Test helper (`test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn pending_len(&self) -> Result<u64, StoreError> {
+        use redb::{ReadableDatabase, ReadableTableMetadata};
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(PENDING)?.len()?)
     }
@@ -613,6 +625,7 @@ impl<W: WallClock> Store<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use ed25519_dalek::SigningKey;
     use mesh_hlc::{Hlc, ManualClock};
 

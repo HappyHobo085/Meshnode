@@ -41,10 +41,10 @@ pub enum KvError {
     Other(String),
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub use mem::MemKv;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 mod mem {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ops::Bound;
@@ -60,6 +60,8 @@ mod mem {
 
     #[derive(Default)]
     struct Inner {
+        fail: Option<KvError>,
+        max_value_len: Option<usize>,
         registers: BTreeMap<String, Register>,
         sets: BTreeMap<String, BTreeSet<Vec<u8>>>,
     }
@@ -74,15 +76,45 @@ mod mem {
         fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
             f(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()))
         }
+
+        /// Makes every following call return `err` (`None` restores normal service).
+        pub fn fail_with(&self, err: Option<KvError>) {
+            self.with(|i| i.fail = err);
+        }
+
+        /// Makes writes of values longer than `len` bytes return [`KvError::Other`].
+        pub fn set_max_value_len(&self, len: Option<usize>) {
+            self.with(|i| i.max_value_len = len);
+        }
+
+        /// The injected failure, if any.
+        fn check(&self) -> Result<(), KvError> {
+            self.with(|i| i.fail.clone()).map_or(Ok(()), Err)
+        }
+
+        /// The injected failure or an oversized `value`.
+        fn check_write(&self, value: Option<&[u8]>) -> Result<(), KvError> {
+            self.check()?;
+            let max = self.with(|i| i.max_value_len);
+            match (max, value) {
+                (Some(max), Some(v)) if v.len() > max => Err(KvError::Other(format!(
+                    "value of {} bytes exceeds {max}",
+                    v.len()
+                ))),
+                _ => Ok(()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl KvBackend for MemKv {
         async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+            self.check()?;
             Ok(self.with(|i| i.registers.get(key).and_then(|r| r.value.clone())))
         }
 
         async fn set(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+            self.check_write(Some(&value))?;
             let reg = Register {
                 order: None,
                 value: Some(value),
@@ -97,6 +129,7 @@ mod mem {
             order: Vec<u8>,
             value: Option<Vec<u8>>,
         ) -> Result<(), KvError> {
+            self.check_write(value.as_deref())?;
             self.with(|i| {
                 // A later write with an equal order wins, as a later HLC would.
                 let loses = i
@@ -116,6 +149,7 @@ mod mem {
         }
 
         async fn delete(&self, key: &str) -> Result<(), KvError> {
+            self.check()?;
             self.with(|i| {
                 if let Some(r) = i.registers.get_mut(key) {
                     r.value = None;
@@ -130,6 +164,7 @@ mod mem {
             start_after: Option<&str>,
             limit: u32,
         ) -> Result<Vec<String>, KvError> {
+            self.check()?;
             let lower = match start_after {
                 Some(after) => Bound::Excluded(after.to_string()),
                 None => Bound::Unbounded,
@@ -145,11 +180,13 @@ mod mem {
         }
 
         async fn set_add(&self, set: &str, member: Vec<u8>) -> Result<(), KvError> {
+            self.check_write(Some(&member))?;
             self.with(|i| i.sets.entry(set.to_string()).or_default().insert(member));
             Ok(())
         }
 
         async fn set_contains(&self, set: &str, member: &[u8]) -> Result<bool, KvError> {
+            self.check()?;
             Ok(self.with(|i| i.sets.get(set).is_some_and(|s| s.contains(member))))
         }
 
@@ -159,6 +196,7 @@ mod mem {
             start_after: Option<&[u8]>,
             limit: u32,
         ) -> Result<Vec<Vec<u8>>, KvError> {
+            self.check()?;
             let lower = match start_after {
                 Some(after) => Bound::Excluded(after.to_vec()),
                 None => Bound::Unbounded,
@@ -175,7 +213,7 @@ mod mem {
     }
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(test)]
 mod tests {
     use super::{KvBackend, MemKv};
 

@@ -27,3 +27,4 @@ mesh-runtime = { path = ".", features = ["test-hooks"] }
 tokio.workspace = true
 http.workspace = true
 bytes.workspace = true
+wat.workspace = true

@@ -84,8 +84,24 @@ async fn garbage_rejected_at_load() {
 #[tokio::test(flavor = "multi_thread")]
 async fn component_without_handler_rejected_at_load() {
     let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-    match rt.load([5; 32], b"(component)").await {
+    match rt
+        .load([5; 32], &wat::parse_str("(component)").unwrap())
+        .await
+    {
         Err(RuntimeError::Invalid(msg)) => assert!(msg.contains("incoming-handler"), "{msg}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn component_importing_sockets_rejected_at_load() {
+    let rt = Runtime::new(RuntimeConfig::default()).unwrap();
+    let wasm = wat::parse_str(
+        r#"(component (import "wasi:sockets/tcp@0.2.12" (instance (export "f" (func)))))"#,
+    )
+    .unwrap();
+    match rt.load([6; 32], &wasm).await {
+        Err(RuntimeError::Invalid(msg)) => assert!(msg.contains("wasi:sockets"), "{msg}"),
         other => panic!("expected Invalid, got {other:?}"),
     }
 }

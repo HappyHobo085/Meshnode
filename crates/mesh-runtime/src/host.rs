@@ -3,6 +3,11 @@
 //! The linker holds exactly the world's imports, so a component importing anything else
 //! (filesystem, sockets, unknown interfaces) fails `instantiate_pre` and is rejected at load.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+
+use http::StatusCode;
+use mesh_proto::NodeId;
 use wasmtime::Engine;
 use wasmtime::component::{HasData, HasSelf, Linker, ResourceTable};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView};
@@ -13,7 +18,7 @@ use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::RuntimeError;
+use crate::{KvBackend, KvError, RuntimeError};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -35,12 +40,31 @@ pub(crate) struct State {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
+    kv: Arc<dyn KvBackend>,
+    node_id: NodeId,
+    kv_status: KvStatus,
+}
+
+/// The HTTP status of a backend error that trapped the guest; 0 while there was none.
+/// Shared so `serve` can read it after the store has moved into the guest task.
+#[derive(Clone, Default)]
+pub(crate) struct KvStatus(Arc<AtomicU16>);
+
+impl KvStatus {
+    pub(crate) fn get(&self) -> Option<StatusCode> {
+        StatusCode::from_u16(self.0.load(Ordering::Relaxed)).ok()
+    }
 }
 
 impl State {
     /// No preopens, no environment, no arguments, stdin closed, stdout and stderr to
     /// [`guest_output`].
-    pub(crate) fn new(service: &str) -> Self {
+    pub(crate) fn new(
+        service: &str,
+        kv: Arc<dyn KvBackend>,
+        node_id: NodeId,
+        kv_status: KvStatus,
+    ) -> Self {
         let wasi = WasiCtx::builder()
             .stdout(guest_output(service, Stream::Stdout))
             .stderr(guest_output(service, Stream::Stderr))
@@ -49,6 +73,9 @@ impl State {
             wasi,
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
+            kv,
+            node_id,
+            kv_status,
         }
     }
 }
@@ -124,52 +151,85 @@ fn link_world(l: &mut Linker<State>) -> wasmtime::Result<()> {
     Ok(())
 }
 
-/// `meshnode:kv/store` placeholder: every call traps until the KV binding is wired.
-fn kv_unavailable<T>() -> wasmtime::Result<T> {
-    Err(wasmtime::format_err!("meshnode:kv/store is not available"))
+/// The most list entries one `list-keys` / `set-members` call returns.
+const MAX_LIST: u32 = 1000;
+
+/// Records the HTTP status for a backend error and turns it into a guest trap.
+fn kv_trap(status: &KvStatus, err: KvError) -> wasmtime::Error {
+    let code = match &err {
+        KvError::Full => StatusCode::INSUFFICIENT_STORAGE,
+        KvError::Removed | KvError::Rebootstrapping => StatusCode::SERVICE_UNAVAILABLE,
+        KvError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    status.0.store(code.as_u16(), Ordering::Relaxed);
+    wasmtime::format_err!("meshnode:kv/store: {err}")
 }
 
 impl store::Host for State {
-    async fn get(&mut self, _key: String) -> wasmtime::Result<Option<Vec<u8>>> {
-        kv_unavailable()
+    async fn get(&mut self, key: String) -> wasmtime::Result<Option<Vec<u8>>> {
+        self.kv
+            .get(&key)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
-    async fn set(&mut self, _key: String, _value: Vec<u8>) -> wasmtime::Result<()> {
-        kv_unavailable()
+    async fn set(&mut self, key: String, value: Vec<u8>) -> wasmtime::Result<()> {
+        self.kv
+            .set(&key, value)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
     async fn set_ordered(
         &mut self,
-        _key: String,
-        _order: Vec<u8>,
-        _value: Option<Vec<u8>>,
+        key: String,
+        order: Vec<u8>,
+        value: Option<Vec<u8>>,
     ) -> wasmtime::Result<()> {
-        kv_unavailable()
+        self.kv
+            .set_ordered(&key, order, value)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
-    async fn delete(&mut self, _key: String) -> wasmtime::Result<()> {
-        kv_unavailable()
+    async fn delete(&mut self, key: String) -> wasmtime::Result<()> {
+        self.kv
+            .delete(&key)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
     async fn list_keys(
         &mut self,
-        _prefix: String,
-        _start_after: Option<String>,
-        _limit: u32,
+        prefix: String,
+        start_after: Option<String>,
+        limit: u32,
     ) -> wasmtime::Result<Vec<String>> {
-        kv_unavailable()
+        self.kv
+            .list_keys(&prefix, start_after.as_deref(), limit.min(MAX_LIST))
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
-    async fn set_add(&mut self, _set: String, _member: Vec<u8>) -> wasmtime::Result<()> {
-        kv_unavailable()
+    async fn set_add(&mut self, set: String, member: Vec<u8>) -> wasmtime::Result<()> {
+        self.kv
+            .set_add(&set, member)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
-    async fn set_contains(&mut self, _set: String, _member: Vec<u8>) -> wasmtime::Result<bool> {
-        kv_unavailable()
+    async fn set_contains(&mut self, set: String, member: Vec<u8>) -> wasmtime::Result<bool> {
+        self.kv
+            .set_contains(&set, &member)
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
     async fn set_members(
         &mut self,
-        _set: String,
-        _start_after: Option<Vec<u8>>,
-        _limit: u32,
+        set: String,
+        start_after: Option<Vec<u8>>,
+        limit: u32,
     ) -> wasmtime::Result<Vec<Vec<u8>>> {
-        kv_unavailable()
+        self.kv
+            .set_members(&set, start_after.as_deref(), limit.min(MAX_LIST))
+            .await
+            .map_err(|e| kv_trap(&self.kv_status, e))
     }
     async fn node_id(&mut self) -> wasmtime::Result<Vec<u8>> {
-        kv_unavailable()
+        Ok(self.node_id.0.to_vec())
     }
 }

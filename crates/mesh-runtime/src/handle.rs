@@ -10,7 +10,7 @@ use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 
 use crate::RequestCtx;
 use crate::engine::EPOCH_TICK;
-use crate::host::State;
+use crate::host::{KvStatus, State};
 
 /// Placeholder deadline, one hour in epoch ticks, so requests run until per-request
 /// timeouts are wired from `Limits::request_timeout_ms`.
@@ -24,7 +24,9 @@ pub(crate) async fn serve(
     ctx: RequestCtx,
 ) -> Response<Bytes> {
     let service = ctx.service;
-    let mut store = Store::new(pre.engine(), State::new(&service));
+    let kv_status = KvStatus::default();
+    let state = State::new(&service, ctx.kv, ctx.node_id, kv_status.clone());
+    let mut store = Store::new(pre.engine(), state);
     store.set_epoch_deadline(PROVISIONAL_DEADLINE_TICKS);
 
     let scheme = match req.uri().scheme_str() {
@@ -57,7 +59,7 @@ pub(crate) async fn serve(
         Ok(Err(code)) => return failed(&service, "guest returned an error", &code),
         Err(_) => {
             return match (&mut guest.0).await {
-                Ok(Err(e)) => failed(&service, "guest trapped", &e),
+                Ok(Err(e)) => trapped(&service, &kv_status, &e),
                 Ok(Ok(())) => failed(&service, "guest set no response", &""),
                 Err(e) => failed(&service, "guest task", &e),
             };
@@ -70,7 +72,7 @@ pub(crate) async fn serve(
     };
     match (&mut guest.0).await {
         Ok(Ok(())) => Response::from_parts(parts, body),
-        Ok(Err(e)) => failed(&service, "guest trapped", &e),
+        Ok(Err(e)) => trapped(&service, &kv_status, &e),
         Err(e) => failed(&service, "guest task", &e),
     }
 }
@@ -84,6 +86,17 @@ fn with_authority(mut req: Request<Bytes>, service: &str) -> Request<Bytes> {
         req.headers_mut().insert(header::HOST, host);
     }
     req
+}
+
+/// A guest trap: the status of the KV error that caused it, else `500`.
+fn trapped(service: &str, kv_status: &KvStatus, err: &dyn std::fmt::Debug) -> Response<Bytes> {
+    match kv_status.get() {
+        Some(code) => {
+            tracing::warn!(service, "guest trapped on a KV error: {err:?}");
+            status(code)
+        }
+        None => failed(service, "guest trapped", err),
+    }
 }
 
 fn failed(service: &str, what: &str, err: &dyn std::fmt::Debug) -> Response<Bytes> {

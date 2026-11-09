@@ -18,7 +18,7 @@ use wasmtime::component::{Component, Linker};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 
 pub use error::RuntimeError;
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub use kv::MemKv;
 pub use kv::{KvBackend, KvError};
 
@@ -107,7 +107,7 @@ impl Runtime {
     pub async fn load(&self, hash: [u8; 32], wasm: &[u8]) -> Result<Loaded, RuntimeError> {
         let engine = self.engine.clone();
         let wasm = wasm.to_vec();
-        let component = tokio::task::spawn_blocking(move || Component::new(&engine, wasm))
+        let component = tokio::task::spawn_blocking(move || Component::from_binary(&engine, &wasm))
             .await
             .map_err(|e| RuntimeError::Compile(format!("compile task: {e}")))?
             .map_err(|e| RuntimeError::Compile(format!("{e:#}")))?;

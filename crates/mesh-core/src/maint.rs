@@ -8,7 +8,6 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, warn};
 
 use crate::error::NodeError;
-use crate::events::NodeEvent;
 use crate::node::{Inner, NodeStatus, join_err, lock};
 
 /// Scheduled maintenance jobs (spec §9). `Node::maint_now` runs one at once.
@@ -78,20 +77,5 @@ pub(crate) async fn run(inner: std::sync::Arc<Inner>) {
         if let Err(e) = run_job(&inner, job).await {
             warn!(?job, error = %e, "maintenance job failed");
         }
-        if job == MaintJob::RetryPending {
-            announce_clock_floor(&inner).await;
-        }
-    }
-}
-
-/// Re-announces `ClockFloorAhead` while the store's floor stays ahead of the wall clock
-/// (the open-time event is easily missed: nobody can subscribe before `open` returns).
-async fn announce_clock_floor(inner: &Inner) {
-    match inner.store.call(|s| Ok(s.clock_floor_ahead_ms())).await {
-        Ok(Some(ms)) => {
-            let _ = inner.events.send(NodeEvent::ClockFloorAhead { ms });
-        }
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "could not read the HLC floor"),
     }
 }

@@ -4,9 +4,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{T, test_cfg, wait_event, wait_until};
-use mesh_core::{MaintJob, Node, NodeEvent};
-use mesh_hlc::WallClock;
+use common::{T, test_cfg, wait_until};
+use mesh_core::{MaintJob, Node};
 use mesh_proto::{Role, VersionVector};
 use mesh_store::SyncItem;
 
@@ -65,7 +64,6 @@ async fn prune_invites_job() {
     assert_eq!(rows(), 1, "unexpired invite is kept");
 
     clock.advance(120_000);
-    assert!(clock.now_ms() > 0);
     a.maint_now(MaintJob::PruneInvites).await.unwrap();
     assert_eq!(rows(), 0, "expired unredeemed invite is gone");
     a.shutdown().await;
@@ -81,20 +79,9 @@ async fn clock_floor_ahead_event() {
     a.shutdown().await;
 
     // Reopened with the wall clock back where it was: the stored floor is 10 min ahead.
-    // The node announces this at open and again on each retry tick while it holds.
-    let (mut cfg, _clock) = test_cfg(d.path(), "a");
-    cfg.timings.retry_pending = Duration::from_millis(100);
+    let (cfg, _clock) = test_cfg(d.path(), "a");
     let a = Node::open(cfg).await.unwrap();
-    let mut rx = a.subscribe();
-    let ev = wait_event(
-        &mut rx,
-        |e| matches!(e, NodeEvent::ClockFloorAhead { .. }),
-        T,
-    )
-    .await;
-    let NodeEvent::ClockFloorAhead { ms } = ev else {
-        unreachable!()
-    };
+    let ms = a.clock_floor_ahead_ms().await.expect("floor is ahead");
     assert!(ms >= TEN_MIN_MS - 5_000, "ms = {ms}");
     a.shutdown().await;
 }

@@ -488,6 +488,18 @@ impl Node {
         *self.inner.first_sync.borrow()
     }
 
+    /// By how many ms the store's HLC floor is ahead of the wall clock beyond the allowed
+    /// skew, read live (the state behind `NodeEvent::ClockFloorAhead`, which is emitted
+    /// once at open and so is easily missed).
+    pub async fn clock_floor_ahead_ms(&self) -> Option<u64> {
+        self.inner
+            .store
+            .call(|s| Ok(s.clock_floor_ahead_ms()))
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Waits until [`Node::first_sync_complete`] holds; false if `limit` passes first.
     pub async fn wait_first_sync(&self, limit: Duration) -> bool {
         let mut rx = self.inner.first_sync.subscribe();

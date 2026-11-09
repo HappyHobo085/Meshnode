@@ -78,7 +78,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             file
         }
         None => {
-            if !inner.store.call(|s| s.is_stale()).await? {
+            if !inner.store.call_raw(|s| s.is_stale()).await? {
                 resume_serving(inner);
                 return Ok(());
             }
@@ -90,7 +90,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             // 2. `synced_self_seq` before the reset, which deletes it.
             let (s, last_seq, export) = inner
                 .store
-                .call(|st| {
+                .call_raw(|st| {
                     let s = st.synced_self_seq()?.unwrap_or(0);
                     let last_seq = st.next_seq()?.saturating_sub(1);
                     Ok((s, last_seq, st.export_unsynced_local_ops()?))
@@ -120,7 +120,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     // 3.
     let next = inner
         .store
-        .call(|st| {
+        .call_raw(|st| {
             st.reset_to_empty()?;
             st.next_seq()
         })
@@ -183,7 +183,10 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             _ = sleep(CHECK_EVERY) => {}
         }
         let acc = inner.acc.clone();
-        inner.store.call(move |st| st.retry_pending(&*acc)).await?;
+        inner
+            .store
+            .call_raw(move |st| st.retry_pending(&*acc))
+            .await?;
     }
 
     // 6. Own edits too old to re-apply (R19).
@@ -241,7 +244,7 @@ async fn reapply(
     let (acc, me) = (inner.acc.clone(), inner.me);
     inner
         .store
-        .call(move |st| {
+        .call_raw(move |st| {
             let mut ops = Vec::new();
             // The highest exported op seq seen so far.
             let mut highest = 0;
@@ -310,7 +313,7 @@ async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
     loop {
         let (have, member) = inner
             .store
-            .call(move |st| {
+            .call_raw(move |st| {
                 let member = me == founder
                     || [Role::Host, Role::Client]
                         .into_iter()

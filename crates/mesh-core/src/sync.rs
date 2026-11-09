@@ -105,8 +105,8 @@ impl SessionCtx {
         let metrics = Arc::new(PeerMetrics::default());
         let serve_paused = Arc::new(AtomicBool::new(false));
         let ctx = SessionCtx {
-            mesh: store.inner().mesh(),
-            me: store.inner().node_id(),
+            mesh: store.raw().mesh(),
+            me: store.raw().node_id(),
             store,
             acc,
             peer,
@@ -309,7 +309,7 @@ impl Session {
         &self,
         f: impl FnOnce(&crate::db::CoreStore) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, SessionEnd> {
-        self.ctx.store.call(f).await.map_err(store_end)
+        self.ctx.store.call_raw(f).await.map_err(store_end)
     }
 
     async fn update_lag(&self) -> Result<(), SessionEnd> {

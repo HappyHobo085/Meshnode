@@ -24,7 +24,7 @@ mod winfs;
 
 pub use blobs::{BlobHash, Blobs};
 pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
-pub use db::{CoreStore, StoreHandle};
+pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;
 pub use maint::MaintJob;

@@ -252,7 +252,7 @@ async fn late_join_gets_history() {
     let dd = tempfile::tempdir().unwrap();
     let a = Node::create_mesh(test_cfg(da.path(), "a").0).await.unwrap();
     a.store()
-        .call(|s| {
+        .call_unchecked(|s| {
             for i in 0..1000u32 {
                 let key = format!("k{}", i % 400);
                 if i % 7 == 6 {
@@ -301,7 +301,7 @@ async fn oversized_batch_closes_session() {
     let (a, b) = (&nodes[0], &nodes[1]);
     let (ia, ib) = (a.node_id(), b.node_id());
     b.store()
-        .call(|s| {
+        .call_unchecked(|s| {
             for i in 0..257u32 {
                 s.set(NS, &format!("b{i}"), &i.to_be_bytes())?;
             }

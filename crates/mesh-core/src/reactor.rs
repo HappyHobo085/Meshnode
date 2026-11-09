@@ -57,7 +57,7 @@ pub(crate) struct Reactor {
 impl Reactor {
     pub fn new(ctx: ReactorCtx) -> Reactor {
         Reactor {
-            rx: ctx.store.inner().subscribe(),
+            rx: ctx.store.raw().subscribe(),
             scanned: false,
             ctx,
             applied: HashMap::new(),
@@ -134,7 +134,7 @@ impl Reactor {
         let g = c.genesis.clone();
         let snap = c
             .store
-            .call(move |s| MembershipSnapshot::load(s, &g))
+            .call_raw(move |s| MembershipSnapshot::load(s, &g))
             .await?;
 
         // 2. Apply raised cutoffs.
@@ -143,7 +143,10 @@ impl Reactor {
                 continue;
             }
             let (origin, cutoff) = (*id, removal.cutoff);
-            let report = c.store.call(move |s| s.on_removal(origin, cutoff)).await?;
+            let report = c
+                .store
+                .call_raw(move |s| s.on_removal(origin, cutoff))
+                .await?;
             self.applied.insert(origin, cutoff);
             if !report.unrestorable_keys.is_empty() {
                 info!(
@@ -160,7 +163,7 @@ impl Reactor {
 
         // 3. Ops held back for an unknown origin may now be acceptable.
         let acc = c.acc.clone();
-        c.store.call(move |s| s.retry_pending(&*acc)).await?;
+        c.store.call_raw(move |s| s.retry_pending(&*acc)).await?;
 
         let snap = Arc::new(snap);
         // A removal record of this node is positive evidence even in a half-refilled
@@ -201,7 +204,7 @@ impl Reactor {
                 let me = c.me;
                 let seq = c
                     .store
-                    .call(move |s| Ok(s.version_vector()?.get(&me)))
+                    .call_raw(move |s| Ok(s.version_vector()?.get(&me)))
                     .await?;
                 c.signout.begin(seq);
             }

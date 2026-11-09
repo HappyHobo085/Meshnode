@@ -101,7 +101,7 @@ impl JoinInner {
     async fn snapshot(&self) -> Result<MembershipSnapshot, NodeError> {
         let g = self.genesis.clone();
         self.store
-            .call(move |s| MembershipSnapshot::load(s, &g))
+            .call_raw(move |s| MembershipSnapshot::load(s, &g))
             .await
     }
 
@@ -164,7 +164,7 @@ impl JoinInner {
         }
         let consumed = self
             .store
-            .call(move |s| s.set_contains(MESH_NS, CONSUMED, &hash))
+            .call_raw(move |s| s.set_contains(MESH_NS, CONSUMED, &hash))
             .await?;
         // A retry after a lost reply: the same node redeeming the same ticket again.
         let retry = entry.redeemed_by == Some(joiner);
@@ -176,7 +176,7 @@ impl JoinInner {
             && entry.redeemed_by.is_none()
             && self
                 .store
-                .call(move |s| s.set_contains(MESH_NS, MEMBERS, &m))
+                .call_raw(move |s| s.set_contains(MESH_NS, MEMBERS, &m))
                 .await?;
         if consumed && !retry && !half_done {
             return refuse(RefuseReason::Used);

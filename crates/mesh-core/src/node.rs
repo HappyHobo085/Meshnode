@@ -252,7 +252,9 @@ pub(crate) async fn start(
     let invites = Arc::new(Mutex::new(invites));
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
     let g = genesis.clone();
-    let snap = store.call(move |s| MembershipSnapshot::load(s, &g)).await?;
+    let snap = store
+        .call_raw(move |s| MembershipSnapshot::load(s, &g))
+        .await?;
     // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale.
     // A removed node has nothing to rebuild (an interrupted run is dropped). Serving is
     // paused before any session starts.
@@ -266,7 +268,7 @@ pub(crate) async fn start(
         remove_rebootstrap(&cfg.data_dir)?;
     }
     let rebootstrap_due =
-        !removed_self && (pending.is_some() || store.call(|s| s.is_stale()).await?);
+        !removed_self && (pending.is_some() || store.call_raw(|s| s.is_stale()).await?);
     // The remembered peers of a resumed run: the emptied store holds no addresses.
     let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
         .filter(|_| rebootstrap_due)
@@ -284,7 +286,7 @@ pub(crate) async fn start(
     let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
 
-    if let Some(ms) = store.call(|s| Ok(s.clock_floor_ahead_ms())).await? {
+    if let Some(ms) = store.call_raw(|s| Ok(s.clock_floor_ahead_ms())).await? {
         warn!(ms, "HLC floor is ahead of the wall clock");
         let _ = events.send(NodeEvent::ClockFloorAhead { ms });
     }
@@ -534,7 +536,7 @@ impl Node {
     pub async fn clock_floor_ahead_ms(&self) -> Option<u64> {
         self.inner
             .store
-            .call(|s| Ok(s.clock_floor_ahead_ms()))
+            .call_raw(|s| Ok(s.clock_floor_ahead_ms()))
             .await
             .ok()
             .flatten()
@@ -627,7 +629,7 @@ impl Node {
         let (snap, vv) = self
             .inner
             .store
-            .call(move |s| Ok((MembershipSnapshot::load(s, &genesis)?, s.version_vector()?)))
+            .call_raw(move |s| Ok((MembershipSnapshot::load(s, &genesis)?, s.version_vector()?)))
             .await?;
         if !snap.is_effective(&me) || !snap.is_effective(&id) {
             return Err(NodeError::NotEffective);
@@ -712,7 +714,7 @@ impl Node {
         if timeout(STOP_TIMEOUT, inner.blobs.shutdown()).await.is_err() {
             warn!("blob store shutdown timed out");
         }
-        let store = Arc::downgrade(inner.store.inner());
+        let store = Arc::downgrade(inner.store.raw());
         drop(inner);
         // A blocking store call still in flight holds the store open until it returns.
         let deadline = Instant::now() + RELEASE_TIMEOUT;
@@ -785,16 +787,16 @@ impl Node {
     /// Hand-delivers to this node every op `other` holds that it lacks, as one sync round
     /// would, without any connection. The reactor then reacts as usual.
     pub async fn deliver_from(&self, other: &Node) -> Result<(), NodeError> {
-        let mine = self.inner.store.call(|s| s.version_vector()).await?;
+        let mine = self.inner.store.call_raw(|s| s.version_vector()).await?;
         let (items, theirs) = other
             .inner
             .store
-            .call(move |s| Ok((s.diff_since(&mine, 100_000)?, s.version_vector()?)))
+            .call_raw(move |s| Ok((s.diff_since(&mine, 100_000)?, s.version_vector()?)))
             .await?;
         let acc = self.inner.acc.clone();
         self.inner
             .store
-            .call(move |s| {
+            .call_raw(move |s| {
                 let mut ops = Vec::new();
                 for item in items {
                     match item {

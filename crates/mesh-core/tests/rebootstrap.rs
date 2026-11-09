@@ -473,6 +473,10 @@ async fn rebootstrap_waits_for_self_seq() {
     } = stuck_on_c().await;
     let r = a.store().set(NS, "x", b"1".to_vec()).await;
     assert!(matches!(r, Err(NodeError::Rebootstrapping)), "{r:?}");
+    let r = a.store().set_ordered(NS, "x", vec![1], None).await;
+    assert!(matches!(r, Err(NodeError::Rebootstrapping)), "{r:?}");
+    let r = a.store().purge_namespace(NS).await;
+    assert!(matches!(r, Err(NodeError::Rebootstrapping)), "{r:?}");
 
     // B comes back: A gets its own ops and finishes.
     b.heal();
@@ -613,7 +617,7 @@ async fn rebootstrap_waits_for_own_membership_before_reapply() {
     // s == 0: step 4 holds at once after the reset, before this node's `members` record
     // (written by B) is back, so the re-applied own ops are held back as `UnknownOrigin`.
     a.store()
-        .call(|s| s.__test_set_meta_u64("synced_self_seq", 0))
+        .call_unchecked(|s| s.__test_set_meta_u64("synced_self_seq", 0))
         .await
         .unwrap();
     let day0 = t.clocks[1].now();

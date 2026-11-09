@@ -25,10 +25,13 @@ pub(crate) async fn run_job(inner: &Inner, job: MaintJob) -> Result<(), NodeErro
     match job {
         MaintJob::RetryPending => {
             let acc = inner.acc.clone();
-            store.call(move |s| s.retry_pending(&*acc)).await.map(drop)
+            store
+                .call_raw(move |s| s.retry_pending(&*acc))
+                .await
+                .map(drop)
         }
-        MaintJob::Compact => store.call(|s| s.compact()).await.map(drop),
-        MaintJob::Gc => store.call(|s| s.gc()).await.map(drop),
+        MaintJob::Compact => store.call_raw(|s| s.compact()).await.map(drop),
+        MaintJob::Gc => store.call_raw(|s| s.gc()).await.map(drop),
         MaintJob::PruneInvites => {
             let invites = inner.invites.clone();
             let now = inner.cfg.wall.now_ms();

@@ -235,6 +235,17 @@ async fn removed_self_stops() {
         c.store().delete(NS, "k").await,
         Err(NodeError::Removed)
     ));
+    // Every local write of the public API is gated, the ordered and bulk ones too.
+    assert!(matches!(
+        c.store()
+            .set_ordered(NS, "k", vec![1], Some(b"x".to_vec()))
+            .await,
+        Err(NodeError::Removed)
+    ));
+    assert!(matches!(
+        c.store().purge_namespace(NS).await,
+        Err(NodeError::Removed)
+    ));
 
     // The state is derived from the store, so it survives a restart.
     c.shutdown().await;

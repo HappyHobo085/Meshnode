@@ -20,6 +20,10 @@ pub const SETTLE_MS: u64 = 7 * 86_400_000;
 /// measured both by the tombstone's HLC wall time and by when this store received it
 /// (Ruling R14), so a tombstone arriving late from an offline device is kept here for
 /// this long after its arrival.
+pub const TOMBSTONE_TTL_MS: u64 = 90 * 86_400_000;
+/// A store whose last full sync is older than this must re-bootstrap (§5.7).
+pub const STALE_MS: u64 = 80 * 86_400_000;
+
 /// Result of [`Store::export_unsynced_local_ops`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Export {
@@ -28,10 +32,6 @@ pub struct Export {
     /// Own `Set` ops too old to re-apply (older than [`TOMBSTONE_TTL_MS`]).
     pub expired: Vec<SignedOp>,
 }
-
-pub const TOMBSTONE_TTL_MS: u64 = 90 * 86_400_000;
-/// A store whose last full sync is older than this must re-bootstrap (§5.7).
-pub const STALE_MS: u64 = 80 * 86_400_000;
 
 /// `meta` rows kept by [`Store::reset_to_empty`].
 const KEEP_ON_RESET: [&str; 5] = [

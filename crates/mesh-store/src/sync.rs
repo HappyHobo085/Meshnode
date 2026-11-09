@@ -163,9 +163,11 @@ impl<W: WallClock> Store<W> {
     ///
     /// - `last_full_sync_ms = wall.now_ms()`, used only for staleness ([`Store::is_stale`]);
     /// - `synced_self_seq`, the boundary for "unsynced own ops": [`Store::gc`] never
-    ///   deletes, and [`Store::export_unsynced_local_ops`] always exports, own ops with a
-    ///   seq above it. An own write made during the session after the peer's diff was
-    ///   computed is above it, so it is never counted as synced.
+    ///   deletes own ops with a seq above it, and [`Store::export_unsynced_local_ops`]
+    ///   returns every one of them (exported, or listed in [`crate::Export::expired`] if
+    ///   it is a `Set` older than [`crate::TOMBSTONE_TTL_MS`]). An own write made during
+    ///   the session after the peer's diff was computed is above it, so it is never
+    ///   counted as synced.
     ///
     /// The stored boundary only grows (a later sync with a peer that confirms less does not
     /// lower it) and is capped at the last own seq this node used (`next_seq - 1`). A store

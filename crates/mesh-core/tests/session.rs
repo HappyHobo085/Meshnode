@@ -22,6 +22,8 @@ use tokio::time::timeout;
 const T: Duration = Duration::from_secs(30);
 const PIPE: usize = 64 * 1024;
 const DAY_MS: u64 = 86_400_000;
+/// How long a session must stay silent to count as quiescent.
+const QUIET: Duration = Duration::from_millis(500);
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
@@ -162,6 +164,30 @@ impl Raw {
         write_frame(&mut self.w, m).await.unwrap();
     }
 
+    fn hello(vv: VersionVector) -> SyncMsg {
+        SyncMsg::Hello { mesh: mesh(), vv }
+    }
+
+    /// Reads frames up to and including the session's next `Done`; returns how many
+    /// `Hello`s came before it.
+    async fn hellos_until_done(&mut self) -> usize {
+        let mut hellos = 0;
+        loop {
+            match self.recv().await {
+                Some(SyncMsg::Done) => return hellos,
+                Some(SyncMsg::Hello { .. }) => hellos += 1,
+                Some(_) => {}
+                None => panic!("session closed"),
+            }
+        }
+    }
+
+    /// Nothing more arrives: the session has gone quiet.
+    async fn assert_quiet(&mut self) {
+        let next = timeout(QUIET, read_frame::<_, SyncMsg>(&mut self.r, SYNC_MAX_FRAME)).await;
+        assert!(next.is_err(), "unexpected frame: {next:?}");
+    }
+
     async fn recv(&mut self) -> Option<SyncMsg> {
         timeout(T, read_frame(&mut self.r, SYNC_MAX_FRAME))
             .await
@@ -172,9 +198,13 @@ impl Raw {
 
 /// A real, non-dialing session for `n` against a raw peer `peer`.
 fn run_against_raw(n: &TestNode, peer: NodeId) -> (Side, Raw) {
+    run_against_raw_with(n, peer, quiet(), false)
+}
+
+fn run_against_raw_with(n: &TestNode, peer: NodeId, timings: Timings, dialer: bool) -> (Side, Raw) {
     let (n_w, raw_r) = tokio::io::duplex(PIPE);
     let (raw_w, n_r) = tokio::io::duplex(PIPE);
-    let side = spawn_side(n, peer, quiet(), n_r, n_w, false);
+    let side = spawn_side(n, peer, timings, n_r, n_w, dialer);
     (side, Raw { r: raw_r, w: raw_w })
 }
 
@@ -522,4 +552,123 @@ async fn message_after_silence_starts_round() {
     next_round(&mut p.b.h.events).await;
     next_round(&mut p.a.h.events).await;
     assert_eq!(p.b.h.metrics.rounds_completed.load(Ordering::SeqCst), 2);
+}
+
+// ------------------------------------------------- round-protocol edge cases (raw peer)
+
+/// Fast silence, no interval rounds.
+fn short_silence() -> Timings {
+    Timings {
+        silence: Duration::from_millis(300),
+        ..quiet()
+    }
+}
+
+/// Waits out `silence` so the next message counts as arriving after it.
+async fn let_silence_pass() {
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_hello_mid_round_gets_one_reply_then_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = pair_nodes(dir.path(), 300, 0);
+    let (mut side, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    // A is mid-round (streaming 300 ops); the peer starts over.
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    let hellos = raw.hellos_until_done().await;
+    // A's first Done may belong to the first round; read on to the Done after the reply.
+    let hellos = if hellos == 0 {
+        raw.hellos_until_done().await
+    } else {
+        hellos
+    };
+    assert_eq!(hellos, 1, "exactly one reply to the second Hello");
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
+    raw.assert_quiet().await;
+    assert_eq!(side.h.metrics.rounds_completed.load(Ordering::SeqCst), 1);
+    assert!(!side.join.is_finished());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ops_after_silence_then_hello_completes_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = pair_nodes(dir.path(), 5, 0);
+    let (mut side, mut raw) = run_against_raw_with(&a, id(2), short_silence(), false);
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    assert_eq!(raw.hellos_until_done().await, 1);
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
+
+    // The Android wake-up: traffic after a silence, then the peer's own round start.
+    let_silence_pass().await;
+    raw.send(&SyncMsg::Ops { ops: Vec::new() }).await;
+    raw.send(&Raw::hello(vv(&a))).await;
+    // Whichever of A's start and the peer's Hello wins, A sends one Hello and a Done.
+    assert_eq!(raw.hellos_until_done().await, 1);
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
+    raw.assert_quiet().await;
+    assert_eq!(side.h.metrics.rounds_completed.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crossing_hellos_make_one_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = pair_nodes(dir.path(), 5, 0);
+    // A dials (starts on entry) while the peer starts too, without waiting.
+    let (mut side, mut raw) = run_against_raw_with(&a, id(2), quiet(), true);
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    assert_eq!(raw.hellos_until_done().await, 1);
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
+    raw.assert_quiet().await;
+    assert_eq!(side.h.metrics.rounds_completed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn silence_restart_while_hello_unanswered_sends_no_second_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = pair_nodes(dir.path(), 5, 0);
+    let (mut side, mut raw) = run_against_raw_with(&a, id(2), short_silence(), true);
+    // A's start; the peer does not answer yet.
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    // Some earlier traffic, then a silence, then more traffic: a forced start while
+    // A's Hello is unanswered must not put a second Hello in flight.
+    raw.send(&SyncMsg::Ops { ops: Vec::new() }).await;
+    let_silence_pass().await;
+    raw.send(&SyncMsg::Ops { ops: Vec::new() }).await;
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    assert_eq!(
+        raw.hellos_until_done().await,
+        0,
+        "A answered its own round twice"
+    );
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
+    raw.assert_quiet().await;
+    assert_eq!(side.h.metrics.rounds_completed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tick_restarts_a_stalled_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = pair_nodes(dir.path(), 5, 0);
+    let timings = Timings {
+        sync_interval: Duration::from_millis(300),
+        ..quiet()
+    };
+    let (mut side, mut raw) = run_against_raw_with(&a, id(2), timings, true);
+    // Round 1: the peer answers but never sends Done, so A's round stalls.
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.send(&Raw::hello(VersionVector::default())).await;
+    assert_eq!(raw.hellos_until_done().await, 0);
+    // After `sync_interval` the tick replaces it with a fresh start.
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.send(&Raw::hello(vv(&a))).await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut side.h.events).await;
 }

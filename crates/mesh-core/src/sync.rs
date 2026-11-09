@@ -128,13 +128,30 @@ impl SessionCtx {
 struct Round {
     /// Our `Hello` must go out (a start, or the reply to the peer's).
     hello_due: bool,
+    /// We started this round and the peer's `Hello` has not arrived yet: the next `Hello`
+    /// received is the reply (or a crossing start) and is not answered. At most one of
+    /// our starts is ever unanswered, so a received `Hello` is never mistaken for a start
+    /// and two sides cannot bounce `Hello`s at each other.
+    awaiting_reply: bool,
     hello_sent: bool,
     hello_received: bool,
     done_sent: bool,
     done_received: bool,
+    /// When the round began (our start or the peer's `Hello`); `None` when idle.
+    began: Option<Instant>,
 }
 
 impl Round {
+    /// A fresh round that this side starts.
+    fn start() -> Round {
+        Round {
+            hello_due: true,
+            awaiting_reply: true,
+            began: Some(Instant::now()),
+            ..Round::default()
+        }
+    }
+
     fn in_progress(&self) -> bool {
         self.hello_due || self.hello_sent || self.hello_received
     }
@@ -155,8 +172,17 @@ struct State {
     /// Live mode is on once the peer's first `Hello` arrived.
     live: bool,
     round: Round,
-    /// A round start was requested; `Some(true)` restarts one in progress.
-    start: Option<bool>,
+}
+
+/// Why a round start was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// Session entry or `sync_now()`: only when no round is in progress.
+    Requested,
+    /// The `sync_interval` tick: also replaces a round in progress for longer than that.
+    Tick,
+    /// A message after `silence` (spec §6.3): replaces any round in progress.
+    Silence,
 }
 
 fn raise(vv: &mut VersionVector, origin: NodeId, seq: u64) {
@@ -253,9 +279,21 @@ impl Session {
         self.ctx.serve_paused.load(Ordering::SeqCst)
     }
 
-    fn request_start(&self, force: bool) {
-        let mut st = self.lock();
-        st.start = Some(force || st.start == Some(true));
+    /// Starts a round now if `why` allows it against the current round (decided at once,
+    /// so a Hello read right after cannot be overtaken by a stale request); the writer
+    /// sends the `Hello`.
+    fn request_start(&self, why: Start) {
+        let started = {
+            let mut st = self.lock();
+            let ok = self.may_start(&st.round, why);
+            if ok {
+                st.round = Round::start();
+            }
+            ok
+        };
+        if started {
+            self.kick.notify_one();
+        }
     }
 
     async fn call<T: Send + 'static>(
@@ -322,8 +360,7 @@ impl Session {
             // Android rule (master §10.2): traffic after a long silence starts a round,
             // unless the peer is starting one itself.
             if after_silence && !is_hello {
-                self.request_start(true);
-                self.kick.notify_one();
+                self.request_start(Start::Silence);
             }
         }
     }
@@ -364,16 +401,22 @@ impl Session {
 
     fn on_hello(&self, vv: VersionVector) {
         let mut st = self.lock();
-        if st.round.hello_received {
-            // The peer started a new round over the current one.
-            st.round = Round::default();
-        }
-        let r = &mut st.round;
-        r.hello_received = true;
-        r.done_sent = false;
-        r.done_received = false;
-        if !r.hello_sent && !r.hello_due {
-            r.hello_due = true;
+        if st.round.awaiting_reply {
+            // The reply to our start, or the peer's start crossing ours: either way it
+            // pairs with our Hello and is not answered (spec §6.3 step 2).
+            let r = &mut st.round;
+            r.awaiting_reply = false;
+            r.hello_received = true;
+            r.done_sent = false;
+            r.done_received = false;
+        } else {
+            // The peer starts a round (possibly over the current one): reply exactly once.
+            st.round = Round {
+                hello_due: true,
+                hello_received: true,
+                began: Some(Instant::now()),
+                ..Round::default()
+            };
         }
         st.advertised = vv.clone();
         st.known = vv;
@@ -425,7 +468,7 @@ impl Session {
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut cmds_open = true;
         if dialer {
-            self.request_start(false);
+            self.request_start(Start::Requested);
         }
         loop {
             if let Err(end) = self.write_pending(&mut w).await {
@@ -435,10 +478,10 @@ impl Session {
                 _ = self.kick.notified() => {}
                 _ = self.ctx.wake.notified() => {}
                 cmd = cmds.recv(), if cmds_open => match cmd {
-                    Some(SessionCmd::StartRound) => self.request_start(false),
+                    Some(SessionCmd::StartRound) => self.request_start(Start::Requested),
                     None => cmds_open = false,
                 },
-                _ = tick.tick(), if dialer => self.request_start(false),
+                _ = tick.tick(), if dialer => self.request_start(Start::Tick),
             }
         }
     }
@@ -454,18 +497,30 @@ impl Session {
         })
     }
 
+    /// Whether a start for `why` may replace `round`. Never while one of our Hellos is
+    /// unanswered or a reply is about to go out: the Hello coming back (or going out)
+    /// already exchanges fresh vectors, and a second one in flight would be answered as a
+    /// new round.
+    fn may_start(&self, round: &Round, why: Start) -> bool {
+        if round.awaiting_reply || round.hello_due {
+            return false;
+        }
+        if !round.in_progress() {
+            return true;
+        }
+        match why {
+            Start::Requested => false,
+            Start::Tick => round
+                .began
+                .is_some_and(|t| t.elapsed() > self.ctx.timings.sync_interval),
+            Start::Silence => true,
+        }
+    }
+
     /// Sends whatever is due: a `Hello`, the diff, and `Done`.
     async fn write_pending<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<(), SessionEnd> {
         let send_hello = {
             let mut st = self.lock();
-            if let Some(force) = st.start.take()
-                && (force || !st.round.in_progress())
-            {
-                st.round = Round {
-                    hello_due: true,
-                    ..Round::default()
-                };
-            }
             let r = &mut st.round;
             let due = r.hello_due;
             if due {

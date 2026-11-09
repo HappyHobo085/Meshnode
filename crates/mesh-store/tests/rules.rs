@@ -1975,3 +1975,102 @@ fn bench_apply_100k() {
         N as f64 / batched.as_secs_f64()
     );
 }
+
+fn rec(n: u8) -> Vec<u8> {
+    node(n).0.to_vec()
+}
+
+/// Origin 1 writes 4 filler ops, then a removal record for node 3 (seq 5) and `n/k` (seq 6).
+fn exempt_ops(x: &Store<ManualClock>) -> Vec<SignedOp> {
+    let mut ops: Vec<SignedOp> = (0..4)
+        .map(|i| x.set("f", &format!("{i}"), b"f").unwrap())
+        .collect();
+    ops.push(x.set_add("_mesh", "removed", &rec(3)).unwrap());
+    ops.push(x.set("n", "k", b"v").unwrap());
+    ops
+}
+
+#[test]
+fn removal_record_survives_issuer_removal() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r1 = store(dir.path(), 2, &clock);
+    for op in exempt_ops(&x) {
+        assert_eq!(r1.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+    }
+    r1.on_removal(node(1), 4).unwrap();
+    assert!(r1.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r1.get("n", "k").unwrap(), None);
+}
+
+#[test]
+fn exempt_op_above_cutoff_applied_after_removal() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r2 = store(dir.path(), 2, &clock);
+    let ops = exempt_ops(&x);
+    for op in &ops[..4] {
+        r2.apply(op.clone(), &AcceptAll).unwrap();
+    }
+    r2.on_removal(node(1), 4).unwrap();
+    assert_eq!(
+        r2.apply(ops[4].clone(), &AcceptAll).unwrap(),
+        Outcome::Applied
+    );
+    assert_eq!(
+        r2.apply(ops[5].clone(), &AcceptAll).unwrap(),
+        Outcome::Ignored
+    );
+    assert!(r2.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r2.get("n", "k").unwrap(), None);
+}
+
+#[test]
+fn exempt_op_above_cutoff_waits_behind_gap() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r2 = store(dir.path(), 2, &clock);
+    let ops = exempt_ops(&x);
+    r2.apply(ops[0].clone(), &AcceptAll).unwrap();
+    r2.on_removal(node(1), 1).unwrap();
+    // The exempt record at seq 5 waits behind the gap (seqs 2..=4 missing).
+    assert_eq!(
+        r2.apply(ops[4].clone(), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    for op in &ops[1..4] {
+        assert_eq!(r2.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Ignored);
+    }
+    assert!(r2.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r2.vv_of(node(1)).unwrap(), 5);
+    assert_eq!(r2.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn mutual_removal_both_records_kept() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let y = store(dir.path(), 2, &clock);
+    let xs = [
+        x.set("f", "a", b"1").unwrap(),
+        x.set_add("_mesh", "removed", &rec(2)).unwrap(),
+    ];
+    let ys = [
+        y.set("f", "a", b"1").unwrap(),
+        y.set_add("_mesh", "removed", &rec(1)).unwrap(),
+    ];
+    for (n, order) in [(3u8, [&xs, &ys]), (4u8, [&ys, &xs])] {
+        let r = store(dir.path(), n, &clock);
+        for ops in order {
+            for op in ops {
+                r.apply(op.clone(), &AcceptAll).unwrap();
+            }
+            // The record just merged removes the other side (and the issuer's own id).
+            let issuer = ops[0].body.origin;
+            let target = if issuer == node(1) { node(2) } else { node(1) };
+            r.on_removal(target, 1).unwrap();
+        }
+        assert!(r.set_contains("_mesh", "removed", &rec(1)).unwrap(), "r{n}");
+        assert!(r.set_contains("_mesh", "removed", &rec(2)).unwrap(), "r{n}");
+    }
+}

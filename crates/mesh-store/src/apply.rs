@@ -8,6 +8,7 @@
 //! removal check and judge).
 
 use crate::error::StoreError;
+use crate::removal::is_cutoff_exempt;
 use crate::tables::{
     self, META, OPS, OpRow, PENDING, PendingRow, REG, REMOVED, SET, SUPERSEDED, VV, meta,
 };
@@ -337,7 +338,10 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         }
 
         // 4. Above a removed origin's cutoff: keep as invalid (covered), don't merge.
-        if removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff) {
+        // Removal records are exempt (node-core spec §2.3): they continue to `judge`.
+        if !is_cutoff_exempt(&op.body.payload)
+            && removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff)
+        {
             self.record(&op, true)?;
             // Compaction ages an invalid op from when it became invalid (Ruling R9).
             self.tx.open_table(SUPERSEDED)?.insert(

@@ -15,6 +15,16 @@ use mesh_proto::{NodeId, Payload};
 use redb::{ReadableTable, WriteTransaction};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The set holding removal records: `(ns, set)`. Its adds are never retracted by a
+/// removal cutoff, even when their issuer is itself removed (node-core spec §2.3).
+pub const CUTOFF_EXEMPT_SET: (&str, &str) = ("_mesh", "removed");
+
+/// True for a removal record (`set_add` into [`CUTOFF_EXEMPT_SET`]): exempt from cutoffs.
+pub(crate) fn is_cutoff_exempt(p: &Payload) -> bool {
+    matches!(p, Payload::SetAdd { ns, set, .. }
+        if (ns.as_str(), set.as_str()) == CUTOFF_EXEMPT_SET)
+}
+
 /// What [`Store::on_removal`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemovalReport {
@@ -82,7 +92,7 @@ fn retract(
                 Some(g) => tables::decode("ops", g.value())?,
                 None => continue,
             };
-            if row.invalid {
+            if row.invalid || is_cutoff_exempt(&row.op.body.payload) {
                 continue;
             }
             row.invalid = true;
@@ -132,6 +142,11 @@ fn retract(
                     .group
                     .get(sk.ns.len() + 1..sk.group.len() - 1)
                     .ok_or_else(|| StoreError::corrupt("set", "malformed key"))?;
+                // Removal records are never retracted.
+                let (ens, eset) = CUTOFF_EXEMPT_SET;
+                if sk.ns == ens.as_bytes() && name == eset.as_bytes() {
+                    continue;
+                }
                 set_fix.insert(
                     k.value().to_vec(),
                     SetFix {
@@ -289,7 +304,7 @@ fn revalidate(
                 Some(g) => tables::decode("ops", g.value())?,
                 None => continue,
             };
-            if !row.invalid {
+            if !row.invalid || is_cutoff_exempt(&row.op.body.payload) {
                 continue;
             }
             row.invalid = false;
@@ -334,6 +349,10 @@ impl<W: WallClock> Store<W> {
     /// - **raised cutoff**: the origin's stored ops in `(old, new]` become valid and are
     ///   merged again;
     /// - **equal or lower cutoff**: nothing (an all-zero report, no commit).
+    ///
+    /// Removal records (set rows in ns `_mesh`, set `removed`, see [`CUTOFF_EXEMPT_SET`])
+    /// are exempt: they are never marked invalid and their set rows are never deleted,
+    /// even when their issuer is the removed origin.
     ///
     /// The version vector is not changed. `Change` events (`local: false`) are published
     /// after commit for every affected key and set.

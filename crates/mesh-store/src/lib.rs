@@ -19,6 +19,9 @@
 //!   exchange (including the catch-up after joining) with the peer's `vv[self]`.
 //! - **Covered markers.** Pass the sender's `Hello` `vv[origin]` as `advertised` to
 //!   [`Store::apply_covered`].
+//! - **Removal records are exempt from cutoffs.** Adds to the set [`CUTOFF_EXEMPT_SET`]
+//!   (`_mesh`/`removed`) are never retracted by `on_removal` nor ignored above a cutoff,
+//!   even when their issuer is removed; other ops are unaffected.
 
 mod apply;
 mod error;
@@ -38,7 +41,7 @@ pub use apply::{
 pub use error::StoreError;
 pub use maint::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
-pub use removal::RemovalReport;
+pub use removal::{CUTOFF_EXEMPT_SET, RemovalReport};
 pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;

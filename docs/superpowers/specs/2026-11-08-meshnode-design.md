@@ -146,15 +146,15 @@ One `redb` file per node at `<data>/store.redb`. A merge and its op-log insert h
 All of this lives in the `_mesh` namespace, so it replicates and merges like any other data.
 
 - **Members:** grow-only set with entries `{ node_id, name, role: host|client, platform, added_by, added_hlc }`.
-- **Removed:** grow-only set with entries `{ node_id, removed_by, cutoff_hlc }`.
+- **Removed:** grow-only set with entries `{ node_id, removed_by, cutoff_seq }`, where `cutoff_seq` is the highest seq of that node the remover had seen with no gaps.
 - **Effective members** = members − removed. A removed `NodeId` can never come back; a device can rejoin only with a new key and a new invite (the UI calls this "reset identity").
-- **Op acceptance:** an op from origin `X` is accepted if `X` is a member and either (a) `X` is not removed, or (b) the op's `hlc ≤ cutoff_hlc` (the earliest cutoff if `X` was removed more than once concurrently). This is deterministic, so every node accepts the same ops whatever order they arrive in.
+- **Op acceptance:** an op from origin `X` is accepted if `X` is a member and either (a) `X` is not removed, or (b) the op's `seq ≤ cutoff_seq` (the **highest** cutoff if `X` was removed more than once). A node that learns of a removal retracts `X`'s ops above the cutoff, and compaction waits a 7-day settle period so retraction can restore older values. Full rules: sub-spec 1 §2 and §5.6.
 - **Removing:** any effective member can remove any member, including itself (sign-out). The **last effective host can't be removed**, because a mesh with no host can't serve and can't recover in-band.
 - **Removal is a hard cutoff:** existing connections to a newly removed node are closed as soon as the removal is merged.
 - **Honest limits** (shown in the UI and CLI help):
   - A removed device keeps whatever data it already replicated.
   - Removal takes effect on each node only once that node has received it.
-  - Within that window, a removed node could backdate its writes to before the cutoff.
+  - If a removal reaches a node more than 7 days after it compacted the removed node's older value for a key, that node can't restore it (logged; sub-spec 1 §5.6).
 
 ### Invites
 - `invite(role, ttl = 15 min)` returns a ticket `{ mesh_id, inviter_node_addr, token: 32 random bytes, role, expires_at }`, encoded as base32 text and as a QR code (shown in the UI and in the terminal).

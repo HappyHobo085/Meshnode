@@ -135,7 +135,7 @@ A test acceptor that accepts every op is provided for property tests.
 All of these steps run in one write transaction:
 1. Check `op.body.mesh` matches and the signature verifies. Otherwise `Rejected(BadSig)`. The op isn't stored and doesn't count toward the vv.
 2. If `(origin, seq)` already exists: an identical op gives `Duplicate`. **A different op with the same seq is equivocation:** keep the first, log `error`, and return `Rejected(Equivocation)`.
-3. `Clock::observe(hlc)`. If that fails with `Skew`, put the op in `pending` (reason `Skew`) and return `Deferred`.
+3. `Clock::observe(hlc)`. If that fails with `Skew`, put the op in `pending` (reason `Skew`) and return `Deferred`. **Exemption:** an own-origin op with `hlc ≤ clock.last()` skips the skew check, so a re-bootstrap after the wall clock moved back does not block local writes until the clock catches up *(back-ported from sub-spec 2)*.
 4. If the origin is in `removed` and `seq > cutoff_seq`: store it in `ops` **marked invalid** (so it counts as covered and isn't fetched again), don't merge, and return `Ignored`. Otherwise `judge`:
    - `UnknownOrigin` → put it in `pending` and return `Deferred`.
    - `Valid` → continue.
@@ -166,6 +166,8 @@ All of these steps run in one write transaction:
 ### 5.6 Retracting a removed origin (`on_removal(origin, cutoff_seq)`)
 
 `mesh-core` calls this when a `_mesh/removed` record is merged or its effective cutoff changes. In one transaction:
+**Exemption *(back-ported from sub-spec 2)*:** adds to the set `CUTOFF_EXEMPT_SET` (`_mesh`/`removed`, the removal records) are exempt from steps 1 and 3 here, and from the "ignored above the cutoff" rule in §5.3 step 4: a removal record whose origin is later removed stays valid and stays in the set. Other ops are unaffected.
+
 1. For every `ops` row of `origin` with `seq > cutoff_seq`: mark it invalid.
 2. For every `reg` row of `origin` whose `seq > cutoff_seq`: replace it with that origin's best remaining op for the key with `seq ≤ cutoff_seq` (found in `ops`, which still holds it unless it was superseded more than `SETTLE` ago), or delete the row if there is none. A restored op is removed from `superseded`, so compaction can't delete the new winner.
 3. For every `set` row of `origin` with `seq > cutoff_seq`: delete it.
@@ -179,7 +181,8 @@ If a later removal record **raises** the effective cutoff (the highest one wins)
 
 - A key whose winner is a tombstone with the **empty order**, older than 90 days by **both** its `hlc.ms` and its local `received_ms`, is deleted: all of the key's `reg` rows and its ops (leaving "covered" markers). Measuring arrival too keeps a tombstone that reaches this node late (from a device that was offline) long enough to reach the other replicas. **Tombstones with a non-empty order are never GC'd:** later writes that lose to that order would otherwise resolve differently on replicas that GC'd and replicas that did not. GC does nothing while the store is stale, and skips a key that holds an own op above `synced_self_seq` (§5.8).
 - **Accepted limit:** a non-stale replica whose last full sync was with a peer that also lacked a tombstone may keep the value after the tombstone is GC'd elsewhere. A stale node must not serve `diff_since`.
-- `is_stale(now)` is true when `last_full_sync_ms < now − 80 days`; a store that never completed a full sync is never stale. `mesh-core` then runs the re-bootstrap from parent spec §5: `export_unsynced_local_ops()`, `reset_to_empty()`, full catch-up, then re-apply the exported items. `export_unsynced_local_ops()` returns `Vec<SyncItem>`: the own ops above `synced_self_seq` in seq order, with a `Covered { origin: self, upto: seq − 1 }` before each op that follows a hole above `synced_self_seq` (own ops already compacted), so re-applying never parks an op behind a gap; `Op` items are re-applied with `apply`, `Covered` items with `apply_covered`.
+- `is_stale(now)` is true when `last_full_sync_ms < now − 80 days`; a store that never completed a full sync is never stale. `mesh-core` then runs the re-bootstrap from parent spec §5: `export_unsynced_local_ops()`, `reset_to_empty()`, full catch-up, then re-apply the exported items. `export_unsynced_local_ops(now)` returns `Export { items: Vec<SyncItem>, expired: Vec<SignedOp> }` *(back-ported from sub-spec 2)*. `items` holds the own ops above `synced_self_seq` in seq order, with a `Covered { origin: self, upto: seq − 1 }` before each op that follows a hole above `synced_self_seq` (own ops already compacted), so re-applying never parks an op behind a gap; `Op` items are re-applied with `apply`, `Covered` items with `apply_covered`. **R19 filter:** own `Set` ops with `hlc.ms < now − TOMBSTONE_TTL_MS` go to `expired` instead of `items`, so a re-bootstrap never resurrects a key whose tombstone other replicas already GC'd; the `Covered` markers in `items` are computed over the seqs that remain.
+- A corrupt `meta.last_hlc` (`ms ≥ 2^48 − 1`) is rejected as `Corrupt` on open instead of panicking on `tick` *(back-ported from sub-spec 2)*.
 - Local writes return `StoreError::Rebootstrapping` while `vv[self] ≠ next_seq − 1` (after `reset_to_empty` until the catch-up and the re-applied export restore the own ops): a write in between would set `vv[self]` past seqs the store no longer holds, and peers would skip them as covered.
 
 ### 5.8 Catch-up support
@@ -205,6 +208,8 @@ pub fn get_entry(&self, ns: &str, key: &str) -> Option<RegEntry>;     // include
 pub fn list_keys(&self, ns: &str, prefix: &str, start_after: Option<&str>, limit: u32) -> Vec<String>; // live keys only, sorted
 pub fn set_contains(&self, ns: &str, set: &str, member: &[u8]) -> bool;
 pub fn set_members(&self, ns: &str, set: &str, start_after: Option<&[u8]>, limit: u32) -> Vec<Vec<u8>>;
+pub fn set_member_origins(&self, ns: &str, set: &str, member: &[u8]) -> Result<Vec<NodeId>, StoreError>;   // origins that added `member`, ascending by id *(back-ported from sub-spec 2)*
+pub fn next_seq(&self) -> Result<u64, StoreError>;   // the seq the next local write will use *(back-ported from sub-spec 2)*
 pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Change>;   // Change { ns, kind: Key(String) | Set(String), local: bool }
 pub fn namespace_sizes(&self) -> BTreeMap<String, u64>;
 pub fn purge_namespace(&self, ns: &str) -> Vec<SignedOp>;             // tombstones every live key; returns ops to broadcast

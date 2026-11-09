@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"
 data-encoding = "2"
 crc32fast = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
 proptest = "1"
 tempfile = "3"
 blake3 = "1"

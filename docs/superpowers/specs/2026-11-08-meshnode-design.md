@@ -18,7 +18,7 @@
 - Networking is **iroh** (self-contained, addressed by key, punches through NAT, relay fallback). No Tailscale dependency.
 - Apps reach services through **both** a localhost gateway and an embeddable iroh client library.
 - Devices join with **invite tickets, and any member can invite or remove**.
-- Implementation stack (approach A): **one Rust core** (iroh, iroh-gossip, iroh-blobs, wasmtime, our own LWW store on redb) in a desktop daemon and an Android foreground service, with a **Tauri 2 management UI**.
+- Implementation stack (approach A): **one Rust core** (iroh, iroh-blobs, wasmtime, our own LWW store on redb) in a desktop daemon and an Android foreground service, with a **Tauri 2 management UI**.
 
 ### Assumptions (stated by the designer, not the owner)
 - Mesh size: 2–10 devices. Data per service: MBs to low GBs.
@@ -56,14 +56,14 @@ Run on **one desktop node (Linux or Windows) and one Android phone**, on differe
  ┌──────────────────────────── node (meshd on desktop / in-process on Android) ─────────────────────────────┐
  │                                                                                                           │
  │  Gateway (HTTP 127.0.0.1)          Peer protocols (iroh ALPNs)                    Admin API               │
- │        │                  join · sync · http-forward · blobs · gossip     (socket / in-process) ◄── UI      │
+ │        │                  join · sync · http-forward · blobs              (socket / in-process) ◄── UI      │
  │        ▼                                    │                                         │                   │
  │  Service Router ─────────► Runtime (wasmtime, wasi:http) ◄──────── Deployer + Placement (manifests)       │
  │        │                         │ meshnode:kv imports                                │                   │
  │        │ static sites            ▼                                                    │                   │
  │        └──────────────► Replicated Store (redb: ordered LWW registers + grow-only sets) ◄┘                  │
  │                                  │  ▲                                                                     │
- │                         Replicator (gossip push + version-vector catch-up + tombstone GC)                  │
+ │                         Replicator (live push + version-vector catch-up + tombstone GC)                    │
  │                                  │                                                                        │
  │                         Membership (signed member set, removed set)                                       │
  │                                  │                                                                        │
@@ -78,7 +78,7 @@ Run on **one desktop node (Linux or Windows) and one Android phone**, on differe
 | `crates/mesh-hlc` | Hybrid logical clock. Pure, no I/O. | — |
 | `crates/mesh-store` | Replicated store: ordered LWW registers + grow-only sets on `redb`; merge function; per-origin op log; tombstone GC | `mesh-hlc` |
 | `crates/mesh-proto` | Wire types for every ALPN (serde + postcard), invite tickets, signatures | `mesh-hlc` |
-| `crates/mesh-core` | `Node`: transport, membership, replicator, deployer, placement, blob fetch | store, proto, `iroh`, `iroh-gossip`, `iroh-blobs` |
+| `crates/mesh-core` | `Node`: transport, membership, replicator, deployer, placement, blob fetch (placement and the deployer arrive in sub-spec 3; sub-spec 2 only stores and replicates member tags) *(back-ported from sub-spec 2)* | store, proto, `iroh`, `iroh-blobs` |
 | `crates/mesh-runtime` | wasmtime host: the `wasi:http` incoming handler, `meshnode:kv`, the outgoing-HTTP allowlist, limits | store, `wasmtime`, `wasmtime-wasi-http` |
 | `crates/mesh-gateway` | localhost HTTP server, Host and port routing, static serving, forwarding to a peer | core, runtime |
 | `crates/mesh-admin` | Admin API: request/response types plus two transports (local socket, in-process channel) | core |
@@ -97,15 +97,15 @@ Each crate is testable on its own. `mesh-hlc`, `mesh-store` and `mesh-proto` hav
 ## 4. Identity and transport
 
 - Each node has an **Ed25519 node key** (its iroh `NodeId`), created on first run and stored at `<data>/node.key` with owner-only file permissions (on Android, in app-private storage).
-- A **mesh** is identified by a random 32-byte `MeshId`, created when the first node starts a mesh. A node belongs to exactly one mesh.
+- A **mesh** is identified by a 32-byte `MeshId = blake3("meshnode/mesh/1" ‖ founder NodeId ‖ nonce[32])`, derived from a genesis the founder creates when it starts the mesh. The founder is an implicit member, and the join reply carries `MeshGenesis { founder, nonce }`, which the joiner checks against the ticket's `mesh` *(back-ported from sub-spec 2)*. A node belongs to exactly one mesh.
 - All peer traffic is iroh QUIC with these ALPNs, each versioned:
   - `meshnode/join/1`: redeem an invite ticket
   - `meshnode/sync/1`: catch-up (version-vector exchange + missing ops)
   - `meshnode/http/1`: forward an HTTP request to a node that hosts the service
   - iroh-blobs' ALPN: fetch module and site content by BLAKE3 hash
-  - iroh-gossip: live op broadcast on topic `blake3("meshnode/ops" ‖ MeshId)`
+  - There is no gossip protocol: live replication runs over the per-peer `sync/1` sessions (a direct connection per peer; push on every local change) *(back-ported from sub-spec 2)*.
 - **Every incoming connection is checked against membership** right after the handshake, using the remote `NodeId` iroh has authenticated. Non-members and removed nodes are closed with an error code. The only exception is `join/1`, which needs a valid ticket instead.
-- **Finding peers:** each member's current direct addresses and home relay are stored in `_mesh/addr/<node_id>` (LWW, refreshed on change and every 10 min), so the mesh carries its own address book. iroh's DNS/pkarr discovery is enabled as a second path. On startup a node dials every known member.
+- **Finding peers:** each member's current direct addresses and home relay are stored in `_mesh/addr/<node_id>` (LWW, rewritten only when the node's address changes *(back-ported from sub-spec 2)*; `NodeAddrBytes` is the postcard encoding of iroh's `EndpointAddr`, converted in `mesh-core`), so the mesh carries its own address book. iroh's DNS/pkarr discovery is enabled as a second path. On startup a node dials every known member.
 - **Relays:** iroh's public relays by default. The relay URL is configurable, and self-hosting a relay is supported (`iroh-relay` binary, documented). Traffic is end-to-end encrypted, so relays see ciphertext only.
 - **Keepalive:** desktop nodes keep a connection open to every member. Android follows its power policy (§10.2).
 
@@ -122,19 +122,19 @@ Data is split into **namespaces**: one per service, plus the reserved `_mesh` na
 **The merge rule** is one pure function in `mesh-store`. It is commutative, associative and idempotent, and property tests check all three (§13).
 
 ### HLC
-48-bit physical milliseconds + 16-bit counter, the same scheme the Aegis sync-server uses. On receiving an op, the local clock advances to `max(local, remote)`. An op whose HLC is more than **5 minutes** ahead of the receiver's wall clock is **deferred, not merged**: it's held and retried as the wall clock catches up, and dropped after 24 h. That way one device with a bad clock can't win every conflict forever or drag every other clock forward.
+48-bit physical milliseconds + 16-bit counter, the same scheme the Aegis sync-server uses. On receiving an op, the local clock advances to `max(local, remote)`. An op whose HLC is more than **5 minutes** ahead of the receiver's wall clock is **deferred, not merged**: it's held and retried as the wall clock catches up, and dropped after 24 h. That way one device with a bad clock can't win every conflict forever or drag every other clock forward. A node's own ops are exempt from this check, so a re-bootstrap after the wall clock moved back does not block local writes *(back-ported from sub-spec 2)*.
 
 ### Op log, version vectors, catch-up
 - Every local write becomes an **Op** `{ origin, seq, hlc, ns, payload, sig }`. `seq` is a per-origin counter that only goes up, and `sig` is the origin's Ed25519 signature.
 - Ops are stored indexed by `(origin, seq)`. **Compaction:** an origin's older register op for a key is deleted once a newer op from the **same origin for that key** beats it under the merge rule. Grow-only set ops are never compacted.
 - **Version vector:** `origin → highest seq covered`. A compacted range counts as covered.
-- **Live path:** ops go out on gossip. A receiver checks the signature and acceptance (§6), then merges.
-- **Catch-up** (`sync/1`): when connecting to a peer, and every 60 s with a random online peer (on Android, also triggered by incoming traffic and a wall-clock alarm, because in-process timers stall in deep sleep; see §10.2), the nodes swap version vectors and each streams what the other is missing. Gossip is best-effort; catch-up is what guarantees convergence. An op that is refused or deferred doesn't advance the version vector, so a later catch-up retries it.
+- **Live path:** ops are pushed over the `sync/1` session to each connected peer *(back-ported from sub-spec 2)*. A receiver checks the signature and acceptance (§6), then merges.
+- **Catch-up** (`sync/1`): when connecting to a peer, and every 60 s with a random online peer (on Android, also triggered by incoming traffic and a wall-clock alarm, because in-process timers stall in deep sleep; see §10.2), the nodes swap version vectors and each streams what the other is missing. Live push is best-effort; catch-up is what guarantees convergence. An op that is refused or deferred doesn't advance the version vector, so a later catch-up retries it.
 
 ### Tombstone GC
 - A register tombstone, and the op behind it, is purged once it is older than **90 days** (by HLC).
 - Every node records `last_full_sync_ms`: the last time it completed catch-up with at least one host.
-- A node whose `last_full_sync_ms` is older than **80 days** (the GC horizon minus a margin) is **stale**. On reconnect it must **re-bootstrap**: it sends ops written after its last sync to a peer, then replaces its replica with a full catch-up from that peer. Older local data is dropped, because otherwise the node could bring back deleted keys. The UI shows a warning before this happens and records it in the log.
+- A node whose `last_full_sync_ms` is older than **80 days** (the GC horizon minus a margin) is **stale**. On reconnect it must **re-bootstrap**: it sends ops written after its last sync to a peer, then replaces its replica with a full catch-up from that peer. Older local data is dropped, because otherwise the node could bring back deleted keys. Own `Set` ops older than the tombstone TTL are not re-sent (a tombstone other replicas already GC'd would be resurrected); they are reported to the user as expired offline edits *(back-ported from sub-spec 2)*. The UI shows a warning before this happens and records it in the log.
 
 ### Storage
 One `redb` file per node at `<data>/store.redb`. A merge and its op-log insert happen in one transaction. The UI shows the size of each namespace.
@@ -150,10 +150,12 @@ All of this lives in the `_mesh` namespace, so it replicates and merges like any
 - **Effective members** = members − removed. A removed `NodeId` can never come back; a device can rejoin only with a new key and a new invite (the UI calls this "reset identity").
 - **Op acceptance:** an op from origin `X` is accepted if `X` is a member and either (a) `X` is not removed, or (b) the op's `seq ≤ cutoff_seq` (the **highest** cutoff if `X` was removed more than once). A node that learns of a removal retracts `X`'s ops above the cutoff, and compaction waits a 7-day settle period so retraction can restore older values. Full rules: sub-spec 1 §2 and §5.6.
 - **Removing:** any effective member can remove any member, including itself (sign-out). The **last effective host can't be removed**, because a mesh with no host can't serve and can't recover in-band.
+- **Removal records are never retracted** *(back-ported from sub-spec 2)*: the `_mesh` removed-set rows are exempt from the cutoff rules, so the effective cutoff only rises and every node computes the same removed set in any arrival order. (Sub-spec 1 §5.6.)
 - **Removal is a hard cutoff:** existing connections to a newly removed node are closed as soon as the removal is merged.
 - **Honest limits** (shown in the UI and CLI help):
   - A removed device keeps whatever data it already replicated.
   - Removal takes effect on each node only once that node has received it.
+  - Two nodes that remove each other during a split are both removed only if both records reach a node; a node that applies one removal closes the other remover, so the second record may never spread and then only the first-removed node is removed everywhere. If the nodes were the last two effective hosts, the mesh has no host and cannot recover in-band. A stolen device that removes other members *before its own removal reaches them* has those removals honoured; its data writes are still retracted *(back-ported from sub-spec 2)*.
   - If a removal reaches a node more than 7 days after it compacted the removed node's older value for a key, that node can't restore it (logged; sub-spec 1 §5.6).
 
 ### Invites
@@ -231,7 +233,7 @@ A built-in native handler serves files from an iroh-blobs collection: `index.htm
 One bidirectional QUIC stream per request: a length-prefixed `RequestHead { service, method, path, headers }`, the streamed body, then `ResponseHead { status, headers }` and the streamed body back. Hosts accept it only from effective members.
 
 ### `mesh-client` library
-A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts) and talks `http/1`. Intended for embedding in apps on devices that don't run the full node.
+A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts; partial replication for clients moves to sub-spec 8 *(back-ported from sub-spec 2)*: until then a client member replicates everything) and talks `http/1`. Intended for embedding in apps on devices that don't run the full node.
 
 ---
 
@@ -276,7 +278,7 @@ One set of typed requests, used by the CLI and the UI:
 - **Starting automatically:** a `BOOT_COMPLETED` receiver starts the service after the first unlock (verified in the spike: it reconnected 4 s after boot). A `WorkManager` watchdog every 15 minutes restarts it if the system killed it.
 - **Swipe-away recovery *(spike)*:** on One UI, swiping the app out of recents **stops the node** despite the foreground service and battery exemption, and `START_STICKY` doesn't restart it. So `onTaskRemoved` schedules an exact alarm (`setExactAndAllowWhileIdle`, about 5 s out) whose receiver restarts the service, which is an allowed way to start a foreground service from the background. The WorkManager watchdog is the backstop. Onboarding tells the user to lock the app in recents. To verify on the S23 in sub-project 5.
 - **Battery:** first-run onboarding asks for **battery-optimisation exemption** (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) and links to per-manufacturer guidance (Samsung, Xiaomi, etc.) for aggressive app killers. *(spike)*: a foreground service kept network access in forced Doze even **without** the exemption, so the exemption is insurance against OEM app sleeping rather than a requirement.
-- **Timers vs deep sleep *(spike)*:** with the screen off, the CPU was awake only ~15 % of the time. In-process timers run on the monotonic clock, which stops during suspend, so a 300 s timer fired every 18–43 min of wall time. Yet the QUIC connection survived overnight (one reconnect in 10 h), so incoming traffic does reach the sleeping phone. Design rule: **on Android, periodic work (catch-up, address refresh) must not depend on in-process timers alone.** It runs (a) whenever incoming traffic wakes the process, i.e. a catch-up is piggybacked on any incoming connection or gossip message after ≥ 60 s of silence, and (b) on a wall-clock `AlarmManager` while-idle alarm (inexact, every 15 min).
+- **Timers vs deep sleep *(spike)*:** with the screen off, the CPU was awake only ~15 % of the time. In-process timers run on the monotonic clock, which stops during suspend, so a 300 s timer fired every 18–43 min of wall time. Yet the QUIC connection survived overnight (one reconnect in 10 h), so incoming traffic does reach the sleeping phone. Design rule: **on Android, periodic work (catch-up, address refresh) must not depend on in-process timers alone.** It runs (a) whenever incoming traffic wakes the process, i.e. a catch-up is piggybacked on any incoming connection or `sync/1` message after ≥ 60 s of silence, and (b) on a wall-clock `AlarmManager` while-idle alarm (inexact, every 15 min).
 - **Power policy** (setting):
   - **Balanced (default):** keep peer connections open with iroh's default keepalives. Hold a partial wake lock **only** while charging or while serving an incoming request or a catch-up. *(spike)*: with no wake lock at all, the spike used **~0.3 % battery per 24 h** (5.0 mAh over 10.2 h). **Still to measure early in sub-project 5:** how quickly a sleeping phone answers an incoming request, on Wi-Fi and on mobile data. If it's too slow for success criterion 7, Balanced gains a short periodic wake lock.
   - **Always on:** hold a partial wake lock all the time.
@@ -323,7 +325,7 @@ Goal: the same HTTP contract (`/v1/records`, `/v1/devices*`, `/healthz`), unchan
 
 | Situation | Behaviour |
 |---|---|
-| Peer unreachable | Gossip, catch-up and dialling retry with exponential backoff (1 s → 5 min). The gateway falls back to the next host. |
+| Peer unreachable | Live push, catch-up and dialling retry with exponential backoff (1 s → 5 min). The gateway falls back to the next host. |
 | Bad signature or non-member origin | Op dropped, `warn` logged with the origin. |
 | Op HLC > 5 min ahead | Deferred and retried as the clock catches up; dropped after 24 h (§5). |
 | Blob fetch fails or the hash doesn't match | Retried from another peer. The previous version keeps serving. |
@@ -358,7 +360,7 @@ Each row is its own sub-spec → plan → implementation cycle, in this order. E
 |---|---|---|
 | 0 | ~~**Android feasibility spike**~~ **done 2026-11-09** | Feasible. Results in `spikes/android/RESULTS.md`; changes folded into §10.2. Still open for 5: how quickly a sleeping phone answers incoming requests, and overnight on mobile data. |
 | 1 | Store + HLC + proto | merge, op log, compaction, tombstone GC; proptest convergence |
-| 2 | Node core | transport, membership, invites, replicator, blobs; split-and-heal between two desktop nodes |
+| 2 | Node core *(implemented, manual check pending; see `docs/manual-checks/sub-spec-2.md`)* | transport, membership, invites, replicator, blobs; split-and-heal between two desktop nodes |
 | 3 | Runtime + services | wasmtime host, `meshnode:kv`, manifests, deployer, placement, static sites |
 | 4 | Gateway + admin API + `meshd` CLI + desktop OS services | two desktop nodes serving a site, installed as system services |
 | 5 | Android shell | `mesh-ffi`, the foreground service, boot/watchdog, power policy |

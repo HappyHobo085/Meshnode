@@ -26,7 +26,7 @@ Dependencies: `iroh = "1.4"`, `iroh-blobs = "0.104"` (uses redb 4, like the stor
 2. **Genesis-derived `MeshId` (trust root).** `MeshId = blake3("meshnode/mesh/1" ‖ founder NodeId ‖ nonce[32])`. The founder is an implicit member. Without this, a joiner's empty store can accept no op at all (every origin is `UnknownOrigin`, including the ops that add members). The join reply carries `MeshGenesis { founder, nonce }`, which the joiner checks against the ticket's `mesh`.
 3. **Removal records are never retracted.** Set rows in `_mesh` set `removed` are exempt from sub-spec 1 §5.6 steps 1 and 3 (a removal record whose origin is later removed stays valid and stays in the set). The effective cutoff therefore only rises, and every node computes the same removed set whatever order records arrive in.
    - Without this, two nodes that remove each other during a split diverge permanently: each record lies above the cutoff set by the other, so whichever record a node merged first wins on that node.
-   - **Documented limits:** a mutual removal during a split removes both nodes; if they were the last two effective hosts, the mesh has no host and cannot recover in-band. A stolen device that removes other members *before its own removal reaches them* has those removals honoured. Its data writes are still retracted.
+   - **Documented limits:** a mutual removal during a split removes both nodes only when both records reach a node. A node that applies one removal closes the other remover (§3.3 step 4), so the second record may never spread; then only the first-removed node is removed everywhere *(amended during implementation)*. If both were the last two effective hosts, the mesh has no host and cannot recover in-band. A stolen device that removes other members *before its own removal reaches them* has those removals honoured. Its data writes are still retracted.
 4. **R19 export filter** (handoff Must 1). `export_unsynced_local_ops(now) -> Export { items: Vec<SyncItem>, expired: Vec<SignedOp> }`. Own `Set` ops with `hlc.ms < now − TOMBSTONE_TTL_MS` go to `expired` instead of `items`, so a re-bootstrap never resurrects a key whose tombstone other replicas already GC'd. The `Covered` markers in `items` are computed as before over the seqs that remain. Added to sub-spec 1 §5.7.
 5. **Own-op skew exemption** (handoff Should). Own-origin ops with `hlc ≤ clock.last()` skip the skew check in `apply`, so a re-bootstrap after the wall clock moved back does not block local writes until the clock catches up.
 6. **Corrupt `meta.last_hlc`** (`ms ≥ 2^48 − 1`) is rejected as `Corrupt` on open instead of panicking on `tick`.
@@ -71,6 +71,9 @@ impl Node {
     pub async fn create_mesh(cfg: NodeConfig) -> Result<Node, NodeError>;              // founder
     pub async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, NodeError>;
     pub async fn open(cfg: NodeConfig) -> Result<Node, NodeError>;                     // existing data dir
+    pub fn first_sync_complete(&self) -> bool;                                          // sticky (amended during implementation)
+    pub async fn wait_first_sync(&self, timeout: Duration) -> bool;
+    pub async fn clock_floor_ahead_ms(&self) -> Option<u64>;                            // sticky query
     pub async fn invite(&self, role: Role, ttl: Duration) -> Result<InviteTicket, NodeError>;
     pub async fn remove(&self, id: NodeId) -> Result<(), NodeError>;
     pub async fn set_info(&self, name: Option<String>, tags: Option<Vec<String>>) -> Result<(), NodeError>;
@@ -105,7 +108,7 @@ pub enum NodeEvent {
 - `open` fails with `WrongMesh` if `store.redb` belongs to a different mesh than `mesh.json`, with `NotInitialised` if there is no `mesh.json`, and with `BadKey` as above.
 - `create_mesh` and `join` fail with `AlreadyInMesh` if `mesh.json` exists.
 - `StoreHandle`'s local writes fail with `NodeError::Removed` once the node is `Removed`, and with `Rebootstrapping` while the store refuses them.
-- `ClockFloorAhead` is emitted at open when `store.clock_floor_ahead_ms()` returns `Some` (handoff Should).
+- `ClockFloorAhead` is emitted only at open, when `store.clock_floor_ahead_ms()` returns `Some` (handoff Should). The state is queried, not re-emitted: use `clock_floor_ahead_ms()`; likewise `first_sync_complete()` / `wait_first_sync(timeout)` for `FirstSyncComplete` *(amended during implementation)*.
 - `RetractionUnrestorable` is logged at `info` and emitted for diagnostics only; it over-reports (handoff Should, R3) and must not be shown to users as data loss.
 
 ### 3.3 Reacting to changes
@@ -119,7 +122,7 @@ pub enum NodeEvent {
   3. `store.retry_pending(acc)`.
   4. Close connections to peers that are no longer effective members (code `REMOVED`).
   5. Update `PeerManager`'s target set.
-  6. If this node is no longer effective: `status = Removed { by }`, stop every session and the peer manager, refuse local writes, emit `RemovedSelf` (handoff Must 5). The node stays in this state across restarts; leaving it is `reset identity` (sub-spec 4).
+  6. If this node is no longer effective: `status = Removed { by }`, refuse local writes, emit `RemovedSelf` (handoff Must 5). Removal by another node stops every session and the peer manager at once. **Sign-out** (this node removing itself) shows `Removed` at once but keeps its sessions until a peer proves it holds the record (a `REMOVED` close, or a peer `Hello` advertising `vv[self]` ≥ the record's seq); then it stops, so the record is not stranded on this node *(amended during implementation)*. The node stays in this state across restarts; leaving it is `reset identity` (sub-spec 4).
   7. If no effective host remains, emit `NoEffectiveHost`.
 
 ## 4. Membership in `_mesh`
@@ -151,7 +154,7 @@ pub enum NodeEvent {
 
 The resulting `_mesh` change runs the rescan (§3.3), which calls `on_removal`, closes `X`'s connection and drops it from the dial set. A node may remove itself (sign-out), subject to rule 2.
 
-**Learning of one's own removal.** Every peer refuses a removed node, so the record may never reach it. A connection closed with `REMOVED` sets `status = RefusedAsRemoved { by }` (accumulating peers) and emits `RefusedAsRemoved`. The close code is a peer's claim, not a signed record, so the node does not stop on it: it keeps reconnecting at the maximum backoff and its local writes still work. If the removal record does arrive (from a peer that has not heard of the removal yet), the status becomes `Removed` (§3.3 step 6).
+**Learning of one's own removal.** Every peer refuses a removed node, so the record may never reach it. A connection closed with `REMOVED` sets `status = RefusedAsRemoved { by }` (accumulating peers) and emits `RefusedAsRemoved`. The close code is a peer's claim, not a signed record, so the node does not stop on it: it keeps reconnecting and its local writes still work. A `REMOVED` close sets that peer's backoff to the maximum *(amended during implementation)*. If the removal record does arrive (from a peer that has not heard of the removal yet), the status becomes `Removed` (§3.3 step 6).
 
 **Documented limits** (for the UI and the CLI help): those in §2.3; plus master §6's: a removed device keeps the data it already replicated, and a removal takes effect on each node only once that node has received it. A device invited by `X` after `X`'s cutoff loses its membership once `X`'s removal arrives (the member-add op is retracted like any other).
 
@@ -193,7 +196,7 @@ Every top-level message carries the version byte (sub-spec 1 §4). Limits on dec
    2. `blake3(token)` is in `invites.json` → else `Unknown`;
    3. `now ≤ expires_ms` by the inviter's clock → else `Expired`;
    4. the joiner's `NodeId` (authenticated by iroh) has no removal record → else `Removed`;
-   5. `blake3(token)` is not in `consumed_invites`, **or** `redeemed_by == joiner` (a retry after a lost reply) → else `Used`;
+   5. `blake3(token)` is not in `consumed_invites`, **or** `redeemed_by == joiner` (a retry after a lost reply), **or** the token is consumed, `redeemed_by` is unset, and `members` already holds `joiner‖role` (the crash window between the store writes and `redeemed_by`; the writes are re-applied) *(amended during implementation)* → else `Used`;
    6. the inviter is effective and `Running` → else `InviterUnavailable`.
 4. **Inviter, on success** (skipped on an idempotent retry, which only re-sends the reply): `set_add(members, joiner‖role)`, `set_add(consumed_invites, blake3(token))`, `set(info/<joiner>, request.info)`; then `redeemed_by = joiner` in `invites.json`. It replies `Accepted { genesis, peers }`, where `peers` is every effective member except the joiner, with the addresses from `addr/<hex>` (its own current address for itself).
 5. **Joiner:** checks `genesis.mesh_id() == ticket.mesh` (else `JoinRefused(WrongMesh)`, nothing written). Then it writes `mesh.json`, opens the store, starts the node, and gives `PeerManager` the listed peers' addresses. A crash before `mesh.json` is written leaves nothing behind, and the same ticket can be retried.
@@ -208,7 +211,7 @@ Every top-level message carries the version byte (sub-spec 1 §4). Limits on dec
 ### 6.1 Connections
 
 - `PeerManager` holds a target set (effective members except this node). Each target has one task that keeps **one** connection on ALPN `meshnode/sync/1`.
-- Both sides dial when they have no connection. If two connections exist between a pair, the one dialled by the lower `NodeId` is kept and the other is closed with `SHUTDOWN`.
+- Both sides dial when they have no connection. If two connections exist between a pair, the one dialled by the lower `NodeId` is kept and the other is closed with `SHUTDOWN`. After a 2 s grace, a newer connection replaces an existing one whoever dialled it (crash/restart recovery); within the grace the lower-`NodeId` rule applies *(amended during implementation)*.
 - Dial addresses: the `addr/<hex>` register, the addresses from the join reply, and iroh discovery when `discovery` is on.
 - Backoff on failure: 1 s doubling to 5 min, reset on a completed round. `network_change()` resets every backoff.
 - `PeerUp` / `PeerDown` events on connect and disconnect.
@@ -224,7 +227,7 @@ Every incoming connection on `sync/1` and the blobs ALPN is checked right after 
 
 ### 6.3 Session protocol
 
-The dialer opens one bidirectional stream. Frames are a `u32` big-endian length followed by a postcard `SyncMsg`. The connection is closed with `PROTOCOL` on: a frame over 1 MiB + 1 KiB; an `Ops` message with more than 256 ops or more than 1 MiB of encoded ops (handoff Should); a decode error; a `Hello` whose `mesh` differs. The peer task then reconnects with backoff.
+The dialer opens one bidirectional stream. Frames are a `u32` big-endian length followed by a postcard `SyncMsg`. The connection is closed with `PROTOCOL` on: a frame over 1 MiB + 1 KiB; an `Ops` message with more than 256 ops, or with more than 1 MiB of encoded ops *and* more than one op (a single max-size op, about 1 MiB + 800 B, must replicate) *(amended during implementation)* (handoff Should); a decode error; a `Hello` whose `mesh` differs. The peer task then reconnects with backoff.
 
 Per-session state:
 - `advertised: VersionVector` — the vv from the peer's latest `Hello`;
@@ -235,6 +238,7 @@ Per-session state:
 1. Either side starts a round by sending `Hello { mesh, vv: store.version_vector() }` and setting `hello_sent`.
 2. On receiving a `Hello`: if `hello_sent` is false for the current round, reply with this side's `Hello`. (If both sides send at the same time, each takes the other's as the reply.) Set `advertised = known = their vv`, reset `done_*`.
 3. Stream `diff_since(known, 256)` page by page as `Ops` / `Covered` messages, raising `known` as it goes, until a page is empty. Then send `Done`.
+A side never starts a round while its own `Hello` is unanswered or a reply is due; the dialer's interval tick restarts a round that has been in progress longer than `sync_interval` *(amended during implementation)*.
 4. The round is complete on this side when it has sent `Done` and received `Done`. Call `mark_full_sync(advertised[self])`, the peer's confirmed seq for this node (handoff Must 3, R15), emit `RoundComplete`, and (first time only) `FirstSyncComplete`. Clear `hello_sent` for the next round.
 
 **When rounds start:**
@@ -272,9 +276,9 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
 1. Emit `RebootstrapStarting` and log a `warn`.
 2. `s = store.synced_self_seq()` — **before** the reset, which deletes it. `export = store.export_unsynced_local_ops(now)` (§2.4). Write `{ s, export.items, export.expired }` to `rebootstrap.bin` and fsync.
 3. `store.reset_to_empty()`. The store refuses local writes with `Rebootstrapping` from here until the own ops are back (sub-spec 1 §5.7). `status = Rebootstrapping { waiting_for_self_seq: s }`.
-4. Run ordinary rounds (§6.3) with online peers. The emptied store has nothing to serve, so in practice this is a pull. After each completed round, check `version_vector()[self] ≥ s`. If not, the peer lacked this node's synced ops; continue with the next round and other peers on the normal schedule.
-5. Once `vv[self] ≥ s`: apply the export's `Covered` items with `apply_covered(self, upto, advertised = upto, acc)` (trusted local data), then re-apply its `Op` items with one `apply_batch`.
-6. Write `export.expired` to `expired-edits.bin` and emit `ExpiredOfflineEdits { count, keys }`.
+4. Wait until this node is a member in the store *(amended during implementation)*, then run ordinary rounds (§6.3) with online peers. The emptied store has nothing to serve, so in practice this is a pull. After each completed round, check `version_vector()[self] ≥ s`. If not, the peer lacked this node's synced ops; continue with the next round and other peers on the normal schedule.
+5. Once `vv[self] ≥ s`: apply the export's items in their own order *(amended during implementation)* (a `Covered` marker precedes the op after each hole; trusted local data, `advertised = upto`). A self `Covered` item is never applied until `vv[self]` covers every exported op before it, and the sequence ends with a self `Covered` up to the export-time last seq (a trailing hole). Local writes are drained (in-flight writes finish) before the export. `rebootstrap.bin` also carries peer address hints. A present self-removal record ends the run as `Removed`.
+6. If `export.expired` is non-empty, write it to `expired-edits.bin` and emit `ExpiredOfflineEdits { count, keys }`.
 7. Delete `rebootstrap.bin`, set `status = Running`, emit `RebootstrapDone`. Live mode pushes the re-applied ops.
 
 **Crash safety:** if `rebootstrap.bin` exists when the node opens, the flow resumes at step 3 (repeating `reset_to_empty` is harmless). The export is never recomputed from a half-reset store.
@@ -291,11 +295,14 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
       pub async fn add_bytes(&self, bytes: Bytes) -> Result<Hash, NodeError>;
       pub async fn add_path(&self, path: &Path) -> Result<Hash, NodeError>;   // file → blob; directory → collection
       pub async fn has(&self, hash: Hash) -> Result<bool, NodeError>;
-      pub async fn fetch(&self, hash: Hash) -> Result<(), NodeError>;         // from peers; no-op if present
+      pub async fn fetch(&self, hash: Hash) -> Result<(), NodeError>;         // raw blob only; from peers; no-op if present
+      pub async fn fetch_collection(&self, hash: Hash) -> Result<(), NodeError>;  // collection root and children (amended during implementation)
+      pub async fn has_collection(&self, hash: Hash) -> Result<bool, NodeError>;
       pub async fn read(&self, hash: Hash) -> Result<Bytes, NodeError>;
       pub async fn export(&self, hash: Hash, dest: &Path) -> Result<(), NodeError>;
   }
   ```
+- The blob kind is supplied by the caller: `fetch(hash)` is raw-only; `fetch_collection(hash)` and `has_collection(hash)` handle collections. There is no content sniffing. A collection root and its names blob are capped at 16 MiB *(amended during implementation)*.
 - `fetch` tries online effective members in RTT order and moves to the next on failure; iroh-blobs verifies the hash while streaming. It fails with `BlobUnavailable` when every peer fails.
 - Everything added or fetched is protected by a named tag `meshnode/pin/<hash>`. iroh-blobs' own GC is disabled. Unpinning and reference-based GC are sub-spec 3.
 
@@ -304,8 +311,8 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
 | Job | Interval | Notes |
 |---|---|---|
 | `retry_pending` | 60 s, and after every membership rescan | |
-| `compact` | 1 h | |
-| `gc` | 24 h | the store does nothing while stale |
+| `compact` | 1 h | skipped by the scheduler while re-bootstrapping *(amended during implementation)* |
+| `gc` | 24 h | the store does nothing while stale; skipped while re-bootstrapping *(amended during implementation)* |
 | address refresh | on iroh's address-change watcher | writes `addr/<self>` only if the encoded value changed |
 | prune `invites.json` | 1 h | drops expired, unredeemed entries |
 

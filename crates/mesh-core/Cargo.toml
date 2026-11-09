@@ -31,3 +31,4 @@ test-hooks = ["mesh-store/test-hooks"]
 [dev-dependencies]
 mesh-core = { path = ".", features = ["test-hooks"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true

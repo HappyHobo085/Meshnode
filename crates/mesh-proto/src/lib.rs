@@ -9,7 +9,7 @@ mod ticket;
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};
-pub use sync::{SyncMsg, VersionVector, batch_ops};
+pub use sync::{MAX_BATCH_BYTES, MAX_BATCH_OPS, SyncMsg, VersionVector, batch_ops};
 pub use ticket::InviteTicket;
 
 use serde::{Serialize, de::DeserializeOwned};

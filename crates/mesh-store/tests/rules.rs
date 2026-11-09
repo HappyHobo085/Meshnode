@@ -820,7 +820,7 @@ fn covered_marker_lets_peer_advance() {
                 c.apply(o, &AcceptAll).unwrap();
             }
             SyncItem::Covered { origin, upto } => {
-                c.apply_covered(origin, upto, &AcceptAll).unwrap()
+                c.apply_covered(origin, upto, upto, &AcceptAll).unwrap()
             }
         }
     }
@@ -885,14 +885,14 @@ fn apply_covered_drains_pending_and_publishes() {
     b.apply(a2, &AcceptAll).unwrap();
     b.apply(a3, &AcceptAll).unwrap();
     let mut rx = b.subscribe();
-    b.apply_covered(node(1), 1, &AcceptAll).unwrap();
+    b.apply_covered(node(1), 1, 3, &AcceptAll).unwrap();
     assert_eq!(b.version_vector().unwrap().get(&node(1)), 3);
     assert_eq!(b.pending_len().unwrap(), 0);
     assert_eq!(b.get("s", "k").unwrap(), Some(b"2".to_vec()));
     assert_eq!(rx.try_recv().unwrap().kind, ChangeKind::Key("k".into()));
     assert_eq!(rx.try_recv().unwrap().kind, ChangeKind::Key("other".into()));
     // Lower or equal upto is a no-op.
-    b.apply_covered(node(1), 2, &AcceptAll).unwrap();
+    b.apply_covered(node(1), 2, 3, &AcceptAll).unwrap();
     assert_eq!(b.version_vector().unwrap().get(&node(1)), 3);
 }
 
@@ -906,7 +906,7 @@ fn apply_covered_drops_covered_pending() {
     let a3 = a.set("s", "k", b"3").unwrap();
     b.apply(a3, &AcceptAll).unwrap();
     assert_eq!(b.pending_len().unwrap(), 1);
-    b.apply_covered(node(1), 5, &AcceptAll).unwrap();
+    b.apply_covered(node(1), 5, 5, &AcceptAll).unwrap();
     assert_eq!(b.pending_len().unwrap(), 0);
     assert_eq!(b.version_vector().unwrap().get(&node(1)), 5);
     // The covered op's data was never merged.
@@ -918,12 +918,46 @@ fn apply_covered_for_own_origin_raises_next_seq() {
     let (dir, clock) = setup();
     let s = store(dir.path(), 1, &clock);
     s.set("s", "k", b"1").unwrap();
-    s.apply_covered(s.node_id(), 7, &AcceptAll).unwrap();
+    s.apply_covered(s.node_id(), 7, 7, &AcceptAll).unwrap();
     assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 7);
     assert_eq!(s.set("s", "k", b"2").unwrap().body.seq, 8);
     // Not above next_seq: unchanged.
-    s.apply_covered(s.node_id(), 3, &AcceptAll).unwrap();
+    s.apply_covered(s.node_id(), 3, 7, &AcceptAll).unwrap();
     assert_eq!(s.set("s", "k", b"3").unwrap().body.seq, 9);
+}
+
+#[test]
+fn apply_covered_above_advertised_is_ignored() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let a1 = a.set("s", "k", b"1").unwrap();
+    let _a2 = a.set("s", "k", b"2").unwrap();
+    // The sender advertised vv[a] = 2 in its Hello but claims more is covered.
+    b.apply_covered(node(1), 5, 2, &AcceptAll).unwrap();
+    assert_eq!(b.version_vector().unwrap().get(&node(1)), 0);
+    assert_eq!(b.apply(a1, &AcceptAll).unwrap(), Outcome::Applied);
+    // Within the advertised bound it applies.
+    b.apply_covered(node(1), 2, 2, &AcceptAll).unwrap();
+    assert_eq!(b.version_vector().unwrap().get(&node(1)), 2);
+}
+
+#[test]
+fn apply_covered_huge_own_upto_is_ignored() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.set("s", "k", b"1").unwrap();
+    s.apply_covered(s.node_id(), u64::MAX, u64::MAX, &AcceptAll)
+        .unwrap();
+    s.apply_covered(s.node_id(), u64::MAX / 2 + 1, u64::MAX, &AcceptAll)
+        .unwrap();
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 1);
+    // Local writes still work.
+    assert_eq!(s.set("s", "k", b"2").unwrap().body.seq, 2);
+    // The bound itself is accepted.
+    s.apply_covered(s.node_id(), u64::MAX / 2, u64::MAX / 2, &AcceptAll)
+        .unwrap();
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), u64::MAX / 2);
 }
 
 #[test]
@@ -934,28 +968,37 @@ fn version_vector_includes_self_and_full_sync_mark_roundtrips() {
     assert_eq!(s.last_full_sync_ms().unwrap(), None);
     s.set("s", "k", b"1").unwrap();
     assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 1);
+    assert_eq!(s.synced_self_seq().unwrap(), None);
     clock.set(T0 + 5);
-    s.mark_full_sync().unwrap();
+    s.mark_full_sync(1).unwrap();
     assert_eq!(s.last_full_sync_ms().unwrap(), Some(T0 + 5));
+    assert_eq!(s.synced_self_seq().unwrap(), Some(1));
+    // A peer cannot confirm seqs this node never wrote; a lower one does not lower it.
+    s.mark_full_sync(9).unwrap();
+    assert_eq!(s.synced_self_seq().unwrap(), Some(1));
+    s.mark_full_sync(0).unwrap();
+    assert_eq!(s.synced_self_seq().unwrap(), Some(1));
     drop(s);
     let s = store(dir.path(), 1, &clock);
     assert_eq!(s.last_full_sync_ms().unwrap(), Some(T0 + 5));
+    assert_eq!(s.synced_self_seq().unwrap(), Some(1));
 }
 
 // ---- Task 6: maintenance ----
 
 use mesh_store::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 
-/// Feeds `items` (from `diff_since`) into `to`.
-fn feed(to: &Store<ManualClock>, items: Vec<SyncItem>) {
+/// Feeds `items` (from `from.diff_since`) into `to`; `from`'s vector is the advertised one.
+fn feed(to: &Store<ManualClock>, from: &Store<ManualClock>, items: Vec<SyncItem>) {
+    let advertised = from.version_vector().unwrap();
     for item in items {
         match item {
             SyncItem::Op(o) => {
                 to.apply(o, &AcceptAll).unwrap();
             }
-            SyncItem::Covered { origin, upto } => {
-                to.apply_covered(origin, upto, &AcceptAll).unwrap()
-            }
+            SyncItem::Covered { origin, upto } => to
+                .apply_covered(origin, upto, advertised.get(&origin), &AcceptAll)
+                .unwrap(),
         }
     }
 }
@@ -1036,7 +1079,7 @@ fn compacted_store_feeds_fresh_peer_to_same_reads() {
     assert!(a.compact().unwrap() > 0);
     let items = a.diff_since(&VersionVector::default(), 1000).unwrap();
     assert!(items.iter().any(|i| matches!(i, SyncItem::Covered { .. })));
-    feed(&c, items);
+    feed(&c, &a, items);
     for k in ["a", "b", "c", "d", "o", "never"] {
         assert_eq!(c.get("s", k).unwrap(), a.get("s", k).unwrap(), "{k}");
         assert_eq!(
@@ -1074,7 +1117,7 @@ fn tombstone_gc_after_90_days() {
     let mut rx = a.subscribe();
     clock.advance(TOMBSTONE_TTL_MS);
     // A's own ops of k must be covered by a full sync before they can be GC'd.
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(4).unwrap();
     assert_eq!(a.gc().unwrap(), 0);
     clock.advance(1);
     assert_eq!(a.gc().unwrap(), 1);
@@ -1108,10 +1151,14 @@ fn gc_without_compaction_does_not_resurrect_on_fresh_peer() {
     a.delete("s", "k").unwrap();
     a.set("s", "other", b"o").unwrap();
     clock.advance(TOMBSTONE_TTL_MS + 1);
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(4).unwrap();
     // No compact() ran: the superseded ops of k must not outlive the GC.
     assert_eq!(a.gc().unwrap(), 1);
-    feed(&c, a.diff_since(&VersionVector::default(), 100).unwrap());
+    feed(
+        &c,
+        &a,
+        a.diff_since(&VersionVector::default(), 100).unwrap(),
+    );
     assert_eq!(c.get("s", "k").unwrap(), None);
     assert_eq!(c.get_entry("s", "k").unwrap(), None);
     assert_eq!(c.get("s", "other").unwrap(), Some(b"o".to_vec()));
@@ -1125,7 +1172,7 @@ fn stale_after_80_days() {
     let (dir, clock) = setup();
     let s = store(dir.path(), 1, &clock);
     assert!(!s.is_stale().unwrap());
-    s.mark_full_sync().unwrap();
+    s.mark_full_sync(0).unwrap();
     clock.advance(STALE_MS);
     assert!(!s.is_stale().unwrap());
     clock.advance(1);
@@ -1148,25 +1195,58 @@ fn export_unsynced_local_ops_after_last_full_sync() {
         a.export_unsynced_local_ops().unwrap(),
         vec![SyncItem::Op(o1), SyncItem::Op(o2)]
     );
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(2).unwrap();
     assert!(a.export_unsynced_local_ops().unwrap().is_empty());
     clock.advance(1);
     let o3 = a.delete("s", "k").unwrap();
     let o4 = a.set("s", "z", b"z").unwrap();
     a.apply(b.set("s", "j", b"b2").unwrap(), &AcceptAll)
         .unwrap();
-    // Seqs 1..=2 were synced: covered before the first exported op.
+    // Seqs 1..=2 were synced: no marker below the boundary (catch-up brings them back).
     assert_eq!(
         a.export_unsynced_local_ops().unwrap(),
-        vec![
-            SyncItem::Covered {
-                origin: node(1),
-                upto: 2
-            },
-            SyncItem::Op(o3),
-            SyncItem::Op(o4)
-        ]
+        vec![SyncItem::Op(o3), SyncItem::Op(o4)]
     );
+}
+
+#[test]
+fn own_write_during_sync_session_is_not_counted_as_synced() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"1").unwrap();
+    // The peer's diff is computed here: it will hold seq 1. Then, still during the
+    // session, A writes seq 2 at the same wall time as the sync completes.
+    let o2 = a.set("s", "k", b"2").unwrap();
+    a.mark_full_sync(1).unwrap();
+    assert_eq!(
+        a.export_unsynced_local_ops().unwrap(),
+        vec![SyncItem::Op(o2)]
+    );
+}
+
+#[test]
+fn export_covers_only_holes_above_the_synced_seq() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"1").unwrap(); // 1
+    a.set("s", "j", b"1").unwrap(); // 2
+    a.mark_full_sync(2).unwrap();
+    a.set("s", "k", b"2").unwrap(); // 3 supersedes 1
+    a.set("s", "j", b"2").unwrap(); // 4 supersedes 2
+    a.set("s", "k", b"3").unwrap(); // 5 supersedes 3
+    let o6 = a.set("s", "j", b"3").unwrap(); // 6 supersedes 4
+    clock.advance(SETTLE_MS);
+    assert_eq!(a.compact().unwrap(), 4);
+    let items = a.export_unsynced_local_ops().unwrap();
+    // Holes 3..=4 lie above the boundary 2: one marker up to 4, nothing for 1..=2.
+    assert!(matches!(
+        items.as_slice(),
+        [
+            SyncItem::Covered { upto: 4, .. },
+            SyncItem::Op(o5),
+            SyncItem::Op(o)
+        ] if o5.body.seq == 5 && *o == o6
+    ));
 }
 
 #[test]
@@ -1183,7 +1263,7 @@ fn reset_keeps_seq() {
     a.apply(b.set("s", "b", b"b3").unwrap(), &AcceptAll)
         .unwrap();
     assert_eq!(a.pending_len().unwrap(), 1);
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(3).unwrap();
     a.reset_to_empty().unwrap();
     assert_eq!(a.get("s", "k").unwrap(), None);
     assert_eq!(a.get_entry("s", "b").unwrap(), None);
@@ -1249,7 +1329,8 @@ fn reapply(to: &Store<ManualClock>, items: Vec<SyncItem>) {
                 assert_eq!(to.apply(o, &AcceptAll).unwrap(), Outcome::Applied);
             }
             SyncItem::Covered { origin, upto } => {
-                to.apply_covered(origin, upto, &AcceptAll).unwrap()
+                // Exported by this node itself: the marker is its own bound.
+                to.apply_covered(origin, upto, upto, &AcceptAll).unwrap()
             }
         }
     }
@@ -1319,12 +1400,12 @@ fn gc_does_nothing_while_stale() {
     let a = store(dir.path(), 1, &clock);
     a.set("s", "k", b"v").unwrap();
     a.delete("s", "k").unwrap();
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(2).unwrap();
     clock.advance(TOMBSTONE_TTL_MS + 1);
     assert!(a.is_stale().unwrap());
     assert_eq!(a.gc().unwrap(), 0);
     assert!(a.get_entry("s", "k").unwrap().is_some());
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(2).unwrap();
     assert_eq!(a.gc().unwrap(), 1);
 }
 
@@ -1333,19 +1414,24 @@ fn gc_keeps_keys_with_own_unsynced_ops() {
     let (dir, clock) = setup();
     let a = store(dir.path(), 1, &clock);
     let b = store(dir.path(), 2, &clock);
-    // Never synced: A's own tombstone may not have reached anyone.
-    a.set("s", "own", b"v").unwrap();
-    a.delete("s", "own").unwrap();
-    // B's old tombstone of `k`, with no op of A under it.
+    a.set("s", "own", b"v").unwrap(); // 1
+    a.delete("s", "own").unwrap(); // 2
+    // A's write of k (seq 3), then B's newer tombstone of k.
+    a.set("s", "k", b"late").unwrap();
+    clock.advance(5);
     a.apply(b.delete("s", "k").unwrap(), &AcceptAll).unwrap();
+    assert_eq!(a.get("s", "k").unwrap(), None);
     clock.advance(TOMBSTONE_TTL_MS + 1);
-    // `k` goes; `own` holds unsynced own ops.
-    assert_eq!(a.gc().unwrap(), 1);
-    assert!(a.get_entry("s", "k").unwrap().is_none());
-    assert!(a.get_entry("s", "own").unwrap().is_some());
-    a.mark_full_sync().unwrap();
+    // Never synced: every own op may be unknown to the others.
+    assert_eq!(a.gc().unwrap(), 0);
+    // The peer confirmed seqs 1..=2 only: `own` goes, `k` holds unsynced seq 3.
+    a.mark_full_sync(2).unwrap();
     assert_eq!(a.gc().unwrap(), 1);
     assert!(a.get_entry("s", "own").unwrap().is_none());
+    assert!(a.get_entry("s", "k").unwrap().is_some());
+    a.mark_full_sync(3).unwrap();
+    assert_eq!(a.gc().unwrap(), 1);
+    assert!(a.get_entry("s", "k").unwrap().is_none());
 }
 
 #[test]
@@ -1357,7 +1443,7 @@ fn gc_never_runs_on_own_ops_of_a_never_synced_store() {
     clock.advance(TOMBSTONE_TTL_MS + 1);
     assert!(!a.is_stale().unwrap());
     assert_eq!(a.gc().unwrap(), 0);
-    a.mark_full_sync().unwrap();
+    a.mark_full_sync(2).unwrap();
     assert_eq!(a.gc().unwrap(), 1);
 }
 
@@ -1384,7 +1470,11 @@ fn late_arriving_old_tombstone_is_kept_for_ttl_after_arrival() {
         "a tombstone that just arrived is not GC'd"
     );
     // B catches up from A and must learn the deletion.
-    feed(&b, a.diff_since(&b.version_vector().unwrap(), 100).unwrap());
+    feed(
+        &b,
+        &a,
+        a.diff_since(&b.version_vector().unwrap(), 100).unwrap(),
+    );
     assert_eq!(b.get("s", "k").unwrap(), None);
     assert!(b.get_entry("s", "k").unwrap().is_some());
     // 90 days after its arrival, it goes.

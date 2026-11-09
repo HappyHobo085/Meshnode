@@ -265,14 +265,14 @@ fn peer_of(r: usize, peer: usize, m: usize) -> usize {
 }
 
 /// Applies catch-up items in order (`Op` → `apply`, `Covered` → `apply_covered`).
-fn feed(to: &S, items: Vec<SyncItem>) {
+fn feed(to: &S, items: Vec<SyncItem>, advertised: &VersionVector) {
     for item in items {
         match item {
             SyncItem::Op(o) => {
                 to.apply(o, &AcceptAll).expect("apply");
             }
             SyncItem::Covered { origin, upto } => {
-                to.apply_covered(origin, upto, &AcceptAll)
+                to.apply_covered(origin, upto, advertised.get(&origin), &AcceptAll)
                     .expect("apply_covered");
             }
         }
@@ -285,7 +285,7 @@ fn pull(to: &S, from: &S, limit: usize) -> usize {
         .diff_since(&to.version_vector().expect("vv"), limit)
         .expect("diff_since");
     let n = items.len();
-    feed(to, items);
+    feed(to, items, &from.version_vector().expect("vv"));
     n
 }
 
@@ -776,7 +776,7 @@ fn gc_case(case: GcCase) -> Result<usize, TestCaseError> {
 
 /// Records a completed full sync on a reader (readers write nothing of their own).
 fn mark_synced(s: &S) {
-    s.mark_full_sync().expect("mark_full_sync");
+    s.mark_full_sync(0).expect("mark_full_sync");
 }
 
 /// Random `gc()` calls (after the clocks passed the TTL) are invisible to the live reads

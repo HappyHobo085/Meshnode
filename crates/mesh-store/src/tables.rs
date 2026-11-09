@@ -1,7 +1,8 @@
 //! redb table definitions and postcard value structs.
 //!
 //! Value encodings:
-//! - `meta`: `mesh`/`node` = 32 raw bytes; `next_seq`, `last_hlc`, `schema` = u64 big-endian.
+//! - `meta`: `mesh`/`node` = 32 raw bytes; `next_seq`, `last_hlc`, `schema`,
+//!   `last_full_sync_ms`, `synced_self_seq` = u64 big-endian.
 //! - `reg`: [`RegRow`]; `set`: [`SetRow`]; `ops`: [`OpRow`]; `pending`: [`PendingRow`] (postcard).
 //! - `vv` (highest gap-free seq), `removed` (max cutoff seq), `superseded` (superseded-at ms): u64 big-endian.
 
@@ -32,6 +33,8 @@ pub(crate) mod meta {
     pub const LAST_HLC: &str = "last_hlc";
     pub const SCHEMA: &str = "schema";
     pub const LAST_FULL_SYNC_MS: &str = "last_full_sync_ms";
+    /// Highest own seq a peer confirmed holding at a completed full sync (Ruling R15).
+    pub const SYNCED_SELF_SEQ: &str = "synced_self_seq";
 }
 
 pub(crate) const SCHEMA_VERSION: u64 = 1;

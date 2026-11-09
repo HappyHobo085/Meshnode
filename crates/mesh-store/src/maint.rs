@@ -138,16 +138,22 @@ impl<W: WallClock> Store<W> {
     /// removed yet, so a fresh peer catching up from this store can't resurrect an old
     /// value) and every invalid op of the key that does not beat the winner, each with its
     /// `superseded` entry. A key is skipped if that would delete one of this node's own
-    /// ops received after the last full sync (or if it never synced): the op may not have
-    /// reached any peer yet. Set rows are untouched. Publishes one `Change` per GC'd key
+    /// ops with a seq above the `synced_self_seq` of the last full sync (any own op if it
+    /// never synced): the op may not have reached any peer yet. Set rows are untouched. Publishes one `Change` per GC'd key
     /// after commit (`local: false`: nothing to broadcast). Returns the number of keys.
     pub fn gc(&self) -> Result<usize, StoreError> {
         let clock = self.lock_clock();
         let now = clock.wall().now_ms();
         let cutoff = now.saturating_sub(TOMBSTONE_TTL_MS);
         let tx = self.db.begin_write()?;
-        let synced = meta_u64(&tx.open_table(META)?, meta::LAST_FULL_SYNC_MS)?;
-        if synced.is_some_and(|t| t < now.saturating_sub(STALE_MS)) {
+        let (synced_ms, synced_seq) = {
+            let m = tx.open_table(META)?;
+            (
+                meta_u64(&m, meta::LAST_FULL_SYNC_MS)?,
+                meta_u64(&m, meta::SYNCED_SELF_SEQ)?,
+            )
+        };
+        if synced_ms.is_some_and(|t| t < now.saturating_sub(STALE_MS)) {
             tx.abort()?;
             return Ok(0);
         }
@@ -230,7 +236,7 @@ impl<W: WallClock> Store<W> {
                     // Would win if a raised cutoff re-validated it: keep.
                     continue;
                 }
-                if b.origin == self.node && synced.is_none_or(|t| row.received_ms > t) {
+                if b.origin == self.node && synced_seq.is_none_or(|s| b.seq > s) {
                     d.unsafe_own = true;
                 }
                 let (origin, seq) = keys::split_op_key("ops", k.value())?;
@@ -281,29 +287,31 @@ impl<W: WallClock> Store<W> {
             .is_some_and(|t| t < now.saturating_sub(STALE_MS)))
     }
 
-    /// This node's own ops received (written) after the last full sync — all of them if
-    /// it never synced — in seq order, for re-applying after re-bootstrap. Own ops
-    /// already compacted leave holes; before each op that does not directly follow the
-    /// previous exported one (or, for the first, whenever its seq is above 1) a
-    /// `Covered { origin: self, upto: seq - 1 }` is emitted, so re-applying never parks
-    /// an op behind a gap. Re-apply `Op` items with `apply` and `Covered` items with
-    /// `apply_covered`, in order.
+    /// This node's own ops with a seq above the `synced_self_seq` of the last full sync
+    /// (Ruling R15) — all of them if it never synced — in seq order, for re-applying after
+    /// re-bootstrap. Own ops already compacted leave holes; for a hole strictly above the
+    /// boundary (before an exported op that does not directly follow the previous exported
+    /// one or the boundary) a `Covered { origin: self, upto: seq - 1 }` is emitted, so
+    /// re-applying never parks an op behind a gap. Seqs at or below the boundary are never
+    /// covered by an export: the catch-up from the peers brings them back. Re-apply `Op`
+    /// items with `apply` and `Covered` items with `apply_covered(self, upto, upto, ..)`,
+    /// in order.
     pub fn export_unsynced_local_ops(&self) -> Result<Vec<SyncItem>, StoreError> {
         let tx = self.db.begin_read()?;
-        let since = meta_u64(&tx.open_table(META)?, meta::LAST_FULL_SYNC_MS)?;
+        let synced = meta_u64(&tx.open_table(META)?, meta::SYNCED_SELF_SEQ)?.unwrap_or(0);
         let ops = tx.open_table(OPS)?;
-        let lo = keys::op_key(&self.node, 0);
+        let Some(first) = synced.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        let lo = keys::op_key(&self.node, first);
         let hi = keys::op_key(&self.node, u64::MAX);
         let mut out = Vec::new();
-        let mut prev: u64 = 0;
+        let mut prev: u64 = synced;
         for item in ops.range(lo.as_slice()..=hi.as_slice())? {
             let (_, v) = item?;
             let row: OpRow = tables::decode("ops", v.value())?;
-            if since.is_some_and(|t| row.received_ms <= t) {
-                continue;
-            }
             let seq = row.op.body.seq;
-            // Seqs are >= 1 and ascending, so `seq - 1 >= prev` here.
+            // Seqs are ascending and above `synced`, so `seq - 1 >= prev` here.
             if seq != prev.saturating_add(1) {
                 out.push(SyncItem::Covered {
                     origin: self.node,
@@ -318,7 +326,8 @@ impl<W: WallClock> Store<W> {
 
     /// Clears every table except `meta` and `removed`, in one write transaction. `meta`
     /// keeps the mesh and node ids, schema, `next_seq` and `last_hlc` (so seqs and HLCs
-    /// never repeat); `last_full_sync_ms` is removed because the store is now empty.
+    /// never repeat); `last_full_sync_ms` and `synced_self_seq` are removed because the
+    /// store is now empty.
     /// `removed` is kept so the catch-up that follows still stores ops above a removal
     /// cutoff as invalid. Publishes nothing.
     ///

@@ -96,12 +96,35 @@ impl<W: WallClock> Store<W> {
     /// Pending entries now covered are dropped. For this node's own origin, `next_seq`
     /// is raised to `upto + 1` so a seq is never reused. Publishes change events for
     /// anything merged by the drain.
+    ///
+    /// `advertised` is the sender's `vv[origin]` from its `Hello` (Ruling R16): a marker
+    /// above it is a lie or a bug and is ignored (no-op, `tracing::warn!`), as is a marker
+    /// for this node's own origin above `u64::MAX / 2` (it would exhaust `next_seq`).
+    /// When re-applying this node's own [`Store::export_unsynced_local_ops`] items, pass
+    /// `upto` itself.
     pub fn apply_covered(
         &self,
         origin: NodeId,
         upto: u64,
+        advertised: u64,
         acc: &dyn Acceptor,
     ) -> Result<(), StoreError> {
+        if upto > advertised {
+            tracing::warn!(
+                origin = %origin.short(),
+                upto,
+                advertised,
+                "ignoring a Covered marker above the sender's advertised version vector"
+            );
+            return Ok(());
+        }
+        if origin == self.node && upto > u64::MAX / 2 {
+            tracing::warn!(
+                upto,
+                "ignoring a Covered marker for this node's own origin above u64::MAX / 2"
+            );
+            return Ok(());
+        }
         let mut clock = self.lock_clock();
         let tx = self.db.begin_write()?;
         if upto <= vv_get(&tx, &origin)? {
@@ -129,16 +152,38 @@ impl<W: WallClock> Store<W> {
         Ok(())
     }
 
-    /// Records that a full sync just completed (`wall.now_ms()`).
-    pub fn mark_full_sync(&self) -> Result<(), StoreError> {
+    /// Records that a **full sync** just completed (Ruling R15). A full sync is a completed
+    /// two-way exchange with a peer: both sides sent everything the other lacked. mesh-core
+    /// must call this after each one, including the catch-up right after joining.
+    ///
+    /// `synced_self_seq` is the peer's `vv[self]` at the end of the exchange: the highest
+    /// of this node's own seqs the peer confirmed holding. Two values are stored:
+    ///
+    /// - `last_full_sync_ms = wall.now_ms()`, used only for staleness ([`Store::is_stale`]);
+    /// - `synced_self_seq`, the boundary for "unsynced own ops": [`Store::gc`] never
+    ///   deletes, and [`Store::export_unsynced_local_ops`] always exports, own ops with a
+    ///   seq above it. An own write made during the session after the peer's diff was
+    ///   computed is above it, so it is never counted as synced.
+    ///
+    /// The stored boundary only grows (a later sync with a peer that confirms less does not
+    /// lower it) and is capped at the last own seq this node used (`next_seq - 1`). A store
+    /// that never synced has no boundary (every own op is unsynced) and is never stale.
+    pub fn mark_full_sync(&self, synced_self_seq: u64) -> Result<(), StoreError> {
         let clock = self.lock_clock();
         let now = clock.wall().now_ms();
         let tx = self.db.begin_write()?;
         {
             let mut m = tx.open_table(META)?;
+            let last_used = crate::meta_u64_req(&m, meta::NEXT_SEQ)?.saturating_sub(1);
+            let old = meta_u64(&m, meta::SYNCED_SELF_SEQ)?.unwrap_or(0);
+            let seq = synced_self_seq.min(last_used).max(old);
             m.insert(
                 meta::LAST_FULL_SYNC_MS.as_bytes(),
                 keys::u64_value(now).as_slice(),
+            )?;
+            m.insert(
+                meta::SYNCED_SELF_SEQ.as_bytes(),
+                keys::u64_value(seq).as_slice(),
             )?;
         }
         tx.commit()?;
@@ -150,6 +195,13 @@ impl<W: WallClock> Store<W> {
         let tx = self.db.begin_read()?;
         let m = tx.open_table(META)?;
         meta_u64(&m, meta::LAST_FULL_SYNC_MS)
+    }
+
+    /// The own-seq boundary recorded by `mark_full_sync` (`None` if never synced).
+    pub fn synced_self_seq(&self) -> Result<Option<u64>, StoreError> {
+        let tx = self.db.begin_read()?;
+        let m = tx.open_table(META)?;
+        meta_u64(&m, meta::SYNCED_SELF_SEQ)
     }
 
     /// Test hook simulating compaction: deletes only the `ops` row of `(origin, seq)`.

@@ -93,7 +93,7 @@ pub struct InviteTicket { pub mesh: MeshId, pub inviter: NodeAddrBytes, pub toke
 
 - Domain separation: the signature covers `b"meshnode/op/1"` plus the body, and the body includes `mesh`, so an op can't be replayed into another mesh or another protocol.
 - `NodeAddrBytes` is an opaque `Vec<u8>` here. Sub-spec 2 fills it with iroh's serialized address, so proto doesn't depend on iroh.
-- Size limits are checked on decode: `ns` ≤ 64 bytes, `key` and `set` ≤ 512 bytes, `order` ≤ 64 bytes, `value` and `member` ≤ 1 MiB.
+- Size limits are checked on decode: `ns` ≤ 64 bytes, `key` and `set` ≤ 512 bytes, `order` ≤ 64 bytes, `value` and `member` ≤ 1 MiB. `ns`, `key` and `set` must not contain a `0x00` byte, because the store uses it as a key separator. The same checks apply to local writes.
 - `join/1` and `http/1` message types are added to this crate by sub-specs 2 and 4.
 
 ## 5. `mesh-store`

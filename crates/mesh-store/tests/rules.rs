@@ -1571,3 +1571,32 @@ fn removal_after_settle_cannot_restore_and_warns() {
         vec![("s".to_string(), "k".to_string())]
     );
 }
+
+// ---- Bench (informational) ----
+
+#[test]
+#[ignore]
+fn bench_apply_100k() {
+    use std::time::Instant;
+    const N: u64 = 100_000;
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    let ops: Vec<SignedOp> = (1..=N)
+        .map(|i| hand_op(2, i, T0, &format!("k{}", i % 10_000), b"value"))
+        .collect();
+    let t = Instant::now();
+    for op in ops {
+        assert_eq!(s.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+    }
+    let apply = t.elapsed();
+    let t = Instant::now();
+    for i in 0..10_000u64 {
+        assert!(s.get("s", &format!("k{i}")).unwrap().is_some());
+    }
+    let get = t.elapsed();
+    println!(
+        "apply {N} remote ops: {apply:?} ({:.0} ops/s); 10000 gets: {get:?} ({:.1} us/get)",
+        N as f64 / apply.as_secs_f64(),
+        get.as_secs_f64() * 1e6 / 10_000.0
+    );
+}

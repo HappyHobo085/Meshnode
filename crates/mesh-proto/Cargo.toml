@@ -1,0 +1,15 @@
+[package]
+name = "mesh-proto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-hlc = { path = "../mesh-hlc" }
+serde.workspace = true
+postcard.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+data-encoding.workspace = true
+crc32fast.workspace = true

@@ -174,9 +174,12 @@ impl Reactor {
         }
         self.publish(&snap);
 
-        // 4. Close connections to peers that are no longer effective.
+        // 4. Close connections to removed peers. Only a removal record present in the
+        // snapshot justifies `REMOVED` (the peer turns `RefusedAsRemoved` on it); a peer the
+        // snapshot does not know yet (a joiner's provisional target) is not removed, and
+        // step 5 drops non-targets with `SHUTDOWN`.
         for id in c.peers.target_ids() {
-            if !snap.is_effective(&id) {
+            if snap.removed_by(&id).is_some() {
                 c.peers.close(id, REMOVED);
             }
         }

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{T, converged, test_cfg, wait_until};
-use mesh_core::{Node, NodeError};
+use mesh_core::{Node, NodeError, NodeEvent, NodeStatus};
 use mesh_proto::{InviteTicket, NodeId, Role};
 use tokio::time::timeout;
 
@@ -69,6 +69,45 @@ async fn join_via_non_founder_while_founder_offline() {
     })
     .await;
     key_reaches(&b, &c, "k1").await;
+
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// The joiner's own `_mesh` writes during its join window trigger membership rescans while
+/// the inviter is only a provisional peer (not yet in the joiner's snapshot). Those rescans
+/// must not close the inviter with `REMOVED`: the inviter would turn `RefusedAsRemoved` and
+/// stop serving invites and joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inviter_stays_running_through_joiners_first_sync() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (_ia, b) = mesh_of_two(dirs[0].path(), dirs[1].path()).await;
+    let mut b_events = b.subscribe();
+
+    let ticket = b.invite(Role::Host, TTL).await.unwrap();
+    let c = join(dirs[2].path(), "c", ticket).await.unwrap();
+    // Keep changing `_mesh` on C until its first sync completes, so rescans run while B is
+    // still provisional.
+    let mut n = 0u32;
+    while !c.first_sync_complete() && n < 200 {
+        let _ = c.set_info(Some(format!("c{n}")), None).await;
+        n += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(c.wait_first_sync(FIRST_SYNC).await, "C's first sync");
+    key_reaches(&b, &c, "k3").await;
+
+    assert!(
+        matches!(b.status(), NodeStatus::Running),
+        "the inviter must stay Running, got {:?}",
+        b.status()
+    );
+    while let Ok(ev) = b_events.try_recv() {
+        assert!(
+            !matches!(ev, NodeEvent::RefusedAsRemoved(_)),
+            "the inviter was refused as removed by the joiner"
+        );
+    }
 
     b.shutdown().await;
     c.shutdown().await;

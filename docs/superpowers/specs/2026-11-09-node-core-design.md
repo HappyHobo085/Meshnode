@@ -120,7 +120,7 @@ pub enum NodeEvent {
   1. Rebuild `MembershipSnapshot` from the store.
   2. For every origin whose effective cutoff is above the cutoff last applied, call `store.on_removal(origin, cutoff)`. Applied cutoffs are cached in memory; the cache is cleared on `Lagged` and on restart, which is safe because `on_removal` is idempotent.
   3. `store.retry_pending(acc)`.
-  4. Close connections to peers that are no longer effective members (code `REMOVED`).
+  4. Close connections to peers that have a removal record in the snapshot (code `REMOVED`). A peer the snapshot merely does not know yet (a joiner's provisional target) is not removed; step 5 drops non-targets with `SHUTDOWN` *(amended during implementation)*.
   5. Update `PeerManager`'s target set (a joiner's provisional targets, §5.3 step 5, are kept until its first sync completes) *(amended during implementation)*.
   6. If this node is no longer effective: `status = Removed { by }`, refuse local writes, emit `RemovedSelf` (handoff Must 5). Removal by another node stops every session and the peer manager at once. **Sign-out** (this node removing itself) shows `Removed` at once but keeps its sessions until a peer proves it holds the record (a `REMOVED` close, or a peer `Hello` advertising `vv[self]` ≥ the record's seq); then it stops, so the record is not stranded on this node *(amended during implementation)*. The node stays in this state across restarts; leaving it is `reset identity` (sub-spec 4).
   7. If no effective host remains, emit `NoEffectiveHost`.

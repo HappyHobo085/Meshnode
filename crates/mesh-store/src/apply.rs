@@ -8,6 +8,7 @@
 //! removal check and judge).
 
 use crate::error::StoreError;
+use crate::removal::is_cutoff_exempt;
 use crate::tables::{
     self, META, OPS, OpRow, PENDING, PendingRow, REG, REMOVED, SET, SUPERSEDED, VV, meta,
 };
@@ -324,7 +325,10 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         }
 
         // 3. Observe; persist the clock so a reopen never goes backwards.
-        if let Err(skew) = self.clock.observe(op.body.hlc) {
+        // An own op at or below the clock (re-applied after a reset) is exempt from the
+        // skew check: this node issued it, so its HLC is no evidence of a remote's skew.
+        let own_replay = origin == self.node && op.body.hlc <= self.clock.last();
+        if !own_replay && let Err(skew) = self.clock.observe(op.body.hlc) {
             tracing::debug!(origin = %origin.short(), seq, "deferring op: {skew}");
             return self.defer(op, DeferReason::Skew, first_seen_ms);
         }
@@ -337,7 +341,10 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         }
 
         // 4. Above a removed origin's cutoff: keep as invalid (covered), don't merge.
-        if removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff) {
+        // Removal records are exempt (node-core spec §2.3): they continue to `judge`.
+        if !is_cutoff_exempt(&op.body.payload)
+            && removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff)
+        {
             self.record(&op, true)?;
             // Compaction ages an invalid op from when it became invalid (Ruling R9).
             self.tx.open_table(SUPERSEDED)?.insert(

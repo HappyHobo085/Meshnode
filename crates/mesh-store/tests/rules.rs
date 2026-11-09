@@ -1282,11 +1282,11 @@ fn export_unsynced_local_ops_after_last_full_sync() {
     a.apply(b.set("s", "j", b"b").unwrap(), &AcceptAll).unwrap();
     // Never synced: every own op.
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o1), SyncItem::Op(o2)]
     );
     a.mark_full_sync(2).unwrap();
-    assert!(a.export_unsynced_local_ops().unwrap().is_empty());
+    assert!(a.export_unsynced_local_ops().unwrap().items.is_empty());
     clock.advance(1);
     let o3 = a.delete("s", "k").unwrap();
     let o4 = a.set("s", "z", b"z").unwrap();
@@ -1294,7 +1294,7 @@ fn export_unsynced_local_ops_after_last_full_sync() {
         .unwrap();
     // Seqs 1..=2 were synced: no marker below the boundary (catch-up brings them back).
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o3), SyncItem::Op(o4)]
     );
 }
@@ -1309,7 +1309,7 @@ fn own_write_during_sync_session_is_not_counted_as_synced() {
     let o2 = a.set("s", "k", b"2").unwrap();
     a.mark_full_sync(1).unwrap();
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o2)]
     );
 }
@@ -1327,7 +1327,7 @@ fn export_covers_only_holes_above_the_synced_seq() {
     let o6 = a.set("s", "j", b"3").unwrap(); // 6 supersedes 4
     clock.advance(SETTLE_MS);
     assert_eq!(a.compact().unwrap(), 4);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     // Holes 3..=4 lie above the boundary 2: one marker up to 4, nothing for 1..=2.
     assert!(matches!(
         items.as_slice(),
@@ -1390,7 +1390,7 @@ fn local_write_refused_until_exported_ops_are_reapplied() {
     let a = store(dir.path(), 1, &clock);
     a.set("s", "k", b"1").unwrap();
     a.set("s", "j", b"2").unwrap();
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     a.reset_to_empty().unwrap();
     assert!(matches!(
         a.set("s", "k", b"x"),
@@ -1473,7 +1473,7 @@ fn export_after_compaction_reapplies_without_gaps() {
     a.set("s", "k2", b"x").unwrap();
     clock.advance(SETTLE_MS + 1);
     assert_eq!(a.compact().unwrap(), 1);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     assert!(matches!(
         items.as_slice(),
         [
@@ -1511,7 +1511,7 @@ fn export_covers_holes_between_exported_ops() {
     a.set("s", "j", b"2").unwrap(); // 4 supersedes 2
     clock.advance(SETTLE_MS);
     assert_eq!(a.compact().unwrap(), 2);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     assert!(matches!(
         items.as_slice(),
         [
@@ -1974,4 +1974,153 @@ fn bench_apply_100k() {
         "apply_batch {N} remote ops in batches of {BATCH}: {batched:?} ({:.0} ops/s)",
         N as f64 / batched.as_secs_f64()
     );
+}
+
+fn rec(n: u8) -> Vec<u8> {
+    node(n).0.to_vec()
+}
+
+/// Origin 1 writes 4 filler ops, then a removal record for node 3 (seq 5) and `n/k` (seq 6).
+fn exempt_ops(x: &Store<ManualClock>) -> Vec<SignedOp> {
+    let mut ops: Vec<SignedOp> = (0..4)
+        .map(|i| x.set("f", &format!("{i}"), b"f").unwrap())
+        .collect();
+    ops.push(x.set_add("_mesh", "removed", &rec(3)).unwrap());
+    ops.push(x.set("n", "k", b"v").unwrap());
+    ops
+}
+
+#[test]
+fn removal_record_survives_issuer_removal() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r1 = store(dir.path(), 2, &clock);
+    for op in exempt_ops(&x) {
+        assert_eq!(r1.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+    }
+    r1.on_removal(node(1), 4).unwrap();
+    assert!(r1.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r1.get("n", "k").unwrap(), None);
+}
+
+#[test]
+fn exempt_op_above_cutoff_applied_after_removal() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r2 = store(dir.path(), 2, &clock);
+    let ops = exempt_ops(&x);
+    for op in &ops[..4] {
+        r2.apply(op.clone(), &AcceptAll).unwrap();
+    }
+    r2.on_removal(node(1), 4).unwrap();
+    assert_eq!(
+        r2.apply(ops[4].clone(), &AcceptAll).unwrap(),
+        Outcome::Applied
+    );
+    assert_eq!(
+        r2.apply(ops[5].clone(), &AcceptAll).unwrap(),
+        Outcome::Ignored
+    );
+    assert!(r2.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r2.get("n", "k").unwrap(), None);
+}
+
+#[test]
+fn exempt_op_above_cutoff_waits_behind_gap() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let r2 = store(dir.path(), 2, &clock);
+    let ops = exempt_ops(&x);
+    r2.apply(ops[0].clone(), &AcceptAll).unwrap();
+    r2.on_removal(node(1), 1).unwrap();
+    // The exempt record at seq 5 waits behind the gap (seqs 2..=4 missing).
+    assert_eq!(
+        r2.apply(ops[4].clone(), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    for op in &ops[1..4] {
+        assert_eq!(r2.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Ignored);
+    }
+    assert!(r2.set_contains("_mesh", "removed", &rec(3)).unwrap());
+    assert_eq!(r2.vv_of(node(1)).unwrap(), 5);
+    assert_eq!(r2.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn mutual_removal_both_records_kept() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let y = store(dir.path(), 2, &clock);
+    let xs = [
+        x.set("f", "a", b"1").unwrap(),
+        x.set_add("_mesh", "removed", &rec(2)).unwrap(),
+    ];
+    let ys = [
+        y.set("f", "a", b"1").unwrap(),
+        y.set_add("_mesh", "removed", &rec(1)).unwrap(),
+    ];
+    for (n, order) in [(3u8, [&xs, &ys]), (4u8, [&ys, &xs])] {
+        let r = store(dir.path(), n, &clock);
+        for ops in order {
+            for op in ops {
+                r.apply(op.clone(), &AcceptAll).unwrap();
+            }
+            // The record just merged removes the other side (and the issuer's own id).
+            let issuer = ops[0].body.origin;
+            let target = if issuer == node(1) { node(2) } else { node(1) };
+            r.on_removal(target, 1).unwrap();
+        }
+        assert!(r.set_contains("_mesh", "removed", &rec(1)).unwrap(), "r{n}");
+        assert!(r.set_contains("_mesh", "removed", &rec(2)).unwrap(), "r{n}");
+    }
+}
+
+#[test]
+fn export_puts_old_sets_in_expired() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let o1 = a.set("s", "k", b"1").unwrap();
+    let o2 = a.set_add("s", "m", b"x").unwrap();
+    clock.advance(91 * DAY_MS);
+    let o3 = a.set("s", "j", b"2").unwrap();
+    let ex = a.export_unsynced_local_ops().unwrap();
+    assert_eq!(ex.expired, vec![o1]);
+    assert_eq!(
+        ex.items,
+        vec![
+            SyncItem::Covered {
+                origin: a.node_id(),
+                upto: 1
+            },
+            SyncItem::Op(o2),
+            SyncItem::Op(o3)
+        ]
+    );
+}
+
+#[test]
+fn own_op_below_clock_skips_skew() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let o1 = a.set("s", "k", b"1").unwrap();
+    a.export_unsynced_local_ops().unwrap();
+    a.reset_to_empty().unwrap();
+    clock.set(T0 - 600_000);
+    assert_eq!(a.apply(o1, &AcceptAll).unwrap(), Outcome::Applied);
+    let foreign = hand_op(2, 1, T0, "f", b"x");
+    assert_eq!(
+        a.apply(foreign, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Skew)
+    );
+}
+
+#[test]
+fn corrupt_last_hlc_rejected() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.__test_set_meta_u64("last_hlc", Hlc::new((1 << 48) - 1, 0).as_u64())
+        .unwrap();
+    drop(a);
+    let r = Store::open(&db_path(dir.path(), 1), MESH, key(1), clock.clone());
+    assert!(matches!(r, Err(StoreError::Corrupt { table: "meta", .. })));
 }

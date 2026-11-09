@@ -19,6 +19,9 @@
 //!   exchange (including the catch-up after joining) with the peer's `vv[self]`.
 //! - **Covered markers.** Pass the sender's `Hello` `vv[origin]` as `advertised` to
 //!   [`Store::apply_covered`].
+//! - **Removal records are exempt from cutoffs.** Adds to the set [`CUTOFF_EXEMPT_SET`]
+//!   (`_mesh`/`removed`) are never retracted by `on_removal` nor ignored above a cutoff,
+//!   even when their issuer is removed; other ops are unaffected.
 
 mod apply;
 mod error;
@@ -36,9 +39,9 @@ pub use apply::{
     Verdict,
 };
 pub use error::StoreError;
-pub use maint::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
+pub use maint::{Export, SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
-pub use removal::RemovalReport;
+pub use removal::{CUTOFF_EXEMPT_SET, RemovalReport};
 pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;
@@ -131,7 +134,11 @@ impl<W: WallClock> Store<W> {
                     if meta_u64_req(&m, meta::NEXT_SEQ)? == 0 {
                         return Err(StoreError::corrupt("meta", "next_seq is 0"));
                     }
-                    meta_u64_req(&m, meta::LAST_HLC)?
+                    let last = meta_u64_req(&m, meta::LAST_HLC)?;
+                    if Hlc::from_u64(last).ms() >= (1 << 48) - 1 {
+                        return Err(StoreError::corrupt("meta", "last_hlc is out of range"));
+                    }
+                    last
                 }
             }
         };

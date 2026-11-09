@@ -145,13 +145,18 @@ pub(crate) fn take_stashed_error() -> Option<ProtoError> {
     STASHED.with(|s| s.borrow_mut().take())
 }
 
+/// Records `e` for [`take_stashed_error`] and returns its message for the serde error.
+pub(crate) fn stash_error(e: ProtoError) -> String {
+    let msg = e.to_string();
+    STASHED.with(|s| *s.borrow_mut() = Some(e));
+    msg
+}
+
 impl TryFrom<RawSignedOp> for SignedOp {
     type Error = String;
     fn try_from(r: RawSignedOp) -> Result<Self, String> {
         if let Err(e) = r.body.validate() {
-            let msg = e.to_string();
-            STASHED.with(|s| *s.borrow_mut() = Some(e));
-            return Err(msg);
+            return Err(stash_error(e));
         }
         Ok(SignedOp {
             body: r.body,

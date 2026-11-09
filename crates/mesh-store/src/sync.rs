@@ -7,9 +7,11 @@ use crate::{Store, keys, meta_u64};
 use mesh_hlc::WallClock;
 use mesh_proto::{NodeId, SignedOp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 
-/// One element of a catch-up stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One element of a catch-up stream (serializable so mesh-core can persist a re-bootstrap
+/// export).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncItem {
     Op(SignedOp),
     /// Everything of `origin` up to and including `upto` that the sender holds no op row
@@ -161,9 +163,11 @@ impl<W: WallClock> Store<W> {
     ///
     /// - `last_full_sync_ms = wall.now_ms()`, used only for staleness ([`Store::is_stale`]);
     /// - `synced_self_seq`, the boundary for "unsynced own ops": [`Store::gc`] never
-    ///   deletes, and [`Store::export_unsynced_local_ops`] always exports, own ops with a
-    ///   seq above it. An own write made during the session after the peer's diff was
-    ///   computed is above it, so it is never counted as synced.
+    ///   deletes own ops with a seq above it, and [`Store::export_unsynced_local_ops`]
+    ///   returns every one of them (exported, or listed in [`crate::Export::expired`] if
+    ///   it is a `Set` older than [`crate::TOMBSTONE_TTL_MS`]). An own write made during
+    ///   the session after the peer's diff was computed is above it, so it is never
+    ///   counted as synced.
     ///
     /// The stored boundary only grows (a later sync with a peer that confirms less does not
     /// lower it) and is capped at the last own seq this node used (`next_seq - 1`). A store
@@ -197,6 +201,13 @@ impl<W: WallClock> Store<W> {
         meta_u64(&m, meta::LAST_FULL_SYNC_MS)
     }
 
+    /// The seq the next local write will use (kept by [`Store::reset_to_empty`]).
+    pub fn next_seq(&self) -> Result<u64, StoreError> {
+        let tx = self.db.begin_read()?;
+        let m = tx.open_table(META)?;
+        crate::meta_u64_req(&m, meta::NEXT_SEQ)
+    }
+
     /// The own-seq boundary recorded by `mark_full_sync` (`None` if never synced).
     pub fn synced_self_seq(&self) -> Result<Option<u64>, StoreError> {
         let tx = self.db.begin_read()?;
@@ -214,6 +225,20 @@ impl<W: WallClock> Store<W> {
         {
             let mut ops = tx.open_table(OPS)?;
             ops.remove(keys::op_key(&origin, seq).as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test hook: overwrites a raw `meta` u64 row (`test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn __test_set_meta_u64(&self, name: &str, v: u64) -> Result<(), StoreError> {
+        let _clock = self.lock_clock();
+        let tx = self.db.begin_write()?;
+        {
+            let mut m = tx.open_table(META)?;
+            m.insert(name.as_bytes(), keys::u64_value(v).as_slice())?;
         }
         tx.commit()?;
         Ok(())

@@ -155,7 +155,7 @@ All of this lives in the `_mesh` namespace, so it replicates and merges like any
 - **Honest limits** (shown in the UI and CLI help):
   - A removed device keeps whatever data it already replicated.
   - Removal takes effect on each node only once that node has received it.
-  - Two nodes that remove each other during a split are both removed only if both records reach a node; a node that applies one removal closes the other remover, so the second record may never spread and then only the first-removed node is removed everywhere. If the nodes were the last two effective hosts, the mesh has no host and cannot recover in-band. A stolen device that removes other members *before its own removal reaches them* has those removals honoured; its data writes are still retracted *(back-ported from sub-spec 2)*.
+  - Two nodes that remove each other during a split are both removed only if both records reach a node; a node that applies one removal closes the other remover, so the second record may never spread and then only the first-removed node is removed everywhere. If the nodes were the last two effective hosts, the mesh has no host and cannot recover in-band. A stolen device that removes other members *before its own removal reaches every node* has those removals honoured, and a removal record it authored after its own cutoff is honoured mesh-wide if it reaches any node still unaware of its removal; its data writes are still retracted *(back-ported from sub-spec 2)*.
   - If a removal reaches a node more than 7 days after it compacted the removed node's older value for a key, that node can't restore it (logged; sub-spec 1 §5.6).
 
 ### Invites

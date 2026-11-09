@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
-use super::{BoxFut, DIAL_TIMEOUT, PeerEnv, Shared, Slot, lock};
+use super::{BoxFut, DIAL_TIMEOUT, DUPLICATE_GRACE, PeerEnv, Shared, Slot, lock};
 use crate::events::NodeEvent;
 use crate::sync::{SessionCtx, SessionEnd, run_session};
 use crate::transport::{ALPN_SYNC, PROTOCOL, REMOVED, SHUTDOWN, addr_from_bytes, endpoint_id_of};
@@ -24,6 +24,8 @@ struct Live {
     by: NodeId,
     fut: BoxFut<SessionEnd>,
     rounds_at_start: u64,
+    /// When the session on `conn` started.
+    since: Instant,
 }
 
 enum Ev {
@@ -252,7 +254,11 @@ impl SlotTask {
             }
             Some(cur) => {
                 // Same dialer: the peer replaced a connection it considers dead.
-                if by == cur.by || by == me.min(peer) {
+                // Arriving well after the current one: not a simultaneous dial. A side dials
+                // only while it has no connection, so the peer has lost the current one (it
+                // restarted or crashed); the newer connection wins on both sides.
+                let late = cur.since.elapsed() > DUPLICATE_GRACE;
+                if by == cur.by || by == me.min(peer) || late {
                     debug!(peer = %peer.short(), "replacing the connection");
                     cur.conn.close(SHUTDOWN, b"duplicate connection");
                     self.live = Some(self.start_session(conn, by));
@@ -307,6 +313,7 @@ impl SlotTask {
             by,
             fut,
             rounds_at_start: self.slot.metrics.rounds_completed.load(Ordering::SeqCst),
+            since: Instant::now(),
         }
     }
 

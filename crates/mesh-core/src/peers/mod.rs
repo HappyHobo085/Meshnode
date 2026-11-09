@@ -5,7 +5,9 @@
 //! session that completed a round and by `reset_backoff_all`), takes incoming connections
 //! handed over by the gated `SyncHandler`, and keeps at most one of them: when two
 //! connections exist between a pair, the one dialled by the lower `NodeId` survives and the
-//! other is closed with `SHUTDOWN`. Both sides apply the same rule, so they agree.
+//! other is closed with `SHUTDOWN`. Both sides apply the same rule, so they agree. The
+//! exception is a connection arriving more than `DUPLICATE_GRACE` after the current one
+//! started: the peer has lost the current one (a restart or a crash), so the newer wins.
 //!
 //! Slot state the rest of the node touches (address, hint, handed-over connections,
 //! requests) lives behind a mutex in the [`Slot`]; the task is woken through `kick`, a
@@ -41,6 +43,10 @@ use crate::transport::{SHUTDOWN, node_id_of};
 
 /// Upper bound on one dial attempt.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Two connections between a pair that start less than this apart are a simultaneous
+/// dial, settled by the lower-`NodeId` rule. A connection arriving later means the peer
+/// lost the current one (a restart or a crash), so the newer one wins (spec §6.1).
+const DUPLICATE_GRACE: Duration = Duration::from_secs(2);
 /// How long `join` waits for the slot tasks before aborting them.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 

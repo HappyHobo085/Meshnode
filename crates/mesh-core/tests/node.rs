@@ -243,3 +243,131 @@ async fn wrong_mesh_refuses_start() {
     let r = Node::open(test_cfg(d.path(), "a").0).await;
     assert!(matches!(r, Err(NodeError::WrongMesh)), "{:?}", r.err());
 }
+
+/// Runs a member node on its own runtime in its own thread, so that dropping the runtime
+/// kills it like a process: every task (iroh's connection drivers included) stops at once
+/// and nothing more reaches the wire, not even a stream FIN or a connection close.
+struct CrashableNode {
+    id: NodeId,
+    addr: NodeAddrBytes,
+    ready: std::sync::mpsc::Receiver<()>,
+    crash: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl CrashableNode {
+    /// Starts the member in `dir`; it becomes ready once connected to `peer` and holding
+    /// `peer`'s address register.
+    fn start(dir: std::path::PathBuf, genesis: MeshGenesis, peer: NodeId) -> CrashableNode {
+        let (info_tx, info_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+        let (crash, crash_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let node = rt.block_on(async {
+                let cfg = test_cfg(&dir, "crasher").0;
+                let n = Node::start_member_for_test(cfg, genesis, vec![])
+                    .await
+                    .unwrap();
+                info_tx.send((n.node_id(), own_addr(&n).await)).unwrap();
+                wait_until("crasher connected with the peer's address", T, || async {
+                    online(&n, peer)
+                        && n.store()
+                            .get(MESH_NS, &addr_key(&peer))
+                            .await
+                            .unwrap()
+                            .is_some()
+                })
+                .await;
+                n
+            });
+            ready_tx.send(()).unwrap();
+            let _ = crash_rx.recv();
+            // Kill every task first; only then let the node's handles go.
+            drop(rt);
+            drop(node);
+        });
+        let (id, addr) = info_rx.recv_timeout(T).expect("crasher did not start");
+        CrashableNode {
+            id,
+            addr,
+            ready,
+            crash,
+            thread,
+        }
+    }
+
+    fn wait_ready(&self) {
+        tokio::task::block_in_place(|| self.ready.recv_timeout(T).expect("crasher not ready"));
+    }
+
+    fn crash(self) {
+        self.crash.send(()).unwrap();
+        tokio::task::block_in_place(|| self.thread.join().expect("crasher thread panicked"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crashed_peer_reconnects_quickly() {
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // The survivor has the lower id and dials; the higher id crashes. The survivor is then
+    // left holding a dead connection that it dialled itself (spec §6.1 duplicate rule).
+    let (sdir, cdir) = if id_of_dir(d1.path()) < id_of_dir(d2.path()) {
+        (d1.path(), d2.path())
+    } else {
+        (d2.path(), d1.path())
+    };
+    let survivor = Node::create_mesh(test_cfg(sdir, "survivor").0)
+        .await
+        .unwrap();
+    let crasher_id = id_of_dir(cdir);
+    assert!(survivor.node_id() < crasher_id);
+    survivor
+        .store()
+        .set_add(
+            MESH_NS,
+            MEMBERS,
+            member_bytes(&crasher_id, Role::Host).to_vec(),
+        )
+        .await
+        .unwrap();
+    let genesis = read_genesis(sdir).unwrap().unwrap();
+    let crasher = CrashableNode::start(cdir.to_path_buf(), genesis, survivor.node_id());
+    assert_eq!(crasher.id, crasher_id);
+    survivor.add_hint(crasher.id, crasher.addr.clone());
+    crasher.wait_ready();
+    wait_until("survivor sees the crasher", T, || async {
+        online(&survivor, crasher_id)
+    })
+    .await;
+
+    crasher.crash();
+    let restarted = Node::open(test_cfg(cdir, "restarted").0).await.unwrap();
+    assert_eq!(restarted.node_id(), crasher_id);
+
+    let quick = Duration::from_secs(5);
+    survivor
+        .store()
+        .set("app", "after_crash", b"1".to_vec())
+        .await
+        .unwrap();
+    wait_until(
+        "survivor's write reaches the restarted node",
+        quick,
+        || async {
+            restarted.store().get("app", "after_crash").await.unwrap() == Some(b"1".to_vec())
+        },
+    )
+    .await;
+    wait_until("one live connection on the survivor", quick, || async {
+        online(&survivor, crasher_id) && survivor.connection_count() == 1
+    })
+    .await;
+
+    timeout(T, restarted.shutdown()).await.unwrap();
+    timeout(T, survivor.shutdown()).await.unwrap();
+}

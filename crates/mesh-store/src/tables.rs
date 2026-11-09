@@ -31,6 +31,7 @@ pub(crate) mod meta {
     pub const NEXT_SEQ: &str = "next_seq";
     pub const LAST_HLC: &str = "last_hlc";
     pub const SCHEMA: &str = "schema";
+    pub const LAST_FULL_SYNC_MS: &str = "last_full_sync_ms";
 }
 
 pub(crate) const SCHEMA_VERSION: u64 = 1;

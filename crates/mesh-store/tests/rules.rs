@@ -50,7 +50,7 @@ fn local_ops_have_increasing_seq_and_hlc() {
     }
     assert!(ops[0].body.hlc < ops[1].body.hlc);
     assert!(ops[1].body.hlc < ops[2].body.hlc);
-    assert_eq!(s.version_vector_local_seq(), 3);
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 3);
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn local_write_over_limit_is_rejected() {
         s.set_add("s\0", "m", b"v"),
         Err(StoreError::Proto(_))
     ));
-    assert_eq!(s.version_vector_local_seq(), 0); // nothing was consumed (helper: next_seq - 1)
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 0); // nothing was consumed (helper: next_seq - 1)
     let op = s.set("s", "k", b"ok").unwrap();
     assert_eq!(op.body.seq, 1);
 }
@@ -331,7 +331,7 @@ fn own_op_echo_is_duplicate() {
     let a = store(dir.path(), 1, &clock);
     let op = a.set("s", "k", b"v").unwrap();
     assert_eq!(a.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Duplicate);
-    assert_eq!(a.version_vector_local_seq(), 1);
+    assert_eq!(a.version_vector().unwrap().get(&a.node_id()), 1);
     assert_eq!(a.vv_of(a.node_id()).unwrap(), 1);
     assert_eq!(a.pending_len().unwrap(), 0);
     assert_eq!(a.set("s", "k", b"w").unwrap().body.seq, 2);
@@ -704,7 +704,7 @@ fn echoed_own_ops_raise_next_seq() {
         s.apply(echoed[i].clone(), &AcceptAll).unwrap();
     }
     assert_eq!(s.vv_of(s.node_id()).unwrap(), 3);
-    assert_eq!(s.version_vector_local_seq(), 3);
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 3);
     let new = s.set("s", "k", b"4").unwrap();
     assert_eq!(new.body.seq, 4);
     assert_eq!(s.get("s", "k").unwrap(), Some(b"4".to_vec()));
@@ -733,4 +733,211 @@ fn concurrent_writes_converge_in_any_order() {
         d.get_entry("s", "k").unwrap()
     );
     assert!(b.get("s", "k").unwrap().is_some());
+}
+
+// ---- Task 5: catch-up ----
+
+use mesh_proto::VersionVector;
+use mesh_store::SyncItem;
+
+fn op_ids(items: &[SyncItem]) -> Vec<(u8, u64)> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            SyncItem::Op(o) => Some((o.body.origin.0[0], o.body.seq)),
+            SyncItem::Covered { .. } => None,
+        })
+        .collect()
+}
+
+#[test]
+fn diff_since_returns_missing_ops_in_origin_seq_order() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let c = store(dir.path(), 3, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let a_ops: Vec<_> = (0..3).map(|i| a.set("s", "k", &[i]).unwrap()).collect();
+    let c_ops: Vec<_> = (0..2).map(|i| c.set("s", "j", &[i]).unwrap()).collect();
+    for op in a_ops.iter().chain(c_ops.iter()) {
+        b.apply(op.clone(), &AcceptAll).unwrap();
+    }
+    let vv = b.version_vector().unwrap();
+    assert_eq!(vv.get(&node(1)), 3);
+    assert_eq!(vv.get(&node(3)), 2);
+    assert_eq!(vv.get(&b.node_id()), 0);
+    let mut theirs = VersionVector::default();
+    theirs.set(node(1), 1);
+    // An origin the peer has but we don't is ignored.
+    theirs.set(node(9), 4);
+    let items = b.diff_since(&theirs, 100).unwrap();
+    assert_eq!(
+        op_ids(&items),
+        vec![
+            (node(1).0[0], 2),
+            (node(1).0[0], 3),
+            (node(3).0[0], 1),
+            (node(3).0[0], 2)
+        ]
+    );
+    assert_eq!(items.len(), 4);
+}
+
+#[test]
+fn diff_since_respects_limit() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    for i in 0..5 {
+        a.set("s", "k", &[i]).unwrap();
+    }
+    let items = a.diff_since(&VersionVector::default(), 2).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(a.diff_since(&VersionVector::default(), 0).unwrap().len(), 0);
+}
+
+#[test]
+fn covered_marker_lets_peer_advance() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let c = store(dir.path(), 3, &clock);
+    for i in 0..5u8 {
+        let op = a.set("s", "k", &[i]).unwrap();
+        b.apply(op, &AcceptAll).unwrap();
+    }
+    b.__test_drop_op(node(1), 2).unwrap();
+    b.__test_drop_op(node(1), 3).unwrap();
+    let items = b.diff_since(&VersionVector::default(), 100).unwrap();
+    assert_eq!(items.len(), 4);
+    assert!(matches!(&items[0], SyncItem::Op(o) if o.body.seq == 1));
+    assert!(matches!(&items[1], SyncItem::Covered { origin, upto: 3 } if *origin == node(1)));
+    assert!(matches!(&items[2], SyncItem::Op(o) if o.body.seq == 4));
+    assert!(matches!(&items[3], SyncItem::Op(o) if o.body.seq == 5));
+    // Limit counts markers too.
+    assert_eq!(b.diff_since(&VersionVector::default(), 2).unwrap().len(), 2);
+    for item in items {
+        match item {
+            SyncItem::Op(o) => {
+                c.apply(o, &AcceptAll).unwrap();
+            }
+            SyncItem::Covered { origin, upto } => {
+                c.apply_covered(origin, upto, &AcceptAll).unwrap()
+            }
+        }
+    }
+    assert_eq!(c.version_vector().unwrap().get(&node(1)), 5);
+    assert_eq!(c.get("s", "k").unwrap(), b.get("s", "k").unwrap());
+    assert_eq!(
+        c.get_entry("s", "k").unwrap(),
+        b.get_entry("s", "k").unwrap()
+    );
+}
+
+#[test]
+fn trailing_hole_is_covered_and_invalid_ops_are_served() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    for i in 0..3u8 {
+        b.apply(a.set("s", "k", &[i]).unwrap(), &AcceptAll).unwrap();
+    }
+    b.__test_drop_op(node(1), 3).unwrap();
+    let items = b.diff_since(&VersionVector::default(), 100).unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(matches!(&items[2], SyncItem::Covered { upto: 3, .. }));
+    // Peer already has 1..=2: only the marker is sent.
+    let mut theirs = VersionVector::default();
+    theirs.set(node(1), 2);
+    let items = b.diff_since(&theirs, 100).unwrap();
+    assert!(matches!(
+        items.as_slice(),
+        [SyncItem::Covered { upto: 3, .. }]
+    ));
+}
+
+#[test]
+fn pending_ops_are_not_served() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let _a1 = a.set("s", "k", b"1").unwrap();
+    let a2 = a.set("s", "k", b"2").unwrap();
+    assert_eq!(
+        b.apply(a2, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(b.pending_len().unwrap(), 1);
+    assert!(
+        b.diff_since(&VersionVector::default(), 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(b.version_vector().unwrap().0.is_empty());
+}
+
+#[test]
+fn apply_covered_drains_pending_and_publishes() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let _a1 = a.set("s", "k", b"1").unwrap();
+    let a2 = a.set("s", "k", b"2").unwrap();
+    let a3 = a.set("s", "other", b"3").unwrap();
+    b.apply(a2, &AcceptAll).unwrap();
+    b.apply(a3, &AcceptAll).unwrap();
+    let mut rx = b.subscribe();
+    b.apply_covered(node(1), 1, &AcceptAll).unwrap();
+    assert_eq!(b.version_vector().unwrap().get(&node(1)), 3);
+    assert_eq!(b.pending_len().unwrap(), 0);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(rx.try_recv().unwrap().kind, ChangeKind::Key("k".into()));
+    assert_eq!(rx.try_recv().unwrap().kind, ChangeKind::Key("other".into()));
+    // Lower or equal upto is a no-op.
+    b.apply_covered(node(1), 2, &AcceptAll).unwrap();
+    assert_eq!(b.version_vector().unwrap().get(&node(1)), 3);
+}
+
+#[test]
+fn apply_covered_drops_covered_pending() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let _ = a.set("s", "k", b"1").unwrap();
+    let _ = a.set("s", "k", b"2").unwrap();
+    let a3 = a.set("s", "k", b"3").unwrap();
+    b.apply(a3, &AcceptAll).unwrap();
+    assert_eq!(b.pending_len().unwrap(), 1);
+    b.apply_covered(node(1), 5, &AcceptAll).unwrap();
+    assert_eq!(b.pending_len().unwrap(), 0);
+    assert_eq!(b.version_vector().unwrap().get(&node(1)), 5);
+    // The covered op's data was never merged.
+    assert_eq!(b.get("s", "k").unwrap(), None);
+}
+
+#[test]
+fn apply_covered_for_own_origin_raises_next_seq() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.set("s", "k", b"1").unwrap();
+    s.apply_covered(s.node_id(), 7, &AcceptAll).unwrap();
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 7);
+    assert_eq!(s.set("s", "k", b"2").unwrap().body.seq, 8);
+    // Not above next_seq: unchanged.
+    s.apply_covered(s.node_id(), 3, &AcceptAll).unwrap();
+    assert_eq!(s.set("s", "k", b"3").unwrap().body.seq, 9);
+}
+
+#[test]
+fn version_vector_includes_self_and_full_sync_mark_roundtrips() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    assert!(s.version_vector().unwrap().0.is_empty());
+    assert_eq!(s.last_full_sync_ms().unwrap(), None);
+    s.set("s", "k", b"1").unwrap();
+    assert_eq!(s.version_vector().unwrap().get(&s.node_id()), 1);
+    clock.set(T0 + 5);
+    s.mark_full_sync().unwrap();
+    assert_eq!(s.last_full_sync_ms().unwrap(), Some(T0 + 5));
+    drop(s);
+    let s = store(dir.path(), 1, &clock);
+    assert_eq!(s.last_full_sync_ms().unwrap(), Some(T0 + 5));
 }

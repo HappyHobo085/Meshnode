@@ -147,7 +147,6 @@ pub(crate) fn op_key(origin: &NodeId, seq: u64) -> [u8; OP_KEY_LEN] {
     k
 }
 
-#[allow(dead_code)] // used by later tasks (catch-up, compaction)
 pub(crate) fn split_op_key(table: &'static str, k: &[u8]) -> Result<(NodeId, u64), StoreError> {
     if k.len() != OP_KEY_LEN {
         return Err(bad_key(table, k));
@@ -162,7 +161,6 @@ pub(crate) fn origin_key(origin: &NodeId) -> [u8; ORIGIN_LEN] {
     origin.0
 }
 
-#[allow(dead_code)] // used by later tasks (version vector, removal)
 pub(crate) fn split_origin_key(table: &'static str, k: &[u8]) -> Result<NodeId, StoreError> {
     origin_from(table, k)
 }

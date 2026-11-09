@@ -9,6 +9,7 @@ mod keys;
 mod local;
 pub mod merge;
 mod read;
+mod sync;
 mod tables;
 
 pub use apply::{
@@ -17,11 +18,12 @@ pub use apply::{
 };
 pub use error::StoreError;
 pub use read::RegEntry;
+pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;
 use mesh_hlc::{Clock, Hlc, SystemClock, WallClock};
 use mesh_proto::{MeshId, NodeId};
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableTable};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use tables::{META, SCHEMA_VERSION, meta};
@@ -135,20 +137,5 @@ impl<W: WallClock> Store<W> {
     /// (it only ever moves forward).
     pub(crate) fn lock_clock(&self) -> MutexGuard<'_, Clock<W>> {
         self.clock.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Highest local seq issued so far (`next_seq - 1`); 0 if it cannot be read.
-    /// Test helper; replaced by `version_vector()` in a later task.
-    #[doc(hidden)]
-    pub fn version_vector_local_seq(&self) -> u64 {
-        let read = || -> Result<u64, StoreError> {
-            let tx = self.db.begin_read()?;
-            let m = tx.open_table(META)?;
-            Ok(meta_u64_req(&m, meta::NEXT_SEQ)?.saturating_sub(1))
-        };
-        read().unwrap_or_else(|e| {
-            tracing::error!("reading next_seq failed: {e}");
-            0
-        })
     }
 }

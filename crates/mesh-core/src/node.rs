@@ -312,13 +312,17 @@ pub(crate) async fn start(
     };
     // Subscribed before the first rescan starts any peer, so no round is missed.
     let mut first_rx = Some(events.subscribe());
-    Reactor::new(rctx.clone()).rescan_logged(false).await;
+    let mut reactor = Reactor::new(rctx.clone());
+    reactor.rescan_logged(false).await;
+    let mut reactor = Some(reactor);
 
     let mut tasks = JoinSet::new();
     let t = cfg.timings.clone();
     let c = cancel.clone();
     tasks.spawn(supervise("reactor", cancel.clone(), t.clone(), move || {
-        Reactor::new(rctx.clone()).run(c.clone())
+        // The first run keeps the startup rescan's state; a restart starts afresh.
+        let r = reactor.take().unwrap_or_else(|| Reactor::new(rctx.clone()));
+        r.run(c.clone())
     }));
     let (ep, st, c) = (endpoint.clone(), store.clone(), cancel.clone());
     tasks.spawn(supervise("addr", cancel.clone(), t.clone(), move || {

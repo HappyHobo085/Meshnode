@@ -55,6 +55,7 @@ async fn pair(da: &Path, db: &Path, hints_for_b: bool) -> (Node, Node) {
 async fn create_mesh_writes_genesis_and_self_member() {
     let d = tempfile::tempdir().unwrap();
     let a = Node::create_mesh(test_cfg(d.path(), "a").0).await.unwrap();
+    let mut events = a.subscribe();
     let g = read_genesis(d.path()).unwrap().expect("mesh.json written");
     assert_eq!(g.founder, a.node_id());
     assert_eq!(g.mesh_id(), a.mesh());
@@ -81,6 +82,29 @@ async fn create_mesh_writes_genesis_and_self_member() {
         a.members()[0].info.as_ref().is_some_and(|i| i.name == "a")
     })
     .await;
+
+    // A founder-only mesh has a host: the reactor never reports `NoEffectiveHost`, neither
+    // for the founding writes nor for a later `_mesh` change.
+    a.set_info(None, Some(vec!["t".into()])).await.unwrap();
+    let mut seen = Vec::new();
+    let has_tag = |a: &Node| {
+        a.members()[0]
+            .info
+            .as_ref()
+            .is_some_and(|i| i.tags == ["t"])
+    };
+    while !has_tag(&a) {
+        // Record every event, not only the one waited for.
+        let pred = |e: &NodeEvent| {
+            seen.push(e.clone());
+            *e == NodeEvent::MembersChanged
+        };
+        wait_event(&mut events, pred, T).await;
+    }
+    while let Ok(e) = events.try_recv() {
+        seen.push(e);
+    }
+    assert!(!seen.contains(&NodeEvent::NoEffectiveHost), "{seen:?}");
     timeout(T, a.shutdown()).await.unwrap();
 }
 

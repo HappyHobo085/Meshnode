@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use mesh_proto::{MeshGenesis, NodeId};
 use mesh_store::Change;
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{Notify, broadcast, watch};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,10 @@ pub(crate) struct ReactorCtx {
 
 pub(crate) struct Reactor {
     ctx: ReactorCtx,
+    /// Subscribed at construction, so a rescan run before `run` misses no event.
+    rx: Receiver<Change>,
+    /// Whether a rescan already ran since `rx` was subscribed.
+    scanned: bool,
     /// Cutoffs already passed to `on_removal`; cleared on `Lagged` and on restart.
     applied: HashMap<NodeId, u64>,
     /// Whether `NoEffectiveHost` was emitted for the current state.
@@ -46,24 +51,27 @@ pub(crate) struct Reactor {
 impl Reactor {
     pub fn new(ctx: ReactorCtx) -> Reactor {
         Reactor {
+            rx: ctx.store.inner().subscribe(),
+            scanned: false,
             ctx,
             applied: HashMap::new(),
             no_host: false,
         }
     }
 
-    /// Subscribes, rescans once (anything before the subscription is covered), then
-    /// reacts to events until cancelled.
+    /// Rescans once unless that already happened since the subscription (a restart after
+    /// a panic gets a fresh reactor), then reacts to events until cancelled.
     pub async fn run(mut self, cancel: CancellationToken) {
-        let mut rx = self.ctx.store.inner().subscribe();
-        self.rescan_logged(true).await;
+        if !self.scanned {
+            self.rescan_logged(true).await;
+        }
         loop {
             let mut rescan = false;
             let mut lagged = false;
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = self.ctx.force_lagged.notified() => lagged = true,
-                r = rx.recv() => match r {
+                r = self.rx.recv() => match r {
                     Ok(ch) => rescan |= is_mesh(&ch),
                     Err(RecvError::Lagged(n)) => {
                         warn!(missed = n, "change events lagged; rescanning");
@@ -74,7 +82,7 @@ impl Reactor {
             }
             // Coalesce a burst into one wake-up and at most one rescan.
             loop {
-                match rx.try_recv() {
+                match self.rx.try_recv() {
                     Ok(ch) => rescan |= is_mesh(&ch),
                     Err(TryRecvError::Lagged(_)) => lagged = true,
                     Err(TryRecvError::Empty) => break,
@@ -89,6 +97,7 @@ impl Reactor {
     }
 
     pub async fn rescan_logged(&mut self, lagged: bool) {
+        self.scanned = true;
         if let Err(e) = self.rescan(lagged).await {
             error!(error = %e, "membership rescan failed");
         }

@@ -18,6 +18,8 @@ serde_json.workspace = true
 hex.workspace = true
 postcard.workspace = true
 iroh.workspace = true
+iroh-blobs = { workspace = true, features = ["fs-store"] }
+bytes.workspace = true
 rand.workspace = true
 blake3.workspace = true
 tokio-util.workspace = true

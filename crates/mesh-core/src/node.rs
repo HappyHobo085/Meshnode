@@ -19,6 +19,7 @@ use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use crate::blobs::{Blobs, PeerSource};
 use crate::config::{DynClock, NodeConfig, Timings};
 use crate::db::{CoreStore, StoreHandle};
 use crate::error::NodeError;
@@ -84,6 +85,7 @@ pub(crate) struct Inner {
     pub(crate) me: NodeId,
     pub(crate) endpoint: Endpoint,
     router: Router,
+    blobs: Blobs,
     pub(crate) store: StoreHandle,
     pub(crate) acc: Arc<MeshAcceptor>,
     pub(crate) invites: Arc<Mutex<Invites>>,
@@ -311,10 +313,24 @@ pub(crate) async fn start(
         status.clone(),
         endpoint.clone(),
     ));
+    let blobs = Blobs::open(
+        &cfg.data_dir,
+        &endpoint,
+        PeerSource {
+            membership: membership.clone(),
+            peers: peers.clone(),
+            me,
+        },
+    )
+    .await?;
     let router = Router::builder(endpoint.clone())
         .accept(
             ALPN_SYNC,
             Gate::new(SyncHandler(peers.clone()), membership_rx.clone()),
+        )
+        .accept(
+            iroh_blobs::ALPN,
+            Gate::new(blobs.protocol(), membership_rx.clone()),
         )
         // Not gated: a joiner is not a member yet.
         .accept(ALPN_JOIN, JoinHandler(join.clone()))
@@ -376,6 +392,7 @@ pub(crate) async fn start(
         me,
         endpoint,
         router,
+        blobs,
         store,
         acc,
         invites,
@@ -506,6 +523,11 @@ impl Node {
         timeout(limit, rx.wait_for(|done| *done))
             .await
             .is_ok_and(|r| r.is_ok())
+    }
+
+    /// The blob store (spec §8).
+    pub fn blobs(&self) -> &Blobs {
+        &self.inner.blobs
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -663,6 +685,10 @@ impl Node {
             Ok(Err(e)) => warn!(error = %e, "router shutdown failed"),
             Err(_) => warn!("router shutdown timed out"),
         }
+        // The router already asked the blobs handler to stop; make sure the store is closed.
+        if timeout(STOP_TIMEOUT, inner.blobs.shutdown()).await.is_err() {
+            warn!("blob store shutdown timed out");
+        }
         let store = Arc::downgrade(inner.store.inner());
         drop(inner);
         // A blocking store call still in flight holds the store open until it returns.
@@ -695,6 +721,11 @@ impl Node {
             write_genesis(&cfg.data_dir, &genesis)?;
         }
         start(cfg, key, genesis, hints).await
+    }
+
+    /// This node's current iroh address.
+    pub fn endpoint_addr_for_test(&self) -> EndpointAddr {
+        self.inner.endpoint.addr()
     }
 
     /// The next join this node accepts is applied, but its reply is never sent.

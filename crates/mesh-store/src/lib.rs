@@ -7,6 +7,7 @@ mod apply;
 mod error;
 mod keys;
 mod local;
+mod maint;
 pub mod merge;
 mod read;
 mod sync;
@@ -17,6 +18,7 @@ pub use apply::{
     Verdict,
 };
 pub use error::StoreError;
+pub use maint::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
 pub use sync::SyncItem;
 

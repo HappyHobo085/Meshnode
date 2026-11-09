@@ -941,3 +941,282 @@ fn version_vector_includes_self_and_full_sync_mark_roundtrips() {
     let s = store(dir.path(), 1, &clock);
     assert_eq!(s.last_full_sync_ms().unwrap(), Some(T0 + 5));
 }
+
+// ---- Task 6: maintenance ----
+
+use mesh_store::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
+
+/// Feeds `items` (from `diff_since`) into `to`.
+fn feed(to: &Store<ManualClock>, items: Vec<SyncItem>) {
+    for item in items {
+        match item {
+            SyncItem::Op(o) => {
+                to.apply(o, &AcceptAll).unwrap();
+            }
+            SyncItem::Covered { origin, upto } => {
+                to.apply_covered(origin, upto, &AcceptAll).unwrap()
+            }
+        }
+    }
+}
+
+#[test]
+fn constants_match_spec() {
+    assert_eq!(SETTLE_MS, 7 * DAY_MS);
+    assert_eq!(TOMBSTONE_TTL_MS, 90 * DAY_MS);
+    assert_eq!(STALE_MS, 80 * DAY_MS);
+}
+
+#[test]
+fn compaction_waits_for_settle_period() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.set("s", "k", b"1").unwrap();
+    let op2 = s.set("s", "k", b"2").unwrap();
+    clock.advance(7 * DAY_MS - 1);
+    assert_eq!(s.compact().unwrap(), 0);
+    let items = s.diff_since(&VersionVector::default(), 100).unwrap();
+    assert_eq!(op_ids(&items), vec![(node(1).0[0], 1), (node(1).0[0], 2)]);
+    clock.advance(2);
+    assert_eq!(s.compact().unwrap(), 1);
+    assert_eq!(
+        s.diff_since(&VersionVector::default(), 100).unwrap(),
+        vec![
+            SyncItem::Covered {
+                origin: node(1),
+                upto: 1
+            },
+            SyncItem::Op(op2)
+        ]
+    );
+    assert_eq!(s.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    // Nothing left to compact; the superseded entry went with the row.
+    assert_eq!(s.compact().unwrap(), 0);
+}
+
+#[test]
+fn compaction_never_removes_set_add_ops() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.set_add("s", "m", b"x").unwrap();
+    s.set_add("s", "m", b"x").unwrap();
+    clock.advance(8 * DAY_MS);
+    assert_eq!(s.compact().unwrap(), 0);
+    let items = s.diff_since(&VersionVector::default(), 100).unwrap();
+    assert_eq!(op_ids(&items).len(), 2);
+    assert!(s.set_contains("s", "m", b"x").unwrap());
+}
+
+#[test]
+fn compacted_store_feeds_fresh_peer_to_same_reads() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let c = store(dir.path(), 3, &clock);
+    // B's writes come first (older HLC).
+    let b_ops = [
+        b.set("s", "a", b"b-old").unwrap(),
+        b.set("s", "d", b"1").unwrap(),
+        b.set("s", "d", b"2").unwrap(),
+        b.set_ordered("s", "o", &[9], Some(b"ordered")).unwrap(),
+    ];
+    for op in b_ops {
+        a.apply(op, &AcceptAll).unwrap();
+    }
+    clock.advance(10);
+    a.set("s", "a", b"1").unwrap();
+    a.set("s", "a", b"2").unwrap();
+    a.set("s", "b", b"1").unwrap();
+    a.delete("s", "b").unwrap();
+    a.set("s", "c", b"x").unwrap();
+    a.set("s", "o", b"plain-loses").unwrap();
+    a.set_add("s", "m", b"x").unwrap();
+    a.set_add("s", "m", b"x").unwrap();
+    clock.advance(8 * DAY_MS);
+    assert!(a.compact().unwrap() > 0);
+    let items = a.diff_since(&VersionVector::default(), 1000).unwrap();
+    assert!(items.iter().any(|i| matches!(i, SyncItem::Covered { .. })));
+    feed(&c, items);
+    for k in ["a", "b", "c", "d", "o", "never"] {
+        assert_eq!(c.get("s", k).unwrap(), a.get("s", k).unwrap(), "{k}");
+        assert_eq!(
+            c.get_entry("s", k).unwrap(),
+            a.get_entry("s", k).unwrap(),
+            "{k}"
+        );
+    }
+    assert_eq!(
+        c.list_keys("s", "", None, 100).unwrap(),
+        a.list_keys("s", "", None, 100).unwrap()
+    );
+    assert_eq!(
+        a.list_keys("s", "", None, 100).unwrap(),
+        strings(&["a", "c", "d", "o"])
+    );
+    assert!(c.set_contains("s", "m", b"x").unwrap());
+    assert_eq!(c.version_vector().unwrap().get(&node(1)), 8);
+    assert_eq!(c.version_vector().unwrap().get(&node(2)), 4);
+}
+
+#[test]
+fn tombstone_gc_after_90_days() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    // B's older write of k, and B's old tombstone of `live`.
+    a.apply(b.set("s", "k", b"w").unwrap(), &AcceptAll).unwrap();
+    a.apply(b.delete("s", "live").unwrap(), &AcceptAll).unwrap();
+    clock.advance(10);
+    a.set("s", "k", b"v").unwrap();
+    a.set("s", "live", b"yes").unwrap();
+    a.set_add("s", "m", b"x").unwrap();
+    a.delete("s", "k").unwrap();
+    let mut rx = a.subscribe();
+    clock.advance(TOMBSTONE_TTL_MS);
+    assert_eq!(a.gc().unwrap(), 0);
+    clock.advance(1);
+    assert_eq!(a.gc().unwrap(), 1);
+    assert_eq!(a.get("s", "k").unwrap(), None);
+    // No reg row of any origin remains (B's older "w" must not reappear).
+    assert_eq!(a.get_entry("s", "k").unwrap(), None);
+    assert_eq!(a.list_keys("s", "", None, 100).unwrap(), strings(&["live"]));
+    // A key whose winner is live is untouched, even with an old tombstone row under it.
+    assert_eq!(a.get("s", "live").unwrap(), Some(b"yes".to_vec()));
+    assert!(a.set_contains("s", "m", b"x").unwrap());
+    let ev = rx.try_recv().unwrap();
+    assert_eq!(ev.ns, "s");
+    assert_eq!(ev.kind, ChangeKind::Key("k".into()));
+    assert!(rx.try_recv().is_err());
+    // The GC'd ops are served as covered, never as ops.
+    let items = a.diff_since(&VersionVector::default(), 100).unwrap();
+    assert!(items.iter().all(|i| match i {
+        SyncItem::Op(o) => !matches!(&o.body.payload, Payload::Set { key, .. } if key == "k"),
+        SyncItem::Covered { .. } => true,
+    }));
+    assert_eq!(a.gc().unwrap(), 0);
+}
+
+#[test]
+fn gc_without_compaction_does_not_resurrect_on_fresh_peer() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let c = store(dir.path(), 3, &clock);
+    a.set("s", "k", b"v").unwrap();
+    a.set("s", "k", b"v2").unwrap();
+    a.delete("s", "k").unwrap();
+    a.set("s", "other", b"o").unwrap();
+    clock.advance(TOMBSTONE_TTL_MS + 1);
+    // No compact() ran: the superseded ops of k must not outlive the GC.
+    assert_eq!(a.gc().unwrap(), 1);
+    feed(&c, a.diff_since(&VersionVector::default(), 100).unwrap());
+    assert_eq!(c.get("s", "k").unwrap(), None);
+    assert_eq!(c.get_entry("s", "k").unwrap(), None);
+    assert_eq!(c.get("s", "other").unwrap(), Some(b"o".to_vec()));
+    assert_eq!(c.version_vector().unwrap().get(&node(1)), 4);
+    // Nothing of k is left for compaction either.
+    assert_eq!(a.compact().unwrap(), 0);
+}
+
+#[test]
+fn stale_after_80_days() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    assert!(!s.is_stale().unwrap());
+    s.mark_full_sync().unwrap();
+    clock.advance(STALE_MS);
+    assert!(!s.is_stale().unwrap());
+    clock.advance(1);
+    assert!(s.is_stale().unwrap());
+    let never = store(dir.path(), 2, &clock);
+    clock.advance(1000 * DAY_MS);
+    assert!(!never.is_stale().unwrap());
+}
+
+#[test]
+fn export_unsynced_local_ops_after_last_full_sync() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let o1 = a.set("s", "k", b"1").unwrap();
+    let o2 = a.set_add("s", "m", b"x").unwrap();
+    a.apply(b.set("s", "j", b"b").unwrap(), &AcceptAll).unwrap();
+    // Never synced: every own op.
+    assert_eq!(a.export_unsynced_local_ops().unwrap(), vec![o1, o2]);
+    a.mark_full_sync().unwrap();
+    assert!(a.export_unsynced_local_ops().unwrap().is_empty());
+    clock.advance(1);
+    let o3 = a.delete("s", "k").unwrap();
+    let o4 = a.set("s", "z", b"z").unwrap();
+    a.apply(b.set("s", "j", b"b2").unwrap(), &AcceptAll)
+        .unwrap();
+    assert_eq!(a.export_unsynced_local_ops().unwrap(), vec![o3, o4]);
+}
+
+#[test]
+fn reset_keeps_seq() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    a.set("s", "k", b"1").unwrap();
+    a.set("s", "j", b"2").unwrap();
+    let last = a.set_add("s", "m", b"x").unwrap();
+    a.apply(b.set("s", "b", b"b").unwrap(), &AcceptAll).unwrap();
+    // Something pending too (a gap from B).
+    let _ = b.set("s", "b", b"b2").unwrap();
+    a.apply(b.set("s", "b", b"b3").unwrap(), &AcceptAll)
+        .unwrap();
+    assert_eq!(a.pending_len().unwrap(), 1);
+    a.mark_full_sync().unwrap();
+    a.reset_to_empty().unwrap();
+    assert_eq!(a.get("s", "k").unwrap(), None);
+    assert_eq!(a.get_entry("s", "b").unwrap(), None);
+    assert!(a.list_keys("s", "", None, 100).unwrap().is_empty());
+    assert!(!a.set_contains("s", "m", b"x").unwrap());
+    assert!(a.version_vector().unwrap().0.is_empty());
+    assert_eq!(a.pending_len().unwrap(), 0);
+    assert!(
+        a.diff_since(&VersionVector::default(), 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(a.last_full_sync_ms().unwrap(), None);
+    assert!(!a.is_stale().unwrap());
+    let next = a.set("s", "k", b"again").unwrap();
+    assert_eq!(next.body.seq, 4);
+    assert!(next.body.hlc > last.body.hlc);
+    // Survives a reopen.
+    drop(a);
+    let a = store(dir.path(), 1, &clock);
+    assert_eq!(a.set("s", "k", b"x").unwrap().body.seq, 5);
+}
+
+#[test]
+fn purge_namespace_tombstones_live_keys() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.set("p", "c", b"3").unwrap();
+    s.set("p", "a", b"1").unwrap();
+    s.set("p", "b", b"2").unwrap();
+    s.set("p", "gone", b"x").unwrap();
+    s.delete("p", "gone").unwrap();
+    s.set_add("p", "m", b"x").unwrap();
+    s.set("q", "a", b"other").unwrap();
+    let ops = s.purge_namespace("p").unwrap();
+    let keys: Vec<_> = ops
+        .iter()
+        .map(|o| match &o.body.payload {
+            Payload::Set { ns, key, value, .. } => {
+                assert_eq!(ns, "p");
+                assert!(value.is_none());
+                key.clone()
+            }
+            Payload::SetAdd { .. } => panic!("purge emitted a set op"),
+        })
+        .collect();
+    assert_eq!(keys, strings(&["a", "b", "c"]));
+    assert!(s.list_keys("p", "", None, 100).unwrap().is_empty());
+    assert_eq!(s.get("q", "a").unwrap(), Some(b"other".to_vec()));
+    // Sets are grow-only: members survive a purge.
+    assert!(s.set_contains("p", "m", b"x").unwrap());
+    assert!(s.purge_namespace("p").unwrap().is_empty());
+}

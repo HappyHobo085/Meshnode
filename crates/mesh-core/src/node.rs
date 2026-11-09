@@ -72,15 +72,6 @@ pub struct MemberStatus {
     pub lag: u64,
 }
 
-/// Scheduled maintenance jobs (spec §9). `Node::maint_now` runs one at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaintJob {
-    RetryPending,
-    Compact,
-    Gc,
-    PruneInvites,
-}
-
 /// A running mesh node. Call [`Node::shutdown`] to stop it; dropping it only cancels its
 /// tasks.
 pub struct Node {
@@ -95,8 +86,7 @@ pub(crate) struct Inner {
     router: Router,
     pub(crate) store: StoreHandle,
     pub(crate) acc: Arc<MeshAcceptor>,
-    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
-    invites: Arc<Mutex<Invites>>,
+    pub(crate) invites: Arc<Mutex<Invites>>,
     join: Arc<JoinInner>,
     /// Sticky: true once any round has completed since start.
     first_sync: Arc<watch::Sender<bool>>,
@@ -119,11 +109,11 @@ pub(crate) struct Inner {
     lose_events: Arc<AtomicBool>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn join_err(e: tokio::task::JoinError) -> NodeError {
+pub(crate) fn join_err(e: tokio::task::JoinError) -> NodeError {
     NodeError::Io(std::io::Error::other(e))
 }
 
@@ -418,6 +408,13 @@ pub(crate) async fn start(
             crate::rebootstrap::driver(i.clone(), stale.clone(), due.take().unwrap_or(true))
         },
     ));
+    let (i, c) = (inner.clone(), inner.cancel.clone());
+    lock(&inner.tasks).spawn(supervise(
+        "maint",
+        c,
+        inner.cfg.timings.clone(),
+        move || crate::maint::run(i.clone()),
+    ));
     Ok(Node { inner })
 }
 
@@ -703,23 +700,8 @@ impl Node {
     }
 
     /// Runs one maintenance job now.
-    pub async fn maint_now(&self, job: MaintJob) -> Result<(), NodeError> {
-        let store = &self.inner.store;
-        match job {
-            MaintJob::RetryPending => {
-                let acc = self.inner.acc.clone();
-                store.call(move |s| s.retry_pending(&*acc)).await.map(drop)
-            }
-            MaintJob::Compact => store.call(|s| s.compact()).await.map(drop),
-            MaintJob::Gc => store.call(|s| s.gc()).await.map(drop),
-            MaintJob::PruneInvites => {
-                let invites = self.inner.invites.clone();
-                let now = self.inner.cfg.wall.now_ms();
-                tokio::task::spawn_blocking(move || lock(&invites).prune(now))
-                    .await
-                    .map_err(join_err)?
-            }
-        }
+    pub async fn maint_now(&self, job: crate::maint::MaintJob) -> Result<(), NodeError> {
+        crate::maint::run_job(&self.inner, job).await
     }
 
     /// Makes the reactor behave as if its change subscription lagged (a full rescan with

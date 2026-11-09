@@ -1716,6 +1716,92 @@ fn removal_after_settle_cannot_restore_and_warns() {
     );
 }
 
+// ---- Batched apply ----
+
+/// Everything readable about the keys / sets used by `apply_batch_equals_sequential_apply`.
+fn batch_dump(s: &Store<ManualClock>) -> impl PartialEq + std::fmt::Debug {
+    let entries: Vec<_> = ["k", "j", "o", "x"]
+        .iter()
+        .map(|k| s.get_entry("s", k).unwrap())
+        .collect();
+    (
+        entries,
+        s.list_keys("s", "", None, 100).unwrap(),
+        s.set_members("s", "m", None, 100).unwrap(),
+        s.version_vector().unwrap(),
+        s.pending_len().unwrap(),
+        s.diff_since(&VersionVector::default(), 1000).unwrap(),
+    )
+}
+
+#[test]
+fn apply_batch_equals_sequential_apply() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let a1 = a.set("s", "k", b"a1").unwrap();
+    let a2 = a.set_add("s", "m", b"x").unwrap();
+    let a3 = a.delete("s", "j").unwrap();
+    let a4 = a.set_ordered("s", "o", &[2], Some(b"a4")).unwrap();
+    let b1 = b.set("s", "k", b"b1").unwrap();
+    let b2 = b.set("s", "j", b"b2").unwrap();
+    let b3 = b.set_add("s", "m", b"y").unwrap();
+    let mut bad = b.set("s", "x", b"bad").unwrap();
+    bad.body.seq = 9; // signature no longer verifies
+    let equiv = hand_op(2, 1, T0, "x", b"equivocating");
+    let skewed = hand_op(3, 1, T0 + 10 * DAY_MS, "x", b"future");
+    // Gaps (a3 before a1), drains, duplicates, an equivocation, a bad signature, a
+    // skewed op and an unknown origin (node 4, judged by `members`).
+    let c1 = hand_op(4, 1, T0, "x", b"c1");
+    let batch = vec![
+        a3.clone(),
+        b2.clone(),
+        a1.clone(),
+        b1.clone(),
+        a2.clone(),
+        a1.clone(),
+        equiv,
+        bad,
+        skewed,
+        c1,
+        b3.clone(),
+        a4.clone(),
+        b2.clone(),
+    ];
+    let acc = members(&[node(1), node(2), node(3)]);
+
+    let seq_store = store(dir.path(), 5, &clock);
+    let bat_store = store(dir.path(), 6, &clock);
+    let mut seq_rx = seq_store.subscribe();
+    let mut bat_rx = bat_store.subscribe();
+    let sequential: Vec<Outcome> = batch
+        .iter()
+        .map(|op| seq_store.apply(op.clone(), &acc).unwrap())
+        .collect();
+    let batched = bat_store.apply_batch(batch, &acc).unwrap();
+    assert_eq!(batched, sequential);
+    assert!(sequential.contains(&Outcome::Deferred(DeferReason::Gap)));
+    assert!(sequential.contains(&Outcome::Rejected(RejectReason::Equivocation)));
+    assert!(sequential.contains(&Outcome::Rejected(RejectReason::BadSig)));
+    assert!(sequential.contains(&Outcome::Deferred(DeferReason::Skew)));
+    assert!(sequential.contains(&Outcome::Deferred(DeferReason::UnknownOrigin)));
+    assert!(sequential.contains(&Outcome::Duplicate));
+    assert_eq!(batch_dump(&bat_store), batch_dump(&seq_store));
+    // Same change events, in the same order.
+    let drain = |rx: &mut tokio::sync::broadcast::Receiver<Change>| {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+    };
+    let events = drain(&mut seq_rx);
+    assert!(!events.is_empty());
+    assert_eq!(drain(&mut bat_rx), events);
+    // An empty batch and an all-duplicate batch are fine.
+    assert!(bat_store.apply_batch(Vec::new(), &acc).unwrap().is_empty());
+    assert_eq!(
+        bat_store.apply_batch(vec![a1, b1], &acc).unwrap(),
+        vec![Outcome::Duplicate, Outcome::Duplicate]
+    );
+}
+
 // ---- Bench (informational) ----
 
 #[test]
@@ -1742,5 +1828,22 @@ fn bench_apply_100k() {
         "apply {N} remote ops: {apply:?} ({:.0} ops/s); 10000 gets: {get:?} ({:.1} us/get)",
         N as f64 / apply.as_secs_f64(),
         get.as_secs_f64() * 1e6 / 10_000.0
+    );
+
+    // The same ops through `apply_batch`, 256 per batch (one transaction each).
+    const BATCH: usize = 256;
+    let s = store(dir.path(), 3, &clock);
+    let ops: Vec<SignedOp> = (1..=N)
+        .map(|i| hand_op(2, i, T0, &format!("k{}", i % 10_000), b"value"))
+        .collect();
+    let t = Instant::now();
+    for chunk in ops.chunks(BATCH) {
+        let outs = s.apply_batch(chunk.to_vec(), &AcceptAll).unwrap();
+        assert!(outs.iter().all(|o| *o == Outcome::Applied));
+    }
+    let batched = t.elapsed();
+    println!(
+        "apply_batch {N} remote ops in batches of {BATCH}: {batched:?} ({:.0} ops/s)",
+        N as f64 / batched.as_secs_f64()
     );
 }

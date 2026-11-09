@@ -179,8 +179,13 @@ fn in_order(ops: &[SignedOp]) -> Vec<SignedOp> {
 enum Step {
     /// Deliver `ops[i]` with `apply`.
     Op(usize),
-    /// Pull at most `limit` items from a peer reader (`peer` picks it, see `peer_of`).
-    Pull { peer: usize, limit: usize },
+    /// Pull at most `limit` items from a peer reader (`peer` picks it, see `peer_of`),
+    /// applying the ops with `apply_batch` if `batch`, else one `apply` each.
+    Pull {
+        peer: usize,
+        limit: usize,
+        batch: bool,
+    },
     /// Advance this reader's clock by `SETTLE_MS + 1`, then `compact()`.
     Compact,
     /// Apply removal number `i` of the property.
@@ -205,7 +210,10 @@ fn schedule_strategy(n_ops: usize, spec: ScheduleSpec) -> impl Strategy<Value = 
     let perm = Just((0..n_ops).collect::<Vec<_>>()).prop_shuffle();
     let keep = any::<Index>();
     let dups = prop::collection::vec((0..n_ops, any::<Index>()), 0..=n_ops / 5);
-    let pulls = prop::collection::vec((0usize..3, 1usize..8, any::<Index>()), spec.pulls);
+    let pulls = prop::collection::vec(
+        (0usize..3, 1usize..8, any::<bool>(), any::<Index>()),
+        spec.pulls,
+    );
     let compacts = prop::collection::vec(any::<Index>(), spec.compacts);
     let removals = prop::collection::vec(any::<Index>(), spec.removals);
     let gcs = prop::collection::vec(any::<Index>(), spec.gcs);
@@ -221,9 +229,9 @@ fn schedule_strategy(n_ops: usize, spec: ScheduleSpec) -> impl Strategy<Value = 
                 let at = at.index(steps.len() + 1);
                 steps.insert(at, Step::Op(i));
             }
-            for (peer, limit, at) in pulls {
+            for (peer, limit, batch, at) in pulls {
                 let at = at.index(steps.len() + 1);
-                steps.insert(at, Step::Pull { peer, limit });
+                steps.insert(at, Step::Pull { peer, limit, batch });
             }
             for at in compacts {
                 let at = at.index(steps.len() + 1);
@@ -264,41 +272,54 @@ fn peer_of(r: usize, peer: usize, m: usize) -> usize {
     (r + 1 + peer % (m - 1)) % m
 }
 
-/// Applies catch-up items in order (`Op` → `apply`, `Covered` → `apply_covered`).
-fn feed(to: &S, items: Vec<SyncItem>, advertised: &VersionVector) {
+/// Applies catch-up items in order: `Covered` → `apply_covered` (bounded by the sender's
+/// `advertised` vector); `Op` → `apply`, or, if `batch`, each run of consecutive ops in
+/// one `apply_batch` (the two exchange modes of the sync session).
+fn feed(to: &S, items: Vec<SyncItem>, advertised: &VersionVector, batch: bool) {
+    let mut run: Vec<SignedOp> = Vec::new();
+    let flush = |run: &mut Vec<SignedOp>| {
+        if !run.is_empty() {
+            to.apply_batch(std::mem::take(run), &AcceptAll)
+                .expect("apply_batch");
+        }
+    };
     for item in items {
         match item {
+            SyncItem::Op(o) if batch => run.push(o),
             SyncItem::Op(o) => {
                 to.apply(o, &AcceptAll).expect("apply");
             }
             SyncItem::Covered { origin, upto } => {
+                flush(&mut run);
                 to.apply_covered(origin, upto, advertised.get(&origin), &AcceptAll)
                     .expect("apply_covered");
             }
         }
     }
+    flush(&mut run);
 }
 
 /// One catch-up of `to` from `from`, at most `limit` items. Returns how many moved.
-fn pull(to: &S, from: &S, limit: usize) -> usize {
+fn pull(to: &S, from: &S, limit: usize, batch: bool) -> usize {
     let items = from
         .diff_since(&to.version_vector().expect("vv"), limit)
         .expect("diff_since");
     let n = items.len();
-    feed(to, items, &from.version_vector().expect("vv"));
+    feed(to, items, &from.version_vector().expect("vv"), batch);
     n
 }
 
 /// Pulls between every ordered pair until a round transfers nothing, then retries
 /// `pending` everywhere. Returns false if that did not settle within `MAX_ROUNDS`.
+/// Alternates the batched and per-op exchange modes between pairs and rounds.
 fn full_exchange(rs: &[&S]) -> bool {
     let mut settled = false;
-    for _ in 0..MAX_ROUNDS {
+    for round in 0..MAX_ROUNDS {
         let mut moved = 0;
         for (i, to) in rs.iter().enumerate() {
             for (j, from) in rs.iter().enumerate() {
                 if i != j {
-                    moved += pull(to, from, usize::MAX);
+                    moved += pull(to, from, usize::MAX, (i + j + round) % 2 == 0);
                 }
             }
         }
@@ -332,9 +353,9 @@ fn run_schedules(
                 Step::Op(k) => {
                     me.store.apply(ops[k].clone(), &AcceptAll).expect("apply");
                 }
-                Step::Pull { peer, limit } => {
+                Step::Pull { peer, limit, batch } => {
                     let p = pull_from(r, peer);
-                    pull(&me.store, &rs[p].store, limit);
+                    pull(&me.store, &rs[p].store, limit, batch);
                 }
                 Step::Compact => {
                     me.clock.advance(SETTLE_MS + 1);
@@ -544,7 +565,7 @@ proptest! {
         // Catch reader 1 up from reader 0 only.
         let mut settled = false;
         for _ in 0..MAX_ROUNDS {
-            if pull(&rs[1].store, &rs[0].store, usize::MAX) == 0 {
+            if pull(&rs[1].store, &rs[0].store, usize::MAX, false) == 0 {
                 settled = true;
                 break;
             }

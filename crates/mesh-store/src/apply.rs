@@ -484,6 +484,46 @@ impl<W: WallClock> Store<W> {
         Ok(out)
     }
 
+    /// Applies `ops` in order in **one** write transaction (Ruling R17): the outcomes and
+    /// the resulting state are exactly those of calling [`Store::apply`] on each op in
+    /// turn (later ops see the effects of earlier ones, including drains), but with one
+    /// commit and one fsync for the whole batch. Change events are published after the
+    /// commit, in the same order sequential applies would publish them.
+    ///
+    /// Errors: as [`Store::apply`]; an error aborts the whole batch (nothing of it is
+    /// committed), whereas sequential applies would have kept the ops before the failing
+    /// one.
+    pub fn apply_batch(
+        &self,
+        ops: Vec<SignedOp>,
+        acc: &dyn Acceptor,
+    ) -> Result<Vec<Outcome>, StoreError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut clock = self.lock_clock();
+        let tx = self.db.begin_write()?;
+        let (outs, changes) = {
+            let mut p = Pipeline::new(&tx, &mut clock, acc, self.mesh, self.node);
+            let mut outs = Vec::with_capacity(ops.len());
+            for op in ops {
+                outs.push(p.admit(op)?);
+            }
+            (outs, p.changes)
+        };
+        let wrote = outs
+            .iter()
+            .any(|o| !matches!(o, Outcome::Duplicate | Outcome::Rejected(_)));
+        if !wrote && changes.is_empty() {
+            // Nothing was written; skip the commit's fsync.
+            tx.abort()?;
+        } else {
+            tx.commit()?;
+        }
+        self.publish(changes);
+        Ok(outs)
+    }
+
     /// Retries every `pending` op in key order (after a membership change, and about once
     /// a minute so resolved skew is picked up). Returns how many ops were applied,
     /// including ones unblocked behind them. Entries that still can't be applied stay with

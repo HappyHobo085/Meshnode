@@ -11,7 +11,7 @@ use crate::{Store, merge, meta_u64};
 use mesh_hlc::{Hlc, WallClock};
 use mesh_proto::{NodeId, Payload, SignedOp};
 use redb::{ReadableDatabase, ReadableTable, TableHandle, WriteTransaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How long an op must have been superseded (or invalid) before compaction may delete
 /// it (§5.5). Retraction of a removed origin can restore ops younger than this.
@@ -89,7 +89,7 @@ struct Doomed {
     /// Seq of the winning tombstone's op.
     seq: u64,
     change: Change,
-    ops: Vec<[u8; OP_KEY_LEN]>,
+    ops: BTreeSet<[u8; OP_KEY_LEN]>,
     /// Deleting would drop one of this node's own ops not yet covered by a full sync.
     unsafe_own: bool,
 }
@@ -184,7 +184,7 @@ impl<W: WallClock> Store<W> {
                             origin,
                             seq: row.seq,
                             change,
-                            ops: Vec::new(),
+                            ops: BTreeSet::new(),
                             unsafe_own: false,
                         },
                     );
@@ -216,13 +216,40 @@ impl<W: WallClock> Store<W> {
             return Ok(0);
         }
 
-        // The ops of each doomed key that go with it. Every reg row's op is valid, so
-        // it is among them.
+        // The ops of each doomed key that go with it, without scanning `ops`: every op of
+        // a key is either its origin's current `reg` row (valid) or has a `superseded`
+        // entry (a valid op that lost or was replaced, or an invalid op, Ruling R9), until
+        // compaction deletes both together. So the key's `reg` rows give the winners, and
+        // one pass over `superseded` (decoding only those ops) gives the rest. The cost is
+        // O(rows of the doomed keys + |superseded|); `superseded` holds only ops superseded
+        // within the last SETTLE_MS plus ops compaction may never delete (invalid ops above
+        // their origin's vv).
         {
+            let reg = tx.open_table(REG)?;
+            for (g, d) in doomed.iter_mut() {
+                for item in reg.range::<&[u8]>(g.as_slice()..)? {
+                    let (k, v) = item?;
+                    if !k.value().starts_with(g) {
+                        break;
+                    }
+                    let origin = keys::split_reg_key(k.value())?.origin;
+                    let seq = tables::decode::<RegRow>("reg", v.value())?.seq;
+                    if origin == self.node && synced_seq.is_none_or(|s| seq > s) {
+                        d.unsafe_own = true;
+                    }
+                    d.ops.insert(keys::op_key(&origin, seq));
+                }
+            }
+        }
+        {
+            let sup = tx.open_table(SUPERSEDED)?;
             let ops = tx.open_table(OPS)?;
-            for item in ops.iter()? {
-                let (k, v) = item?;
-                let row: OpRow = tables::decode("ops", v.value())?;
+            for item in sup.iter()? {
+                let (k, _) = item?;
+                let row: OpRow = match ops.get(k.value())? {
+                    Some(g) => tables::decode("ops", g.value())?,
+                    None => continue,
+                };
                 let b = &row.op.body;
                 let Payload::Set { ns, key, order, .. } = &b.payload else {
                     continue;
@@ -239,8 +266,8 @@ impl<W: WallClock> Store<W> {
                 if b.origin == self.node && synced_seq.is_none_or(|s| b.seq > s) {
                     d.unsafe_own = true;
                 }
-                let (origin, seq) = keys::split_op_key("ops", k.value())?;
-                d.ops.push(keys::op_key(&origin, seq));
+                let (origin, seq) = keys::split_op_key("superseded", k.value())?;
+                d.ops.insert(keys::op_key(&origin, seq));
             }
         }
         doomed.retain(|_, d| !d.unsafe_own);

@@ -288,6 +288,7 @@ impl SlotTask {
             events: env.events.clone(),
             metrics: self.slot.metrics.clone(),
             serve_paused: env.serve_paused.clone(),
+            signout: env.signout.clone(),
         };
         {
             let mut s = self.slot.lock();
@@ -331,6 +332,7 @@ impl SlotTask {
         if refused {
             info!(peer, "peer refuses this node as removed");
             self.note_refused();
+            self.env().signout.peer_refused();
         }
         match end {
             SessionEnd::Closed => {
@@ -350,6 +352,10 @@ impl SlotTask {
         }
         if self.slot.metrics.rounds_completed.load(Ordering::SeqCst) > l.rounds_at_start {
             self.backoff = self.env().timings.backoff_min;
+        }
+        if refused {
+            // Spec §4: a refused node keeps trying, but only at the slowest pace.
+            self.backoff = self.env().timings.backoff_max;
         }
         self.finish(l);
         self.schedule_redial();

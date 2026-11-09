@@ -152,50 +152,6 @@ async fn post_cutoff_write_retracted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn removed_self_stops() {
-    let Mesh3 { a, b, c, dirs } = mesh3(Role::Host).await;
-    let (ib, ic) = (b.node_id(), c.node_id());
-    let mut c_events = c.subscribe();
-    b.remove(ic).await.unwrap();
-    wait_event(
-        &mut c_events,
-        |e| matches!(e, NodeEvent::RemovedSelf { by } if *by == ib),
-        T,
-    )
-    .await;
-    assert_eq!(c.status(), NodeStatus::Removed { by: ib });
-    assert!(matches!(
-        c.store().set(NS, "k", b"x".to_vec()).await,
-        Err(NodeError::Removed)
-    ));
-    assert!(matches!(
-        c.store().set_add(NS, "s", b"x".to_vec()).await,
-        Err(NodeError::Removed)
-    ));
-    assert!(matches!(
-        c.store().delete(NS, "k").await,
-        Err(NodeError::Removed)
-    ));
-    wait_until("C has no connections", T, || async {
-        c.connection_count() == 0
-    })
-    .await;
-
-    // The state is derived from the store, so it survives a restart.
-    c.shutdown().await;
-    let c = timeout(T, Node::open(test_cfg(dirs[2].path(), "c").0))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(c.status(), NodeStatus::Removed { by: ib });
-    assert!(matches!(
-        c.store().set(NS, "k", b"x".to_vec()).await,
-        Err(NodeError::Removed)
-    ));
-    shutdown_all(vec![a, b, c]).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removed_node_cannot_rejoin() {
     let Mesh3 { a, b, c, dirs } = mesh3(Role::Host).await;
     let ic = c.node_id();
@@ -237,32 +193,114 @@ async fn last_host_cannot_be_removed() {
     shutdown_all(vec![a, b]).await;
 }
 
-/// A and B remove each other while cut off from each other; C (a third node) stays
-/// connected to both and relays the records. `a_first` picks which removal is issued first
-/// (the two run concurrently, so it only biases which record reaches C first).
-async fn mutual(role_c: Role, a_first: bool) -> Mesh3 {
-    let m = mesh3(role_c).await;
-    let (ia, ib) = (m.a.node_id(), m.b.node_id());
-    m.a.partition(&[ib]);
-    m.b.partition(&[ia]);
-    wait_until("A and B apart", T, || async {
-        !online(&m.a, ib) && !online(&m.b, ia)
+/// Cuts every pair of the three nodes apart, so nothing moves except by `deliver_from`.
+async fn isolate_all(m: &Mesh3) {
+    let ids = [m.a.node_id(), m.b.node_id(), m.c.node_id()];
+    for n in [&m.a, &m.b, &m.c] {
+        let others: Vec<NodeId> = ids.iter().copied().filter(|i| *i != n.node_id()).collect();
+        n.partition(&others);
+    }
+    wait_until("all connections closed", T, || async {
+        [&m.a, &m.b, &m.c].iter().all(|n| n.connection_count() == 0)
     })
     .await;
-    // A record that reached the other side first would make that side stop (it learns of its
-    // own removal), so both removals are issued back to back.
-    let (ra, rb) = if a_first {
-        let ra = m.a.remove(ib).await;
-        (ra, m.b.remove(ia).await)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_self_stops() {
+    let m = mesh3(Role::Host).await;
+    isolate_all(&m).await;
+    let Mesh3 { a, b, c, dirs } = m;
+    let (ib, ic) = (b.node_id(), c.node_id());
+    let mut c_events = c.subscribe();
+    b.remove(ic).await.unwrap();
+    // The record reaches C by hand, so no REMOVED close can come first.
+    c.deliver_from(&b).await.unwrap();
+    wait_event(
+        &mut c_events,
+        |e| matches!(e, NodeEvent::RemovedSelf { by } if *by == ib),
+        T,
+    )
+    .await;
+    assert_eq!(c.status(), NodeStatus::Removed { by: ib });
+    assert!(matches!(
+        c.store().set(NS, "k", b"x".to_vec()).await,
+        Err(NodeError::Removed)
+    ));
+    assert!(matches!(
+        c.store().set_add(NS, "s", b"x".to_vec()).await,
+        Err(NodeError::Removed)
+    ));
+    assert!(matches!(
+        c.store().delete(NS, "k").await,
+        Err(NodeError::Removed)
+    ));
+
+    // The state is derived from the store, so it survives a restart.
+    c.shutdown().await;
+    let c = timeout(T, Node::open(test_cfg(dirs[2].path(), "c").0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.status(), NodeStatus::Removed { by: ib });
+    assert!(matches!(
+        c.store().set(NS, "k", b"x".to_vec()).await,
+        Err(NodeError::Removed)
+    ));
+    assert_eq!(c.connection_count(), 0);
+    shutdown_all(vec![a, b, c]).await;
+}
+
+/// Connected end to end: whether C hears the record or only the REMOVED close depends on
+/// timing, so only what holds in every interleaving is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_end_to_end() {
+    let Mesh3 { a, b, c, dirs: _d } = mesh3(Role::Host).await;
+    let (ib, ic) = (b.node_id(), c.node_id());
+    b.remove(ic).await.unwrap();
+    wait_until("A and B drop C", T, || async {
+        !effective(&a, ic) && !effective(&b, ic) && !online(&a, ic) && !online(&b, ic)
+    })
+    .await;
+    wait_until("C knows it is out", T, || async {
+        match c.status() {
+            NodeStatus::Removed { by } => by == ib,
+            NodeStatus::RefusedAsRemoved { by } => !by.is_empty(),
+            _ => false,
+        }
+    })
+    .await;
+    shutdown_all(vec![a, b, c]).await;
+}
+
+/// A and B remove each other while all three are cut apart; the records then reach C by
+/// hand in the chosen order, and C hands both on. Also returns the events of C from before
+/// the deliveries.
+async fn staged_mutual(
+    role_c: Role,
+    a_first: bool,
+) -> (Mesh3, tokio::sync::broadcast::Receiver<NodeEvent>) {
+    let m = mesh3(role_c).await;
+    let (ia, ib) = (m.a.node_id(), m.b.node_id());
+    isolate_all(&m).await;
+    let c_events = m.c.subscribe();
+    m.a.remove(ib).await.unwrap();
+    m.b.remove(ia).await.unwrap();
+    if a_first {
+        m.c.deliver_from(&m.a).await.unwrap();
+        m.c.deliver_from(&m.b).await.unwrap();
     } else {
-        let rb = m.b.remove(ia).await;
-        (m.a.remove(ib).await, rb)
-    };
-    ra.unwrap();
-    rb.unwrap();
-    m.a.heal();
-    m.b.heal();
-    m
+        m.c.deliver_from(&m.b).await.unwrap();
+        m.c.deliver_from(&m.a).await.unwrap();
+    }
+    // Whatever the order, C ends with both removal records in force.
+    wait_until("C shows A and B removed", T, || async {
+        !effective(&m.c, ia) && !effective(&m.c, ib)
+    })
+    .await;
+    m.a.deliver_from(&m.c).await.unwrap();
+    m.b.deliver_from(&m.c).await.unwrap();
+    (m, c_events)
 }
 
 async fn both_removed_everywhere(m: &Mesh3) {
@@ -273,12 +311,18 @@ async fn both_removed_everywhere(m: &Mesh3) {
         })
         .await;
     }
+    wait_until("A and B know they are removed", T, || async {
+        m.a.status() == NodeStatus::Removed { by: ib }
+            && m.b.status() == NodeStatus::Removed { by: ia }
+    })
+    .await;
+    converged(&[&m.a, &m.b, &m.c], T).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutual_removal_converges() {
     for a_first in [true, false] {
-        let m = mutual(Role::Host, a_first).await;
+        let (m, _events) = staged_mutual(Role::Host, a_first).await;
         both_removed_everywhere(&m).await;
         shutdown_all(vec![m.a, m.b, m.c]).await;
     }
@@ -286,60 +330,90 @@ async fn mutual_removal_converges() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutual_removal_of_last_two_hosts() {
-    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let a = Node::create_mesh(test_cfg(dirs[0].path(), "a").0)
-        .await
-        .unwrap();
-    let b = invited(&a, dirs[1].path(), "b", Role::Host).await;
-    let c = invited(&a, dirs[2].path(), "c", Role::Client).await;
-    let ids = [a.node_id(), b.node_id(), c.node_id()];
-    let (ia, ib) = (ids[0], ids[1]);
-    for n in [&a, &b, &c] {
-        wait_until("full mesh", T, || async {
-            n.members().len() == 3 && ids.iter().all(|id| *id == n.node_id() || online(n, *id))
-        })
-        .await;
-    }
-    let mut c_events = c.subscribe();
-    a.partition(&[ib]);
-    b.partition(&[ia]);
-    wait_until("A and B apart", T, || async {
-        !online(&a, ib) && !online(&b, ia)
-    })
-    .await;
-    // Each passes its local last-host check: it still sees the other as a host.
-    a.remove(ib).await.unwrap();
-    b.remove(ia).await.unwrap();
-    a.heal();
-    b.heal();
+    let (m, mut c_events) = staged_mutual(Role::Client, true).await;
     wait_event(
         &mut c_events,
         |e| matches!(e, NodeEvent::NoEffectiveHost),
         T,
     )
     .await;
-    let m = Mesh3 {
-        a,
-        b,
-        c,
-        dirs: Vec::new(),
-    };
     both_removed_everywhere(&m).await;
     shutdown_all(vec![m.a, m.b, m.c]).await;
 }
 
+/// The change event for the removal is lost; a `Lagged` rescan (cache cleared) alone must
+/// apply it: C ends non-effective on A and its post-cutoff write is retracted there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lagged_events_rescan() {
-    let Mesh3 { a, b, c, dirs: _d } = mesh3(Role::Host).await;
-    let ic = c.node_id();
-    // A rescans from scratch (cache cleared) just as B's removal of C reaches it.
-    let mut a_events = a.subscribe();
+    let m = mesh3(Role::Host).await;
+    let ic = m.c.node_id();
+    put(&m.c, "k", "c1").await;
+    converged(&[&m.a, &m.b, &m.c], T).await;
+    isolate_all(&m).await;
+    let Mesh3 { a, b, c, dirs: _d } = m;
+
+    put(&c, "k", "c2").await;
+    a.deliver_from(&c).await.unwrap();
+    assert_eq!(val(&a, "k").await.as_deref(), Some(&b"c2"[..]));
     b.remove(ic).await.unwrap();
+
+    a.lose_events(true);
+    a.deliver_from(&b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(effective(&a, ic), "the lost event must not rescan");
+    assert_eq!(val(&a, "k").await.as_deref(), Some(&b"c2"[..]));
+
+    a.lose_events(false);
     a.force_lagged();
-    wait_event(&mut a_events, |e| matches!(e, NodeEvent::MembersChanged), T).await;
-    wait_until("A drops C", T, || async {
-        !effective(&a, ic) && !online(&a, ic)
+    wait_until("A applies the removal", T, || async {
+        !effective(&a, ic) && val(&a, "k").await.as_deref() == Some(&b"c1"[..])
     })
     .await;
+    shutdown_all(vec![a, b, c]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_out_propagates() {
+    let Mesh3 { a, b, c, dirs: _d } = mesh3(Role::Host).await;
+    let ic = c.node_id();
+    c.remove(ic).await.unwrap();
+    wait_until("A and B show C removed", T, || async {
+        !effective(&a, ic) && !effective(&b, ic)
+    })
+    .await;
+    wait_until("C stops once a peer holds the record", T, || async {
+        c.connection_count() == 0
+    })
+    .await;
+    assert_eq!(c.status(), NodeStatus::Removed { by: ic });
+    assert!(matches!(
+        c.store().set(NS, "k", b"x".to_vec()).await,
+        Err(NodeError::Removed)
+    ));
+    shutdown_all(vec![a, b, c]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_out_while_offline_reaches_peers_after_heal() {
+    let m = mesh3(Role::Host).await;
+    isolate_all(&m).await;
+    let Mesh3 { a, b, c, dirs: _d } = m;
+    let ic = c.node_id();
+    c.remove(ic).await.unwrap();
+    wait_until("C signed out", T, || async {
+        c.status() == NodeStatus::Removed { by: ic }
+    })
+    .await;
+    // Nobody has the record yet, so C keeps trying rather than stopping.
+    assert!(effective(&a, ic) && effective(&b, ic));
+
+    a.heal();
+    b.heal();
+    c.heal();
+    wait_until("A and B learn the sign-out", T, || async {
+        !effective(&a, ic) && !effective(&b, ic)
+    })
+    .await;
+    wait_until("C stops", T, || async { c.connection_count() == 0 }).await;
     shutdown_all(vec![a, b, c]).await;
 }

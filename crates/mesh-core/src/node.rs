@@ -29,7 +29,7 @@ use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
     encode_info, encode_removal, info_key, member_bytes,
 };
-use crate::peers::{PeerEnv, PeerManager, SyncHandler};
+use crate::peers::{PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
 use crate::transport::{ALPN_JOIN, ALPN_SYNC, Gate, addr_to_bytes, build_endpoint};
 
@@ -110,6 +110,8 @@ struct Inner {
     cancel: CancellationToken,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     force_lagged: Arc<Notify>,
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    lose_events: Arc<AtomicBool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -271,6 +273,8 @@ pub(crate) async fn start(
     let cancel = CancellationToken::new();
     let serve_paused = Arc::new(AtomicBool::new(false));
     let force_lagged = Arc::new(Notify::new());
+    let lose_events = Arc::new(AtomicBool::new(false));
+    let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
 
     if let Some(ms) = store.call(|s| Ok(s.clock_floor_ahead_ms())).await? {
@@ -290,6 +294,7 @@ pub(crate) async fn start(
             endpoint: endpoint.clone(),
             events: events.clone(),
             status: status.clone(),
+            signout: signout.clone(),
             serve_paused: serve_paused.clone(),
             stale: stale_tx,
         },
@@ -330,6 +335,8 @@ pub(crate) async fn start(
         peers: peers.clone(),
         events: events.clone(),
         force_lagged: force_lagged.clone(),
+        lose_events: lose_events.clone(),
+        signout: signout.clone(),
     };
     // Subscribed before the first rescan starts any peer, so no round is missed.
     let mut first_rx = Some(events.subscribe());
@@ -382,6 +389,7 @@ pub(crate) async fn start(
             tasks: Mutex::new(tasks),
             cancel,
             force_lagged,
+            lose_events,
         }),
     })
 }
@@ -691,6 +699,40 @@ impl Node {
     /// the applied-cutoff cache cleared).
     pub fn force_lagged(&self) {
         self.inner.force_lagged.notify_one();
+    }
+
+    /// While `on`, the reactor discards the store change events as if they were lost
+    /// (only `force_lagged` or a later event brings the rescan).
+    pub fn lose_events(&self, on: bool) {
+        self.inner.lose_events.store(on, Ordering::SeqCst);
+    }
+
+    /// Hand-delivers to this node every op `other` holds that it lacks, as one sync round
+    /// would, without any connection. The reactor then reacts as usual.
+    pub async fn deliver_from(&self, other: &Node) -> Result<(), NodeError> {
+        let mine = self.inner.store.call(|s| s.version_vector()).await?;
+        let (items, theirs) = other
+            .inner
+            .store
+            .call(move |s| Ok((s.diff_since(&mine, 100_000)?, s.version_vector()?)))
+            .await?;
+        let acc = self.inner.acc.clone();
+        self.inner
+            .store
+            .call(move |s| {
+                let mut ops = Vec::new();
+                for item in items {
+                    match item {
+                        mesh_store::SyncItem::Op(op) => ops.push(op),
+                        mesh_store::SyncItem::Covered { origin, upto } => {
+                            s.apply_batch(std::mem::take(&mut ops), &*acc)?;
+                            s.apply_covered(origin, upto, theirs.get(&origin), &*acc)?;
+                        }
+                    }
+                }
+                s.apply_batch(ops, &*acc).map(drop)
+            })
+            .await
     }
 
     /// An extra dial address for a peer, as a join reply would give.

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mesh_proto::{MeshGenesis, NodeId};
 use mesh_store::Change;
@@ -18,7 +19,7 @@ use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::membership::{MESH_NS, MembershipSnapshot, MeshAcceptor};
 use crate::node::NodeStatus;
-use crate::peers::PeerManager;
+use crate::peers::{PeerManager, SignOut};
 use crate::transport::REMOVED;
 
 /// Everything a rescan reads or updates; cloned into each reactor run.
@@ -34,6 +35,9 @@ pub(crate) struct ReactorCtx {
     pub events: broadcast::Sender<NodeEvent>,
     /// Test hook: behave as if the change subscription lagged.
     pub force_lagged: Arc<Notify>,
+    /// Test hook: discard change events (see `Node::lose_events`).
+    pub lose_events: Arc<AtomicBool>,
+    pub signout: Arc<SignOut>,
 }
 
 pub(crate) struct Reactor {
@@ -71,8 +75,13 @@ impl Reactor {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = self.ctx.force_lagged.notified() => lagged = true,
+                _ = self.ctx.signout.proved() => {
+                    info!("sign-out reached a peer; stopping");
+                    self.ctx.peers.stop();
+                    continue;
+                }
                 r = self.rx.recv() => match r {
-                    Ok(ch) => rescan |= is_mesh(&ch),
+                    Ok(ch) => rescan |= is_mesh(&ch) && !self.lost(),
                     Err(RecvError::Lagged(n)) => {
                         warn!(missed = n, "change events lagged; rescanning");
                         lagged = true;
@@ -83,7 +92,7 @@ impl Reactor {
             // Coalesce a burst into one wake-up and at most one rescan.
             loop {
                 match self.rx.try_recv() {
-                    Ok(ch) => rescan |= is_mesh(&ch),
+                    Ok(ch) => rescan |= is_mesh(&ch) && !self.lost(),
                     Err(TryRecvError::Lagged(_)) => lagged = true,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => return,
@@ -94,6 +103,10 @@ impl Reactor {
                 self.rescan_logged(lagged).await;
             }
         }
+    }
+
+    fn lost(&self) -> bool {
+        self.ctx.lose_events.load(Ordering::SeqCst)
     }
 
     pub async fn rescan_logged(&mut self, lagged: bool) {
@@ -162,7 +175,8 @@ impl Reactor {
             .filter(|id| *id != c.me)
             .map(|id| (id, snap.addr(&id).cloned()))
             .collect();
-        if snap.removed_by(&c.me).is_none() {
+        // (a sign-out keeps its targets until a peer has the record, see step 6)
+        if snap.removed_by(&c.me).is_none_or(|by| by == c.me) {
             c.peers.set_targets(targets);
         }
 
@@ -172,9 +186,20 @@ impl Reactor {
             if !already {
                 warn!(by = %by.short(), "this node was removed from the mesh");
                 c.store.refuse_writes_removed();
-                c.peers.stop();
                 c.status.send_replace(NodeStatus::Removed { by });
                 let _ = c.events.send(NodeEvent::RemovedSelf { by });
+            }
+            if by != c.me {
+                c.peers.stop();
+            } else if !c.signout.begun() {
+                // Sign-out: the record may not have left this node yet, so the sessions stay
+                // until a peer proves it holds the record (`SignOut`).
+                let me = c.me;
+                let seq = c
+                    .store
+                    .call(move |s| Ok(s.version_vector()?.get(&me)))
+                    .await?;
+                c.signout.begin(seq);
             }
         }
 

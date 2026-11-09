@@ -74,6 +74,7 @@ pub struct SessionCtx {
     pub(crate) events: broadcast::Sender<NodeEvent>,
     pub(crate) metrics: Arc<PeerMetrics>,
     pub(crate) serve_paused: Arc<AtomicBool>,
+    pub(crate) signout: Arc<crate::peers::SignOut>,
 }
 
 /// The other ends of a test session's channels.
@@ -111,6 +112,7 @@ impl SessionCtx {
             events,
             metrics: metrics.clone(),
             serve_paused: serve_paused.clone(),
+            signout: Arc::default(),
         };
         let handles = TestHandles {
             cmds: cmd_tx,
@@ -225,6 +227,7 @@ struct Parts {
     events: broadcast::Sender<NodeEvent>,
     metrics: Arc<PeerMetrics>,
     serve_paused: Arc<AtomicBool>,
+    signout: Arc<crate::peers::SignOut>,
 }
 
 /// Runs one session until the stream closes or an error ends it. The dialer starts a
@@ -246,6 +249,7 @@ where
         events,
         metrics,
         serve_paused,
+        signout,
     } = ctx;
     let s = Session {
         ctx: Parts {
@@ -259,6 +263,7 @@ where
             events,
             metrics,
             serve_paused,
+            signout,
         },
         st: Mutex::new(State::default()),
         kick: Notify::new(),
@@ -400,6 +405,7 @@ impl Session {
     }
 
     fn on_hello(&self, vv: VersionVector) {
+        self.ctx.signout.peer_hello(&self.ctx.me, &vv);
         let mut st = self.lock();
         if st.round.awaiting_reply {
             // The reply to our start, or the peer's start crossing ours: either way it

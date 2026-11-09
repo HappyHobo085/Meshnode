@@ -16,14 +16,14 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use mesh_proto::{MeshId, NodeAddrBytes, NodeId};
+use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -52,6 +52,45 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Sign-out in progress (spec §4): this node wrote its own removal record, so it keeps its
+/// sessions until a peer proves it holds the record, by closing with `REMOVED` or by a
+/// `Hello` whose version vector covers `seq`. The reactor then stops the node.
+#[derive(Default)]
+pub(crate) struct SignOut {
+    /// This node's highest seq when the sign-out was noticed; 0 = not signing out.
+    seq: AtomicU64,
+    proved: Notify,
+}
+
+impl SignOut {
+    pub fn begin(&self, seq: u64) {
+        self.seq.store(seq.max(1), Ordering::SeqCst);
+    }
+
+    pub fn begun(&self) -> bool {
+        self.seq.load(Ordering::SeqCst) != 0
+    }
+
+    /// A peer's `Hello` advertised `vv`.
+    pub fn peer_hello(&self, me: &NodeId, vv: &VersionVector) {
+        let seq = self.seq.load(Ordering::SeqCst);
+        if seq != 0 && vv.get(me) >= seq {
+            self.proved.notify_one();
+        }
+    }
+
+    /// A peer closed with `REMOVED`.
+    pub fn peer_refused(&self) {
+        if self.begun() {
+            self.proved.notify_one();
+        }
+    }
+
+    pub async fn proved(&self) {
+        self.proved.notified().await;
+    }
+}
+
 /// What every session of this node shares.
 pub(crate) struct PeerEnv {
     pub store: StoreHandle,
@@ -64,6 +103,7 @@ pub(crate) struct PeerEnv {
     pub events: broadcast::Sender<NodeEvent>,
     /// Peers that close with `REMOVED` are recorded here (spec §4).
     pub status: Arc<watch::Sender<NodeStatus>>,
+    pub signout: Arc<SignOut>,
     pub serve_paused: Arc<AtomicBool>,
     /// A session found the store stale (spec §7); the re-bootstrap hook.
     pub stale: mpsc::Sender<NodeId>,

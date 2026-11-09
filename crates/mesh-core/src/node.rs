@@ -9,7 +9,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
-use mesh_proto::{MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, Role};
+use mesh_proto::{InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, Role};
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -21,6 +21,7 @@ use crate::config::{DynClock, NodeConfig, Timings};
 use crate::db::{CoreStore, StoreHandle};
 use crate::error::NodeError;
 use crate::events::NodeEvent;
+use crate::join::{JoinHandler, JoinInner};
 use crate::local::{Invites, load_or_create_key, read_genesis, write_genesis};
 use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, addr_key, encode_addr, encode_info,
@@ -28,7 +29,7 @@ use crate::membership::{
 };
 use crate::peers::{PeerEnv, PeerManager, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
-use crate::transport::{ALPN_SYNC, Gate, addr_to_bytes, build_endpoint};
+use crate::transport::{ALPN_JOIN, ALPN_SYNC, Gate, addr_to_bytes, build_endpoint};
 
 const STORE_FILE: &str = "store.redb";
 const EVENT_CAPACITY: usize = 1024;
@@ -93,6 +94,7 @@ struct Inner {
     acc: Arc<MeshAcceptor>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     invites: Arc<Mutex<Invites>>,
+    join: Arc<JoinInner>,
     membership: Arc<watch::Sender<Arc<MembershipSnapshot>>>,
     peers: PeerManager,
     events: broadcast::Sender<NodeEvent>,
@@ -114,7 +116,7 @@ fn join_err(e: tokio::task::JoinError) -> NodeError {
     NodeError::Io(std::io::Error::other(e))
 }
 
-fn own_info(cfg: &NodeConfig) -> MemberInfo {
+pub(crate) fn own_info(cfg: &NodeConfig) -> MemberInfo {
     MemberInfo {
         name: cfg.name.clone(),
         platform: cfg.platform.clone(),
@@ -252,6 +254,7 @@ pub(crate) async fn start(
     let invites = tokio::task::spawn_blocking(move || Invites::load(&dir))
         .await
         .map_err(join_err)??;
+    let invites = Arc::new(Mutex::new(invites));
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
     let g = genesis.clone();
     let snap = store.call(move |s| MembershipSnapshot::load(s, &g)).await?;
@@ -288,11 +291,22 @@ pub(crate) async fn start(
     for (id, addr) in hints {
         peers.add_hint(id, addr);
     }
+    let join = Arc::new(JoinInner::new(
+        genesis.clone(),
+        me,
+        store.clone(),
+        invites.clone(),
+        cfg.wall.clone(),
+        status.clone(),
+        endpoint.clone(),
+    ));
     let router = Router::builder(endpoint.clone())
         .accept(
             ALPN_SYNC,
-            Gate::new(SyncHandler(peers.clone()), membership_rx),
+            Gate::new(SyncHandler(peers.clone()), membership_rx.clone()),
         )
+        // Not gated: a joiner is not a member yet.
+        .accept(ALPN_JOIN, JoinHandler(join.clone()))
         .spawn();
 
     if let Err(e) = publish_addr(&store, me, &endpoint.addr()).await {
@@ -348,7 +362,8 @@ pub(crate) async fn start(
             router,
             store,
             acc,
-            invites: Arc::new(Mutex::new(invites)),
+            invites,
+            join,
             membership,
             peers,
             events,
@@ -392,6 +407,30 @@ impl Node {
                 Err(e)
             }
         }
+    }
+
+    /// Joins the mesh a ticket belongs to (spec §5.3).
+    pub async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, NodeError> {
+        crate::join::join(cfg, ticket).await
+    }
+
+    /// Issues a single-use invite ticket valid for `ttl` (spec §5.2).
+    pub async fn invite(&self, role: Role, ttl: Duration) -> Result<InviteTicket, NodeError> {
+        self.inner.join.invite(role, ttl).await
+    }
+
+    /// After a join: writes `info/<self>` and `addr/<self>` once the first round completed.
+    pub(crate) fn spawn_publish_own(&self) {
+        let i = &self.inner;
+        lock(&i.tasks).spawn(crate::join::publish_own(
+            i.events.subscribe(),
+            i.membership.subscribe(),
+            i.store.clone(),
+            i.endpoint.clone(),
+            i.me,
+            own_info(&i.cfg),
+            i.cancel.clone(),
+        ));
     }
 
     /// Opens an existing data directory.
@@ -563,6 +602,11 @@ impl Node {
             write_genesis(&cfg.data_dir, &genesis)?;
         }
         start(cfg, key, genesis, hints).await
+    }
+
+    /// The next join this node accepts is applied, but its reply is never sent.
+    pub fn drop_next_join_reply(&self) {
+        self.inner.join.drop_next_reply();
     }
 
     /// Closes connections to, and refuses dials and accepts from, `ids`.

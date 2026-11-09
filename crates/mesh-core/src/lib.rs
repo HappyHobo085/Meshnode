@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod events;
 pub mod frame;
+mod join;
 pub mod local;
 pub mod membership;
 pub mod node;

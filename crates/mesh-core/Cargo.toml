@@ -19,6 +19,7 @@ hex.workspace = true
 postcard.workspace = true
 iroh.workspace = true
 rand.workspace = true
+blake3.workspace = true
 tokio-util.workspace = true
 
 [features]

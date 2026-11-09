@@ -6,3 +6,4 @@ spikes/**/out/
 local.properties
 /target/
 .superpowers/
+crates/mesh-runtime/tests/fixtures/target/

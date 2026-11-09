@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mesh_proto::{MeshGenesis, NodeId};
+use mesh_proto::{MeshGenesis, NodeAddrBytes, NodeId};
 use mesh_store::Change;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -38,6 +38,8 @@ pub(crate) struct ReactorCtx {
     /// Test hook: discard change events (see `Node::lose_events`).
     pub lose_events: Arc<AtomicBool>,
     pub signout: Arc<SignOut>,
+    /// Set while a re-bootstrap runs (the node's `serve_paused`); see [`Reactor::rescan`].
+    pub rebootstrapping: Arc<AtomicBool>,
 }
 
 pub(crate) struct Reactor {
@@ -117,6 +119,13 @@ impl Reactor {
     }
 
     /// One full membership rescan (spec §3.3 steps 1–7).
+    ///
+    /// While a re-bootstrap runs, the store is emptied and refilled by the catch-up, so a
+    /// snapshot read from it may lack members it held before. Then only steps 1–3 run, and
+    /// the new snapshot replaces the current one (with the dial targets) only if every
+    /// currently effective member is still effective in it: membership only grows, no
+    /// connection is closed and nothing is concluded about this node until the
+    /// re-bootstrap ends with a full rescan.
     pub async fn rescan(&mut self, lagged: bool) -> Result<(), NodeError> {
         let c = &self.ctx;
         if lagged {
@@ -155,11 +164,31 @@ impl Reactor {
         c.store.call(move |s| s.retry_pending(&*acc)).await?;
 
         let snap = Arc::new(snap);
-        let changed = **c.membership.borrow() != *snap;
-        c.membership.send_replace(snap.clone());
-        if changed {
-            let _ = c.events.send(NodeEvent::MembersChanged);
+        if c.rebootstrapping.load(Ordering::SeqCst) {
+            let targets = {
+                let cur = c.membership.borrow();
+                let grows = cur
+                    .effective_members()
+                    .iter()
+                    .all(|id| snap.is_effective(id));
+                // An address register may not be back yet: keep the one known before.
+                grows.then(|| {
+                    let mut t = targets_of(&snap, c.me);
+                    for (id, addr) in &mut t {
+                        if addr.is_none() {
+                            *addr = cur.addr(id).cloned();
+                        }
+                    }
+                    t
+                })
+            };
+            if let Some(targets) = targets {
+                self.publish(&snap);
+                c.peers.set_targets(targets);
+            }
+            return Ok(());
         }
+        self.publish(&snap);
 
         // 4. Close connections to peers that are no longer effective.
         for id in c.peers.target_ids() {
@@ -169,15 +198,9 @@ impl Reactor {
         }
 
         // 5. Dial every effective member but this node (none once this node is removed).
-        let targets = snap
-            .effective_members()
-            .into_iter()
-            .filter(|id| *id != c.me)
-            .map(|id| (id, snap.addr(&id).cloned()))
-            .collect();
         // (a sign-out keeps its targets until a peer has the record, see step 6)
         if snap.removed_by(&c.me).is_none_or(|by| by == c.me) {
-            c.peers.set_targets(targets);
+            c.peers.set_targets(targets_of(&snap, c.me));
         }
 
         // 6. This node was removed: stop for good (also across restarts).
@@ -212,6 +235,25 @@ impl Reactor {
         self.no_host = no_host;
         Ok(())
     }
+
+    /// Replaces the membership snapshot; `MembersChanged` if it differs.
+    fn publish(&self, snap: &Arc<MembershipSnapshot>) {
+        let c = &self.ctx;
+        let changed = **c.membership.borrow() != **snap;
+        c.membership.send_replace(snap.clone());
+        if changed {
+            let _ = c.events.send(NodeEvent::MembersChanged);
+        }
+    }
+}
+
+/// Every effective member but `me`, with its address.
+fn targets_of(snap: &MembershipSnapshot, me: NodeId) -> Vec<(NodeId, Option<NodeAddrBytes>)> {
+    snap.effective_members()
+        .into_iter()
+        .filter(|id| *id != me)
+        .map(|id| (id, snap.addr(&id).cloned()))
+        .collect()
 }
 
 fn is_mesh(ch: &Change) -> bool {

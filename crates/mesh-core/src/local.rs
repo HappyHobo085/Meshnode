@@ -1,4 +1,5 @@
-//! Node-local files in the data directory: `node.key`, `mesh.json`, `invites.json`.
+//! Node-local files in the data directory: `node.key`, `mesh.json`, `invites.json`,
+//! `rebootstrap.bin` and `expired-edits.bin`.
 //!
 //! `node.key` is the raw 32-byte signing seed. On Unix it is created with mode 0600. On Windows
 //! no extra ACL code is run: the file inherits the ACL of the data directory, which normally lives
@@ -9,7 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
-use mesh_proto::{MeshGenesis, NodeId, Role};
+use mesh_proto::{MeshGenesis, NodeId, Role, SignedOp};
+use mesh_store::SyncItem;
 use serde::{Deserialize, Serialize};
 
 use crate::error::NodeError;
@@ -17,6 +19,8 @@ use crate::error::NodeError;
 const KEY_FILE: &str = "node.key";
 const GENESIS_FILE: &str = "mesh.json";
 const INVITES_FILE: &str = "invites.json";
+const REBOOTSTRAP_FILE: &str = "rebootstrap.bin";
+const EXPIRED_FILE: &str = "expired-edits.bin";
 
 /// Write `bytes` to `path` via a temp file in the same directory, fsync, then rename over.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
@@ -200,4 +204,69 @@ impl Invites {
         }
         Ok(())
     }
+}
+
+/// The in-progress re-bootstrap export (spec §7 step 2), persisted before the store is reset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebootstrapFile {
+    /// `synced_self_seq` read before the reset.
+    pub s: u64,
+    /// `Export::items`, re-applied once the catch-up reached `s`.
+    pub items: Vec<SyncItem>,
+    /// `Export::expired`, own edits too old to re-apply.
+    pub expired: Vec<SignedOp>,
+}
+
+/// Writes `rebootstrap.bin` atomically (temp file, fsync, rename).
+pub fn write_rebootstrap(dir: &Path, f: &RebootstrapFile) -> Result<(), NodeError> {
+    let bytes = postcard::to_stdvec(f).map_err(|e| bad_file(e.to_string()))?;
+    atomic_write(&dir.join(REBOOTSTRAP_FILE), &bytes)
+}
+
+/// `Ok(None)` when no re-bootstrap is in progress. A file that does not decode is an error:
+/// the export is never recomputed from a half-reset store.
+pub fn read_rebootstrap(dir: &Path) -> Result<Option<RebootstrapFile>, NodeError> {
+    match std::fs::read(dir.join(REBOOTSTRAP_FILE)) {
+        Ok(b) => postcard::from_bytes(&b)
+            .map(Some)
+            .map_err(|e| bad_file(format!("{REBOOTSTRAP_FILE}: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether `rebootstrap.bin` exists (a re-bootstrap must resume).
+pub fn rebootstrap_pending(dir: &Path) -> bool {
+    dir.join(REBOOTSTRAP_FILE).exists()
+}
+
+/// Deletes `rebootstrap.bin` (no error if it is already gone).
+pub fn remove_rebootstrap(dir: &Path) -> Result<(), NodeError> {
+    match std::fs::remove_file(dir.join(REBOOTSTRAP_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Own edits left out of a re-bootstrap (spec §7 step 6), oldest run first; empty if none.
+pub fn read_expired_edits(dir: &Path) -> Result<Vec<SignedOp>, NodeError> {
+    match std::fs::read(dir.join(EXPIRED_FILE)) {
+        Ok(b) => postcard::from_bytes(&b).map_err(|e| bad_file(format!("{EXPIRED_FILE}: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Adds `ops` to `expired-edits.bin` (atomically), skipping ops already listed, so a
+/// re-bootstrap repeated after a crash lists each edit once.
+pub fn append_expired_edits(dir: &Path, ops: &[SignedOp]) -> Result<(), NodeError> {
+    let mut all = read_expired_edits(dir)?;
+    for op in ops {
+        let id = (op.body.origin, op.body.seq);
+        if !all.iter().any(|o| (o.body.origin, o.body.seq) == id) {
+            all.push(op.clone());
+        }
+    }
+    let bytes = postcard::to_stdvec(&all).map_err(|e| bad_file(e.to_string()))?;
+    atomic_write(&dir.join(EXPIRED_FILE), &bytes)
 }

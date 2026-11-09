@@ -7,9 +7,11 @@ use crate::{Store, keys, meta_u64};
 use mesh_hlc::WallClock;
 use mesh_proto::{NodeId, SignedOp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 
-/// One element of a catch-up stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One element of a catch-up stream (serializable so mesh-core can persist a re-bootstrap
+/// export).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncItem {
     Op(SignedOp),
     /// Everything of `origin` up to and including `upto` that the sender holds no op row

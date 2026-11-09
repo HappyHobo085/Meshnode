@@ -24,7 +24,7 @@ use crate::db::{CoreStore, StoreHandle};
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::join::{JoinHandler, JoinInner};
-use crate::local::{Invites, load_or_create_key, read_genesis, write_genesis};
+use crate::local::{Invites, load_or_create_key, read_genesis, rebootstrap_pending, write_genesis};
 use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
     encode_info, encode_removal, info_key, member_bytes,
@@ -85,31 +85,34 @@ pub struct Node {
     inner: Arc<Inner>,
 }
 
-struct Inner {
-    cfg: NodeConfig,
+pub(crate) struct Inner {
+    pub(crate) cfg: NodeConfig,
     genesis: MeshGenesis,
-    me: NodeId,
-    endpoint: Endpoint,
+    pub(crate) me: NodeId,
+    pub(crate) endpoint: Endpoint,
     router: Router,
-    store: StoreHandle,
-    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
-    acc: Arc<MeshAcceptor>,
+    pub(crate) store: StoreHandle,
+    pub(crate) acc: Arc<MeshAcceptor>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     invites: Arc<Mutex<Invites>>,
     join: Arc<JoinInner>,
     /// Sticky: true once any round has completed since start.
     first_sync: Arc<watch::Sender<bool>>,
     membership: Arc<watch::Sender<Arc<MembershipSnapshot>>>,
-    peers: PeerManager,
-    events: broadcast::Sender<NodeEvent>,
-    status: Arc<watch::Sender<NodeStatus>>,
+    pub(crate) peers: PeerManager,
+    pub(crate) events: broadcast::Sender<NodeEvent>,
+    pub(crate) status: Arc<watch::Sender<NodeStatus>>,
     /// Re-bootstrap pauses serving; whoever clears it must wake every session.
-    #[allow(dead_code)]
-    serve_paused: Arc<AtomicBool>,
-    tasks: Mutex<JoinSet<()>>,
-    cancel: CancellationToken,
+    pub(crate) serve_paused: Arc<AtomicBool>,
+    /// Held for a whole re-bootstrap run: one at a time.
+    pub(crate) rebootstrap: tokio::sync::Mutex<()>,
+    /// Test hook: the next re-bootstrap stops the node right after its step 3.
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
-    force_lagged: Arc<Notify>,
+    pub(crate) crash_after_reset: AtomicBool,
+    tasks: Mutex<JoinSet<()>>,
+    pub(crate) cancel: CancellationToken,
+    /// Makes the reactor run a full rescan (a test hook, and the end of a re-bootstrap).
+    pub(crate) force_lagged: Arc<Notify>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     lose_events: Arc<AtomicBool>,
 }
@@ -159,7 +162,7 @@ pub(crate) async fn supervise<F, Fut>(
 }
 
 /// Writes `addr/<me>` if the encoded value differs from the stored one.
-async fn publish_addr(
+pub(crate) async fn publish_addr(
     store: &StoreHandle,
     me: NodeId,
     addr: &EndpointAddr,
@@ -221,22 +224,6 @@ async fn first_sync(
     }
 }
 
-/// The re-bootstrap hook (spec §7): sessions report a stale store here.
-async fn stale_hook(mut rx: mpsc::Receiver<NodeId>, cancel: CancellationToken) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = rx.recv() => match r {
-                Some(peer) => warn!(
-                    peer = %peer.short(),
-                    "store is stale; re-bootstrap is not available yet"
-                ),
-                None => return,
-            },
-        }
-    }
-}
-
 /// Starts a node on an established membership: opens the store, binds the endpoint, mounts
 /// the gated `sync/1` handler, publishes the address, runs the first rescan and spawns
 /// the reactor, the address watcher and the peer tasks.
@@ -266,12 +253,17 @@ pub(crate) async fn start(
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
     let g = genesis.clone();
     let snap = store.call(move |s| MembershipSnapshot::load(s, &g)).await?;
+    // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale
+    // (a removed node has nothing to rebuild). Serving is paused before any session starts.
+    let rebootstrap_due = rebootstrap_pending(&cfg.data_dir)
+        || (snap.removed_by(&me).is_none() && store.call(|s| s.is_stale()).await?);
+    store.refuse_writes_rebootstrapping(rebootstrap_due);
     let (membership, membership_rx) = watch::channel(Arc::new(snap));
     let membership = Arc::new(membership);
     let status = Arc::new(watch::channel(NodeStatus::Running).0);
     let (events, _) = broadcast::channel(EVENT_CAPACITY);
     let cancel = CancellationToken::new();
-    let serve_paused = Arc::new(AtomicBool::new(false));
+    let serve_paused = Arc::new(AtomicBool::new(rebootstrap_due));
     let force_lagged = Arc::new(Notify::new());
     let lose_events = Arc::new(AtomicBool::new(false));
     let signout = Arc::new(SignOut::default());
@@ -337,6 +329,7 @@ pub(crate) async fn start(
         force_lagged: force_lagged.clone(),
         lose_events: lose_events.clone(),
         signout: signout.clone(),
+        rebootstrapping: serve_paused.clone(),
     };
     // Subscribed before the first rescan starts any peer, so no round is missed.
     let mut first_rx = Some(events.subscribe());
@@ -367,31 +360,46 @@ pub(crate) async fn start(
         let rx = first_rx.take().unwrap_or_else(|| ev.subscribe());
         first_sync(rx, ev.clone(), done.clone(), fsf.clone(), c.clone())
     }));
-    tasks.spawn(stale_hook(stale_rx, cancel.clone()));
 
-    Ok(Node {
-        inner: Arc::new(Inner {
-            cfg,
-            genesis,
-            me,
-            endpoint,
-            router,
-            store,
-            acc,
-            invites,
-            join,
-            first_sync: first_sync_flag,
-            membership,
-            peers,
-            events,
-            status,
-            serve_paused,
-            tasks: Mutex::new(tasks),
-            cancel,
-            force_lagged,
-            lose_events,
-        }),
-    })
+    let inner = Arc::new(Inner {
+        cfg,
+        genesis,
+        me,
+        endpoint,
+        router,
+        store,
+        acc,
+        invites,
+        join,
+        first_sync: first_sync_flag,
+        membership,
+        peers,
+        events,
+        status,
+        serve_paused,
+        rebootstrap: tokio::sync::Mutex::new(()),
+        crash_after_reset: AtomicBool::new(false),
+        tasks: Mutex::new(tasks),
+        cancel,
+        force_lagged,
+        lose_events,
+    });
+    let (stale, i, c) = (
+        Arc::new(tokio::sync::Mutex::new(stale_rx)),
+        inner.clone(),
+        inner.cancel.clone(),
+    );
+    let mut due = Some(rebootstrap_due);
+    lock(&inner.tasks).spawn(supervise(
+        "rebootstrap",
+        c,
+        inner.cfg.timings.clone(),
+        move || {
+            // A restart after a panic checks again whether a re-bootstrap is due.
+            crate::rebootstrap::driver(i.clone(), stale.clone(), due.take().unwrap_or(true))
+        },
+    ));
+    Ok(Node { inner })
 }
 
 impl Node {
@@ -750,6 +758,17 @@ impl Node {
     /// (`None` if it ended otherwise, or none has ended yet).
     pub fn last_peer_close_code(&self, peer: NodeId) -> Option<u64> {
         self.inner.peers.peer_close_code(&peer)
+    }
+
+    /// Arms a one-shot crash: the next re-bootstrap stops this node (cancels every task)
+    /// right after its step 3, leaving `rebootstrap.bin` and the reset store behind.
+    pub fn crash_after_reset(&self) {
+        self.inner.crash_after_reset.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this node's tasks were stopped (by `shutdown`, a drop or a test crash).
+    pub fn is_stopped(&self) -> bool {
+        self.inner.cancel.is_cancelled()
     }
 
     /// Open `sync/1` connections this node holds.

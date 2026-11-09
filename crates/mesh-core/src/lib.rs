@@ -12,6 +12,7 @@ pub mod membership;
 pub mod node;
 mod peers;
 mod reactor;
+mod rebootstrap;
 #[doc(hidden)]
 pub mod sync;
 #[doc(hidden)]

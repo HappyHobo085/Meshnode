@@ -12,11 +12,18 @@ pub type CoreStore = Store<DynClock>;
 
 /// Cloneable handle; every call runs on the blocking pool so the async runtime is never stalled.
 #[derive(Clone)]
-pub struct StoreHandle(Arc<CoreStore>, Arc<AtomicBool>);
+pub struct StoreHandle(Arc<CoreStore>, Arc<Refuse>);
+
+/// Why local writes are refused; shared by every clone of a handle.
+#[derive(Default)]
+struct Refuse {
+    removed: AtomicBool,
+    rebootstrapping: AtomicBool,
+}
 
 impl StoreHandle {
     pub fn new(store: Arc<CoreStore>) -> Self {
-        StoreHandle(store, Arc::new(AtomicBool::new(false)))
+        StoreHandle(store, Arc::default())
     }
 
     /// Direct access, e.g. for `subscribe`. Do not call blocking methods from async code.
@@ -27,14 +34,37 @@ impl StoreHandle {
     /// From now on `set`, `delete` and `set_add` fail with `NodeError::Removed` (spec §3.3
     /// step 6). Shared by every clone of this handle.
     pub(crate) fn refuse_writes_removed(&self) {
-        self.1.store(true, Ordering::SeqCst);
+        self.1.removed.store(true, Ordering::SeqCst);
+    }
+
+    /// While `on`, `set`, `delete` and `set_add` fail with `NodeError::Rebootstrapping`
+    /// (spec §7: from the export until the re-bootstrap is done, so no own op is written
+    /// after the export was taken).
+    pub(crate) fn refuse_writes_rebootstrapping(&self, on: bool) {
+        self.1.rebootstrapping.store(on, Ordering::SeqCst);
     }
 
     fn check_writable(&self) -> Result<(), NodeError> {
-        if self.1.load(Ordering::SeqCst) {
+        if self.1.removed.load(Ordering::SeqCst) {
             return Err(NodeError::Removed);
         }
+        if self.1.rebootstrapping.load(Ordering::SeqCst) {
+            return Err(NodeError::Rebootstrapping);
+        }
         Ok(())
+    }
+
+    /// A local write: refused as above, and the store's own refusal after a reset is
+    /// reported as `NodeError::Rebootstrapping`.
+    async fn write(
+        &self,
+        f: impl FnOnce(&CoreStore) -> Result<(), StoreError> + Send + 'static,
+    ) -> Result<(), NodeError> {
+        self.check_writable()?;
+        self.call(f).await.map_err(|e| match e {
+            NodeError::Store(StoreError::Rebootstrapping) => NodeError::Rebootstrapping,
+            e => e,
+        })
     }
 
     /// Run `f` against the store in one `spawn_blocking`.
@@ -55,21 +85,19 @@ impl StoreHandle {
     }
 
     pub async fn set(&self, ns: &str, key: &str, value: Vec<u8>) -> Result<(), NodeError> {
-        self.check_writable()?;
         let (ns, key) = (ns.to_owned(), key.to_owned());
-        self.call(move |s| s.set(&ns, &key, &value).map(drop)).await
+        self.write(move |s| s.set(&ns, &key, &value).map(drop))
+            .await
     }
 
     pub async fn delete(&self, ns: &str, key: &str) -> Result<(), NodeError> {
-        self.check_writable()?;
         let (ns, key) = (ns.to_owned(), key.to_owned());
-        self.call(move |s| s.delete(&ns, &key).map(drop)).await
+        self.write(move |s| s.delete(&ns, &key).map(drop)).await
     }
 
     pub async fn set_add(&self, ns: &str, set: &str, member: Vec<u8>) -> Result<(), NodeError> {
-        self.check_writable()?;
         let (ns, set) = (ns.to_owned(), set.to_owned());
-        self.call(move |s| s.set_add(&ns, &set, &member).map(drop))
+        self.write(move |s| s.set_add(&ns, &set, &member).map(drop))
             .await
     }
 

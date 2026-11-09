@@ -361,6 +361,8 @@ impl SlotTask {
             SessionEnd::Store(e) => warn!(peer, error = %e, "store error; session closed"),
             SessionEnd::Stale => {
                 warn!(peer, "store is stale; session stopped");
+                // A stale store must not serve (spec §7); the re-bootstrap clears this.
+                self.env().serve_paused.store(true, Ordering::SeqCst);
                 let _ = self.env().stale.try_send(self.slot.peer);
             }
         }

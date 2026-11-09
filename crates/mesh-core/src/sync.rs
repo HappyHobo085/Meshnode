@@ -45,10 +45,14 @@ pub struct PeerMetrics {
     pub rounds_completed: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCmd {
     /// `sync_now()`: start a round unless one is already in progress.
     StartRound,
+    /// Writes these bytes to the stream as they are (length prefix included), between two
+    /// frames. Test hook for protocol-violation tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    RawFrame(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -485,6 +489,14 @@ impl Session {
                 _ = self.ctx.wake.notified() => {}
                 cmd = cmds.recv(), if cmds_open => match cmd {
                     Some(SessionCmd::StartRound) => self.request_start(Start::Requested),
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    Some(SessionCmd::RawFrame(bytes)) => {
+                        use tokio::io::AsyncWriteExt;
+                        let r = async { w.write_all(&bytes).await?; w.flush().await }.await;
+                        if r.is_err() {
+                            return SessionEnd::Closed;
+                        }
+                    }
                     None => cmds_open = false,
                 },
                 _ = tick.tick(), if dialer => self.request_start(Start::Tick),

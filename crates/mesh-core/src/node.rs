@@ -740,6 +740,18 @@ impl Node {
         self.inner.peers.add_hint(id, addr);
     }
 
+    /// Writes `bytes` as they are (a whole frame, length prefix included) on the session
+    /// with `peer`, between two of its frames. False if no session runs with `peer`.
+    pub fn send_raw_sync_frame(&self, peer: NodeId, bytes: Vec<u8>) -> bool {
+        self.inner.peers.send_raw(&peer, bytes)
+    }
+
+    /// The application close code `peer` gave when the last session with it ended
+    /// (`None` if it ended otherwise, or none has ended yet).
+    pub fn last_peer_close_code(&self, peer: NodeId) -> Option<u64> {
+        self.inner.peers.peer_close_code(&peer)
+    }
+
     /// Open `sync/1` connections this node holds.
     pub fn connection_count(&self) -> usize {
         self.inner.peers.connection_count()

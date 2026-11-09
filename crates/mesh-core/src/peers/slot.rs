@@ -303,7 +303,16 @@ impl SlotTask {
                 c.accept_bi().await
             };
             match streams {
-                Ok((send, recv)) => run_session(ctx, recv, send, dialer).await,
+                Ok((mut send, mut recv)) => {
+                    let end = run_session(ctx, &mut recv, &mut send, dialer).await;
+                    // Close before the streams drop: dropping an unfinished send stream
+                    // sends a FIN, and a peer reading that EOF first would never see the
+                    // `PROTOCOL` code.
+                    if matches!(end, SessionEnd::Protocol(_)) {
+                        c.close(PROTOCOL, b"protocol violation");
+                    }
+                    end
+                }
                 Err(e) => {
                     debug!(error = %e, "no sync stream");
                     SessionEnd::Closed
@@ -324,6 +333,13 @@ impl SlotTask {
             return;
         };
         let peer = self.slot.peer.short();
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.slot.lock().peer_close = match l.conn.close_reason() {
+                Some(ConnectionError::ApplicationClosed(c)) => Some(c.error_code.into_inner()),
+                _ => None,
+            };
+        }
         // The peer's claim that this node was removed (not a signed record, spec §4).
         let refused = matches!(
             l.conn.close_reason(),
@@ -340,10 +356,8 @@ impl SlotTask {
                     debug!(peer, "session closed");
                 }
             }
-            SessionEnd::Protocol(m) => {
-                warn!(peer, reason = %m, "protocol violation; closing");
-                l.conn.close(PROTOCOL, b"protocol violation");
-            }
+            // The session future already closed the connection with `PROTOCOL`.
+            SessionEnd::Protocol(m) => warn!(peer, reason = %m, "protocol violation; closed"),
             SessionEnd::Store(e) => warn!(peer, error = %e, "store error; session closed"),
             SessionEnd::Stale => {
                 warn!(peer, "store is stale; session stopped");

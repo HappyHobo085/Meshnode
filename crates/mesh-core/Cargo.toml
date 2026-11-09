@@ -24,7 +24,7 @@ tokio-util.workspace = true
 
 [features]
 # Test-only helpers; the crate's own tests enable it through the dev-dependency below.
-test-hooks = []
+test-hooks = ["mesh-store/test-hooks"]
 
 [dev-dependencies]
 mesh-core = { path = ".", features = ["test-hooks"] }

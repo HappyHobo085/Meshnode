@@ -162,6 +162,9 @@ struct SlotState {
     /// The connection the session runs on.
     live: Option<Connection>,
     cmds: Option<mpsc::Sender<SessionCmd>>,
+    /// The application close code the peer gave when the last session ended, if any.
+    #[cfg(any(test, feature = "test-hooks"))]
+    peer_close: Option<u64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -386,6 +389,25 @@ impl PeerManager {
     pub fn heal(&self) {
         self.lock().blocked.clear();
         self.reset_backoff_all();
+    }
+
+    /// Hands raw bytes to the session with `id` to write as they are; false without one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn send_raw(&self, id: &NodeId, bytes: Vec<u8>) -> bool {
+        let st = self.lock();
+        let Some(slot) = st.slots.get(id) else {
+            return false;
+        };
+        let s = slot.lock();
+        s.cmds
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(SessionCmd::RawFrame(bytes)).is_ok())
+    }
+
+    /// The application close code `id` gave when the last session with it ended.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn peer_close_code(&self, id: &NodeId) -> Option<u64> {
+        self.lock().slots.get(id).and_then(|s| s.lock().peer_close)
     }
 
     /// Open connections held by this node's slots (live or not yet resolved).

@@ -9,7 +9,9 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
-use mesh_proto::{InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, Role};
+use mesh_proto::{
+    InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, RemovalRecord, Role,
+};
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -24,8 +26,8 @@ use crate::events::NodeEvent;
 use crate::join::{JoinHandler, JoinInner};
 use crate::local::{Invites, load_or_create_key, read_genesis, write_genesis};
 use crate::membership::{
-    MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, addr_key, encode_addr, encode_info,
-    info_key, member_bytes,
+    MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
+    encode_info, encode_removal, info_key, member_bytes,
 };
 use crate::peers::{PeerEnv, PeerManager, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
@@ -287,6 +289,7 @@ pub(crate) async fn start(
             discovery: cfg.discovery,
             endpoint: endpoint.clone(),
             events: events.clone(),
+            status: status.clone(),
             serve_paused: serve_paused.clone(),
             stale: stale_tx,
         },
@@ -526,6 +529,31 @@ impl Node {
             rt.spawn(async move { ep.network_change().await });
         }
         self.inner.peers.reset_backoff_all();
+    }
+
+    /// Removes member `id` (spec §4). Takes effect on each node once it receives the
+    /// record; the resulting `_mesh` change drives the rescan that applies it here.
+    pub async fn remove(&self, id: NodeId) -> Result<(), NodeError> {
+        let (genesis, me) = (self.inner.genesis.clone(), self.inner.me);
+        let (snap, vv) = self
+            .inner
+            .store
+            .call(move |s| Ok((MembershipSnapshot::load(s, &genesis)?, s.version_vector()?)))
+            .await?;
+        if !snap.is_effective(&me) || !snap.is_effective(&id) {
+            return Err(NodeError::NotEffective);
+        }
+        if snap.effective_hosts() == [id] {
+            return Err(NodeError::LastHost);
+        }
+        let record = RemovalRecord {
+            node_id: id,
+            cutoff_seq: vv.get(&id),
+        };
+        self.inner
+            .store
+            .set_add(MESH_NS, REMOVED, encode_removal(&record))
+            .await
     }
 
     /// Changes this node's own name and/or tags in `info/<self>`.

@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use super::{BoxFut, DIAL_TIMEOUT, DUPLICATE_GRACE, PeerEnv, Shared, Slot, lock};
 use crate::events::NodeEvent;
+use crate::node::NodeStatus;
 use crate::sync::{SessionCtx, SessionEnd, run_session};
 use crate::transport::{ALPN_SYNC, PROTOCOL, REMOVED, SHUTDOWN, addr_from_bytes, endpoint_id_of};
 
@@ -322,13 +323,18 @@ impl SlotTask {
             return;
         };
         let peer = self.slot.peer.short();
+        // The peer's claim that this node was removed (not a signed record, spec §4).
+        let refused = matches!(
+            l.conn.close_reason(),
+            Some(ConnectionError::ApplicationClosed(c)) if c.error_code == REMOVED
+        );
+        if refused {
+            info!(peer, "peer refuses this node as removed");
+            self.note_refused();
+        }
         match end {
             SessionEnd::Closed => {
-                if let Some(ConnectionError::ApplicationClosed(c)) = l.conn.close_reason()
-                    && c.error_code == REMOVED
-                {
-                    info!(peer, "peer refuses this node as removed");
-                } else {
+                if !refused {
                     debug!(peer, "session closed");
                 }
             }
@@ -347,6 +353,26 @@ impl SlotTask {
         }
         self.finish(l);
         self.schedule_redial();
+    }
+
+    /// Records that this peer closed with `REMOVED`; the node keeps running (spec §4).
+    fn note_refused(&self) {
+        let peer = self.slot.peer;
+        let env = self.env();
+        let changed = env.status.send_if_modified(|s| match s {
+            NodeStatus::Running => {
+                *s = NodeStatus::RefusedAsRemoved { by: vec![peer] };
+                true
+            }
+            NodeStatus::RefusedAsRemoved { by } if !by.contains(&peer) => {
+                by.push(peer);
+                true
+            }
+            _ => false,
+        });
+        if changed {
+            let _ = env.events.send(NodeEvent::RefusedAsRemoved(peer));
+        }
     }
 
     /// Bookkeeping when the session on `l` is over.

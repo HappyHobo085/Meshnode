@@ -155,14 +155,16 @@ impl Reactor {
             }
         }
 
-        // 5. Dial every effective member but this node.
+        // 5. Dial every effective member but this node (none once this node is removed).
         let targets = snap
             .effective_members()
             .into_iter()
             .filter(|id| *id != c.me)
             .map(|id| (id, snap.addr(&id).cloned()))
             .collect();
-        c.peers.set_targets(targets);
+        if snap.removed_by(&c.me).is_none() {
+            c.peers.set_targets(targets);
+        }
 
         // 6. This node was removed: stop for good (also across restarts).
         if let Some(by) = snap.removed_by(&c.me) {

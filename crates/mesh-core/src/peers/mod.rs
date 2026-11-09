@@ -24,7 +24,7 @@ use iroh::Endpoint;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use mesh_proto::{MeshId, NodeAddrBytes, NodeId};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +34,7 @@ use crate::config::Timings;
 use crate::db::StoreHandle;
 use crate::events::NodeEvent;
 use crate::membership::MeshAcceptor;
-use crate::node::supervise;
+use crate::node::{NodeStatus, supervise};
 use slot::run_slot;
 
 mod slot;
@@ -62,6 +62,8 @@ pub(crate) struct PeerEnv {
     pub discovery: bool,
     pub endpoint: Endpoint,
     pub events: broadcast::Sender<NodeEvent>,
+    /// Peers that close with `REMOVED` are recorded here (spec §4).
+    pub status: Arc<watch::Sender<NodeStatus>>,
     pub serve_paused: Arc<AtomicBool>,
     /// A session found the store stale (spec §7); the re-bootstrap hook.
     pub stale: mpsc::Sender<NodeId>,

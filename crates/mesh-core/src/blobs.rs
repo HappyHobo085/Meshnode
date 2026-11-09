@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iroh::{Endpoint, EndpointId};
+use iroh::Endpoint;
 use iroh_blobs::api::Store;
 use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::format::collection::Collection;
-use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options;
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
@@ -28,6 +28,8 @@ use crate::transport::endpoint_id_of;
 pub type BlobHash = Hash;
 
 const DIR: &str = "blobs";
+/// A collection root (32 bytes per entry) larger than this is not loaded.
+const MAX_COLLECTION_ROOT: u64 = 16 << 20;
 
 fn pin_tag(hash: &Hash) -> String {
     format!("meshnode/pin/{hash}")
@@ -159,129 +161,133 @@ impl Blobs {
         Ok(h)
     }
 
-    /// Whether the blob is stored completely (for a collection: with all its files).
+    /// Whether the blob is stored completely. For a collection use [`Blobs::has_collection`].
     pub async fn has(&self, hash: Hash) -> Result<bool, NodeError> {
-        if !self.root_complete(hash).await? {
+        self.root_complete(hash).await
+    }
+
+    /// Whether the collection rooted at `hash` is stored: the root and every child.
+    pub async fn has_collection(&self, hash: Hash) -> Result<bool, NodeError> {
+        let Some(c) = self.load_collection(hash).await? else {
             return Ok(false);
-        }
-        match self.collection(hash).await? {
-            Some(c) => {
-                for (_, h) in c.iter() {
-                    if !self.root_complete(*h).await? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+        };
+        for (_, h) in c.iter() {
+            if !self.root_complete(*h).await? {
+                return Ok(false);
             }
-            None => Ok(true),
         }
+        Ok(true)
     }
 
     async fn root_complete(&self, hash: Hash) -> Result<bool, NodeError> {
         self.api().blobs().has(hash).await.map_err(err)
     }
 
-    /// The collection rooted at `hash`, if it is one and its metadata is stored.
-    async fn collection(&self, hash: Hash) -> Result<Option<Collection>, NodeError> {
-        if self.links(hash).await?.is_none() {
-            return Ok(None);
+    /// The format `hash` is pinned with, if pinned.
+    async fn pinned_format(&self, hash: Hash) -> Result<Option<BlobFormat>, NodeError> {
+        let t = self.api().tags().get(pin_tag(&hash)).await.map_err(err)?;
+        Ok(t.filter(|t| t.hash == hash).map(|t| t.format))
+    }
+
+    /// Loads the collection rooted at `hash` if its root is stored, within the size cap, and
+    /// its metadata is present. The caller says it is a collection; nothing is sniffed.
+    async fn load_collection(&self, hash: Hash) -> Result<Option<Collection>, NodeError> {
+        match self.api().blobs().status(hash).await.map_err(err)? {
+            BlobStatus::Complete { size } if size <= MAX_COLLECTION_ROOT => {}
+            _ => return Ok(None),
         }
         Ok(Collection::load(hash, self.api()).await.ok())
     }
 
-    /// The links of a stored blob whose size is a non-zero multiple of 32 (it might be a
-    /// hash sequence).
-    async fn links(&self, hash: Hash) -> Result<Option<HashSeq>, NodeError> {
-        if !self.root_complete(hash).await? {
-            return Ok(None);
+    /// Fetches a plain blob from online members, nearest first, moving on after a failure.
+    /// A no-op if it is already here. A call has no deadline of its own; wrap it in a
+    /// timeout. For a collection use [`Blobs::fetch_collection`].
+    pub async fn fetch(&self, hash: Hash) -> Result<(), NodeError> {
+        if self.root_complete(hash).await? {
+            if self.pinned_format(hash).await?.is_none() {
+                self.pin(hash, BlobFormat::Raw).await?;
+            }
+            return Ok(());
         }
-        let b = self.api().blobs().get_bytes(hash).await.map_err(err)?;
-        Ok(HashSeq::try_from(b).ok().filter(|s| !s.is_empty()))
+        self.fetch_with(HashAndFormat::raw(hash)).await
     }
 
-    /// Fetches from online members, nearest first, moving on after a failure. A no-op if
-    /// the blob is already here. A call has no deadline of its own; wrap it in a timeout.
-    pub async fn fetch(&self, hash: Hash) -> Result<(), NodeError> {
-        if self.has(hash).await? {
-            let format = if self.collection(hash).await?.is_some() {
-                BlobFormat::HashSeq
-            } else {
-                BlobFormat::Raw
-            };
-            return self.pin(hash, format).await;
+    /// Like [`Blobs::fetch`] for a collection: the root and all its children.
+    pub async fn fetch_collection(&self, hash: Hash) -> Result<(), NodeError> {
+        if self.has_collection(hash).await? {
+            return self.pin(hash, BlobFormat::HashSeq).await;
         }
+        self.fetch_with(HashAndFormat::hash_seq(hash)).await
+    }
+
+    async fn fetch_with(&self, req: HashAndFormat) -> Result<(), NodeError> {
         for peer in self.source.ranked() {
             let Ok(pid) = endpoint_id_of(&peer) else {
                 continue;
             };
-            match self.fetch_from(hash, pid).await {
-                Ok(format) => return self.pin(hash, format).await,
+            match self.downloader.download(req, vec![pid]).await {
+                Ok(()) => return self.pin(req.hash, req.format).await,
                 Err(e) => warn!(peer = %peer.short(), error = %e, "blob fetch failed"),
             }
         }
         Err(NodeError::BlobUnavailable)
     }
 
-    async fn download(&self, req: HashAndFormat, peer: EndpointId) -> Result<(), NodeError> {
-        self.downloader.download(req, vec![peer]).await.map_err(err)
-    }
-
-    /// Fetches `hash` from one peer and says whether it is a plain blob or a collection.
-    /// The wire does not say which; a blob that parses as a hash sequence is tried as one.
-    async fn fetch_from(&self, hash: Hash, peer: EndpointId) -> Result<BlobFormat, NodeError> {
-        self.download(HashAndFormat::raw(hash), peer).await?;
-        let Some(links) = self.links(hash).await? else {
-            return Ok(BlobFormat::Raw);
-        };
-        match self.download(HashAndFormat::hash_seq(hash), peer).await {
-            Ok(()) => Ok(BlobFormat::HashSeq),
-            Err(e) => {
-                // A plain blob that merely has a multiple-of-32 size has no such children.
-                // A real collection has stored metadata at its first link.
-                let first = links.get(0).ok_or_else(|| err("empty hash sequence"))?;
-                let is_collection = self.download(HashAndFormat::raw(first), peer).await.is_ok()
-                    && Collection::load(hash, self.api()).await.is_ok();
-                if is_collection {
-                    Err(e)
-                } else {
-                    Ok(BlobFormat::Raw)
-                }
-            }
-        }
-    }
-
     pub async fn read(&self, hash: Hash) -> Result<Bytes, NodeError> {
         if !self.root_complete(hash).await? {
-            return Err(NodeError::Io(std::io::ErrorKind::NotFound.into()));
+            return Err(NodeError::BlobUnavailable);
         }
         self.api().blobs().get_bytes(hash).await.map_err(err)
     }
 
-    /// A blob is written to the file `dest`; a collection to the directory `dest`.
+    /// A blob is written to the file `dest`; a collection (one pinned as such, by `add_path`
+    /// or `fetch_collection`) to the directory `dest`. Nothing is written if a name is unsafe.
     pub async fn export(&self, hash: Hash, dest: &Path) -> Result<(), NodeError> {
-        match self.collection(hash).await? {
-            None => {
-                make_parent(dest).await?;
-                self.api().blobs().export(hash, dest).await.map_err(err)?;
+        if self.pinned_format(hash).await? != Some(BlobFormat::HashSeq) {
+            make_parent(dest).await?;
+            self.api().blobs().export(hash, dest).await.map_err(err)?;
+            return Ok(());
+        }
+        let c = self
+            .load_collection(hash)
+            .await?
+            .ok_or(NodeError::BlobUnavailable)?;
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for (name, h) in c.iter() {
+            let rel = safe_rel(name)?;
+            if !seen.insert(rel.clone()) {
+                return Err(err(format!("duplicate name {name:?} in collection")));
             }
-            Some(c) => {
-                let mut seen = HashSet::new();
-                let mut targets = Vec::new();
-                for (name, h) in c.iter() {
-                    let rel = safe_rel(name)?;
-                    if !seen.insert(rel.clone()) {
-                        return Err(err(format!("duplicate name {name:?} in collection")));
-                    }
-                    targets.push((dest.join(rel), *h));
-                }
-                tokio::fs::create_dir_all(dest).await?;
-                for (path, h) in targets {
-                    make_parent(&path).await?;
-                    self.api().blobs().export(h, &path).await.map_err(err)?;
-                }
-            }
+            targets.push((dest.join(rel), *h));
+        }
+        tokio::fs::create_dir_all(dest).await?;
+        for (path, h) in targets {
+            make_parent(&path).await?;
+            self.api().blobs().export(h, &path).await.map_err(err)?;
         }
         Ok(())
+    }
+
+    /// Test hook: stores a collection with arbitrary entry names, pinned as a collection.
+    #[doc(hidden)]
+    pub async fn add_named_for_test(
+        &self,
+        entries: Vec<(String, Bytes)>,
+    ) -> Result<Hash, NodeError> {
+        let mut keep = Vec::new();
+        let mut coll = Vec::new();
+        for (name, data) in entries {
+            let tt = self.api().add_bytes(data).temp_tag().await.map_err(err)?;
+            coll.push((name, tt.hash()));
+            keep.push(tt);
+        }
+        let tt = Collection::from_iter(coll)
+            .store(self.api())
+            .await
+            .map_err(err)?;
+        self.pin(tt.hash(), BlobFormat::HashSeq).await?;
+        Ok(tt.hash())
     }
 }
 

@@ -68,12 +68,15 @@ async fn collection_add_fetch_export() {
     std::fs::write(src.path().join("index.html"), b"<html>hi</html>").unwrap();
     std::fs::write(src.path().join("a/b.txt"), data(100_000)).unwrap();
     let hash = a.blobs().add_path(src.path()).await.unwrap();
-    timeout(T, b.blobs().fetch(hash))
+    assert!(a.blobs().has_collection(hash).await.unwrap());
+    assert!(!b.blobs().has_collection(hash).await.unwrap());
+    timeout(T, b.blobs().fetch_collection(hash))
         .await
         .expect("fetch timed out")
         .unwrap();
     assert!(a.blobs().is_pinned(hash).await.unwrap());
     assert!(b.blobs().is_pinned(hash).await.unwrap());
+    assert!(b.blobs().has_collection(hash).await.unwrap());
     let out = tempfile::tempdir().unwrap();
     let dest = out.path().join("site");
     b.blobs().export(hash, &dest).await.unwrap();
@@ -151,4 +154,52 @@ async fn pins_survive_restart() {
     assert!(a.blobs().is_pinned(hash).await.unwrap());
     assert_eq!(a.blobs().read(hash).await.unwrap(), bytes);
     a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_collection_names_refused() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = pair(da.path(), db.path()).await;
+    for bad in ["../x", "a\\b"] {
+        let hash = a
+            .blobs()
+            .add_named_for_test(vec![("ok.txt".into(), data(10)), (bad.into(), data(20))])
+            .await
+            .unwrap();
+        timeout(T, b.blobs().fetch_collection(hash))
+            .await
+            .expect("fetch timed out")
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("d");
+        assert!(b.blobs().export(hash, &dest).await.is_err(), "{bad}");
+        assert!(!dest.exists(), "{bad}: nothing written");
+        assert!(!out.path().join("x").exists());
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_blob_of_hash_size_is_not_a_collection() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = pair(da.path(), db.path()).await;
+    let bytes = data(64);
+    let hash = a.blobs().add_bytes(bytes.clone()).await.unwrap();
+    timeout(T, b.blobs().fetch(hash))
+        .await
+        .expect("fetch timed out")
+        .unwrap();
+    assert_eq!(b.blobs().read(hash).await.unwrap(), bytes);
+    assert!(b.blobs().is_pinned(hash).await.unwrap());
+    assert!(!b.blobs().has_collection(hash).await.unwrap());
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("f.bin");
+    b.blobs().export(hash, &f).await.unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), &bytes[..]);
+    // A missing blob reads as unavailable.
+    let r = b.blobs().read(BlobHash::new(b"absent")).await;
+    assert!(matches!(r, Err(NodeError::BlobUnavailable)), "{r:?}");
+    a.shutdown().await;
+    b.shutdown().await;
 }

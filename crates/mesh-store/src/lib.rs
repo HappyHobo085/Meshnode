@@ -3,6 +3,7 @@
 //! Registers are multi-origin last-writer-wins by `(order, hlc, origin)`; sets are
 //! add-only. See the sub-spec §5 for the full model.
 
+mod apply;
 mod error;
 mod keys;
 mod local;
@@ -10,6 +11,10 @@ pub mod merge;
 mod read;
 mod tables;
 
+pub use apply::{
+    Acceptor, Change, ChangeKind, DeferReason, Outcome, PENDING_TTL_MS, ReadView, RejectReason,
+    Verdict,
+};
 pub use error::StoreError;
 pub use read::RegEntry;
 
@@ -27,8 +32,11 @@ pub struct Store<W: WallClock = SystemClock> {
     mesh: MeshId,
     node: NodeId,
     key: SigningKey,
-    /// Held for the whole of every local write so seq and HLC order agree.
+    /// Held for the whole of every write transaction (local write, apply, retry), so seq
+    /// and HLC order agree and change events are published in commit order.
     clock: Mutex<Clock<W>>,
+    /// Change events, sent after each commit.
+    events: tokio::sync::broadcast::Sender<Change>,
 }
 
 /// Reads a u64 `meta` row.
@@ -103,12 +111,14 @@ impl<W: WallClock> Store<W> {
             }
         };
         tx.commit()?;
+        let (events, _) = tokio::sync::broadcast::channel(apply::EVENT_CAPACITY);
         Ok(Store {
             db,
             mesh,
             node,
             key,
             clock: Mutex::new(Clock::new(wall, Hlc::from_u64(last_hlc))),
+            events,
         })
     }
 
@@ -120,8 +130,9 @@ impl<W: WallClock> Store<W> {
         self.mesh
     }
 
-    /// Locks the clock. A poisoned lock is recovered: the clock holds no invariant a
-    /// panic could break (it only ever moves forward).
+    /// Locks the clock; held for every write transaction (local writes, apply, retry).
+    /// A poisoned lock is recovered: the clock holds no invariant a panic could break
+    /// (it only ever moves forward).
     pub(crate) fn lock_clock(&self) -> MutexGuard<'_, Clock<W>> {
         self.clock.lock().unwrap_or_else(|e| e.into_inner())
     }

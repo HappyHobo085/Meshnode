@@ -1,5 +1,6 @@
 //! Local writes: build, sign, merge and record an op in one transaction.
 
+use crate::apply::change_for;
 use crate::error::StoreError;
 use crate::tables::{self, META, OPS, OpRow, VV, meta};
 use crate::{Store, keys, merge, meta_u64_req};
@@ -44,7 +45,8 @@ impl<W: WallClock> Store<W> {
 
     /// Validates `payload` (before consuming a seq or ticking the clock), then in one
     /// write transaction: reads `next_seq`, ticks the clock, signs, merges, inserts into
-    /// `ops`, sets `vv[self] = seq`, and advances `next_seq` / `last_hlc`.
+    /// `ops`, sets `vv[self] = seq`, and advances `next_seq` / `last_hlc`. After commit,
+    /// publishes a local `Change` if the merge changed a row.
     fn local_write(&self, payload: Payload) -> Result<SignedOp, StoreError> {
         let mut body = OpBody {
             mesh: self.mesh,
@@ -69,7 +71,7 @@ impl<W: WallClock> Store<W> {
         let now_ms = clock.wall().now_ms();
         let op = SignedOp::sign(body, &self.key);
 
-        merge::merge_op(&tx, &op, now_ms)?;
+        let changed = merge::merge_op(&tx, &op, now_ms)?;
         {
             let row = OpRow {
                 op: op.clone(),
@@ -97,6 +99,9 @@ impl<W: WallClock> Store<W> {
             )?;
         }
         tx.commit()?;
+        if changed {
+            self.publish(vec![change_for(&op.body, true)]);
+        }
         Ok(op)
     }
 }

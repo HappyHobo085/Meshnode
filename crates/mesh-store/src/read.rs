@@ -84,10 +84,10 @@ where
                     origin: rk.origin,
                     row,
                 };
-                if let Some(done) = cur.replace(next) {
-                    if !emit(done, &mut f)? {
-                        return Ok(());
-                    }
+                if let Some(done) = cur.replace(next)
+                    && !emit(done, &mut f)?
+                {
+                    return Ok(());
                 }
             }
         }
@@ -98,6 +98,63 @@ where
     Ok(())
 }
 
+/// The winning register of `ns/key` in `reg` (read or write table), or `None`.
+pub(crate) fn reg_entry_in<T>(reg: &T, ns: &str, key: &str) -> Result<Option<RegEntry>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    if has_nul(ns) || has_nul(key) {
+        return Ok(None);
+    }
+    let prefix = keys::item_prefix(ns, key);
+    let mut rows = Vec::new();
+    for item in reg.range::<&[u8]>(prefix.as_slice()..)? {
+        let (k, v) = item?;
+        let k = k.value();
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        let origin = keys::split_reg_key(k)?.origin;
+        rows.push((origin, tables::decode::<RegRow>("reg", v.value())?));
+    }
+    Ok(merge::winner(rows).map(|(origin, r)| RegEntry {
+        order: r.order,
+        hlc: r.hlc,
+        origin,
+        seq: r.seq,
+        value: r.value,
+    }))
+}
+
+/// True if `member` is in `ns/set` according to `table` (read or write `set` table).
+pub(crate) fn set_contains_in<T>(
+    table: &T,
+    ns: &str,
+    set: &str,
+    member: &[u8],
+) -> Result<bool, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    if has_nul(ns) || has_nul(set) {
+        return Ok(false);
+    }
+    let mut p = keys::item_prefix(ns, set);
+    p.extend_from_slice(member);
+    for item in table.range::<&[u8]>(p.as_slice()..)? {
+        let (k, _) = item?;
+        let k = k.value();
+        if !k.starts_with(&p) {
+            break;
+        }
+        // Longer members extending `member` share the prefix; only an exact-length row matches.
+        if k.len() == p.len() + ORIGIN_LEN {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl<W: WallClock> Store<W> {
     /// The live value of `ns/key`, or `None` if absent or deleted.
     pub fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -106,29 +163,8 @@ impl<W: WallClock> Store<W> {
 
     /// The winning register of `ns/key` (including tombstones), or `None` if never written.
     pub fn get_entry(&self, ns: &str, key: &str) -> Result<Option<RegEntry>, StoreError> {
-        if has_nul(ns) || has_nul(key) {
-            return Ok(None);
-        }
         let tx = self.db.begin_read()?;
-        let reg = tx.open_table(REG)?;
-        let prefix = keys::item_prefix(ns, key);
-        let mut rows = Vec::new();
-        for item in reg.range::<&[u8]>(prefix.as_slice()..)? {
-            let (k, v) = item?;
-            let k = k.value();
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            let origin = keys::split_reg_key(k)?.origin;
-            rows.push((origin, tables::decode::<RegRow>("reg", v.value())?));
-        }
-        Ok(merge::winner(rows).map(|(origin, r)| RegEntry {
-            order: r.order,
-            hlc: r.hlc,
-            origin,
-            seq: r.seq,
-            value: r.value,
-        }))
+        reg_entry_in(&tx.open_table(REG)?, ns, key)
     }
 
     /// Live keys of `ns` starting with `prefix`, sorted, strictly after `start_after`
@@ -169,24 +205,8 @@ impl<W: WallClock> Store<W> {
 
     /// True if `member` is in the add-only set `ns/set`.
     pub fn set_contains(&self, ns: &str, set: &str, member: &[u8]) -> Result<bool, StoreError> {
-        if has_nul(ns) || has_nul(set) {
-            return Ok(false);
-        }
-        let mut p = keys::item_prefix(ns, set);
-        p.extend_from_slice(member);
         let table = self.db.begin_read()?.open_table(SET)?;
-        for item in table.range::<&[u8]>(p.as_slice()..)? {
-            let (k, _) = item?;
-            let k = k.value();
-            if !k.starts_with(&p) {
-                break;
-            }
-            // Longer members extending `member` share the prefix; only an exact-length row matches.
-            if k.len() == p.len() + ORIGIN_LEN {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        set_contains_in(&table, ns, set, member)
     }
 
     /// Members of `ns/set`, byte-sorted, strictly after `start_after`, at most `limit`.

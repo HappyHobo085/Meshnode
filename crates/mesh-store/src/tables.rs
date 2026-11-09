@@ -59,8 +59,8 @@ pub(crate) struct OpRow {
     pub invalid: bool,
 }
 
-/// An op held back from merging (`pending` value).
-#[allow(dead_code)] // written by remote apply (later task)
+/// An op held back from merging (`pending` value). `reason`: 0 = gap, 1 = unknown
+/// origin, 2 = skew (`DeferReason::code`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingRow {
     pub op: SignedOp,

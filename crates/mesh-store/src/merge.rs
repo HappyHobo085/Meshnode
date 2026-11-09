@@ -35,6 +35,7 @@ where
 /// - `Set`: if `op` beats this origin's current `reg` row (by `(order, hlc)`), it replaces
 ///   it and the old `(origin, seq)` goes into `superseded` at `now_ms`; otherwise `op`
 ///   itself goes into `superseded` and `reg` is untouched.
+///   If `op` *is* this origin's current row (same seq), nothing changes.
 /// - `SetAdd`: inserts the `set` row if absent (the first adder's row is kept).
 ///
 /// Opens `reg`, `set` and `superseded` itself and closes them before returning, so the
@@ -58,6 +59,11 @@ pub(crate) fn merge_op(
                 Some(g) => Some(tables::decode("reg", g.value())?),
                 None => None,
             };
+            // Re-merging this origin's current winner (same origin, same seq) is a no-op;
+            // otherwise the live winner would land in `superseded` and later be compacted.
+            if old.as_ref().is_some_and(|old| old.seq == b.seq) {
+                return Ok(false);
+            }
             let mut superseded = tx.open_table(SUPERSEDED)?;
             let now = keys::u64_value(now_ms);
             let loses = old.as_ref().is_some_and(|old| {
@@ -129,5 +135,41 @@ mod tests {
         ]);
         assert_eq!(w.map(|(o, _)| o), Some(b));
         assert!(winner(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn remerging_current_winner_is_a_noop() {
+        use ed25519_dalek::SigningKey;
+        use mesh_proto::{MeshId, OpBody};
+        use redb::ReadableTableMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("m.redb")).unwrap();
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let op = SignedOp::sign(
+            OpBody {
+                mesh: MeshId([7; 32]),
+                origin: NodeId(key.verifying_key().to_bytes()),
+                seq: 1,
+                hlc: Hlc::new(10, 0),
+                payload: Payload::Set {
+                    ns: "s".into(),
+                    key: "k".into(),
+                    order: Vec::new(),
+                    value: Some(b"v".to_vec()),
+                },
+            },
+            &key,
+        );
+        let tx = db.begin_write().unwrap();
+        tables::create_all(&tx).unwrap();
+        assert!(merge_op(&tx, &op, 5).unwrap());
+        assert!(!merge_op(&tx, &op, 6).unwrap());
+        assert_eq!(tx.open_table(SUPERSEDED).unwrap().len().unwrap(), 0);
+        let reg = tx.open_table(REG).unwrap();
+        let rk = keys::reg_key("s", "k", &op.body.origin);
+        let row: RegRow =
+            tables::decode("reg", reg.get(rk.as_slice()).unwrap().unwrap().value()).unwrap();
+        assert_eq!(row.seq, 1);
     }
 }

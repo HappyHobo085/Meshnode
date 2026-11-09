@@ -27,3 +27,33 @@ pub fn db_path(dir: &Path, n: u8) -> PathBuf {
 pub fn store(dir: &Path, n: u8, clock: &ManualClock) -> Store<ManualClock> {
     Store::open(&db_path(dir, n), MESH, key(n), clock.clone()).expect("open store")
 }
+
+/// Accepts every op from any origin.
+pub struct AcceptAll;
+
+impl mesh_store::Acceptor for AcceptAll {
+    fn judge(
+        &self,
+        _op: &mesh_proto::OpBody,
+        _view: &mesh_store::ReadView<'_>,
+    ) -> mesh_store::Verdict {
+        mesh_store::Verdict::Valid
+    }
+}
+
+/// Accepts ops only from the listed origins; everything else is `UnknownOrigin`.
+pub struct MembersOnly(pub std::collections::HashSet<NodeId>);
+
+impl mesh_store::Acceptor for MembersOnly {
+    fn judge(
+        &self,
+        op: &mesh_proto::OpBody,
+        _view: &mesh_store::ReadView<'_>,
+    ) -> mesh_store::Verdict {
+        if self.0.contains(&op.origin) {
+            mesh_store::Verdict::Valid
+        } else {
+            mesh_store::Verdict::UnknownOrigin
+        }
+    }
+}

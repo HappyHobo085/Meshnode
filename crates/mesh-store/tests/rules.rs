@@ -2,10 +2,14 @@
 
 mod common;
 
-use common::{MESH, db_path, key, store};
-use mesh_hlc::ManualClock;
-use mesh_proto::{MeshId, Payload};
-use mesh_store::{Store, StoreError};
+use common::{AcceptAll, MESH, MembersOnly, db_path, key, node, store};
+use mesh_hlc::{Hlc, ManualClock};
+use mesh_proto::{MeshId, NodeId, OpBody, Payload, SignedOp};
+use mesh_store::{
+    Acceptor, Change, ChangeKind, DeferReason, Outcome, ReadView, RejectReason, Store, StoreError,
+    Verdict,
+};
+use std::collections::HashSet;
 
 const T0: u64 = 1_700_000_000_000;
 
@@ -275,4 +279,430 @@ fn store_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Store<ManualClock>>();
     assert_send_sync::<Store>();
+}
+
+// ---------------------------------------------------------------------------
+// Remote apply (Task 4)
+
+const DAY_MS: u64 = 86_400_000;
+
+/// A `Set` op signed by test node `n`, built by hand (for equivocation / gaps).
+fn hand_op(n: u8, seq: u64, hlc_ms: u64, key_: &str, value: &[u8]) -> SignedOp {
+    let body = OpBody {
+        mesh: MESH,
+        origin: node(n),
+        seq,
+        hlc: Hlc::new(hlc_ms, 0),
+        payload: Payload::Set {
+            ns: "s".into(),
+            key: key_.into(),
+            order: Vec::new(),
+            value: Some(value.to_vec()),
+        },
+    };
+    SignedOp::sign(body, &key(n))
+}
+
+fn members(ids: &[NodeId]) -> MembersOnly {
+    MembersOnly(ids.iter().copied().collect::<HashSet<_>>())
+}
+
+#[test]
+fn remote_op_applies_and_converges_with_local_reader() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let op = a.set("s", "k", b"v").unwrap();
+    let add = a.set_add("s", "m", b"x").unwrap();
+    assert_eq!(b.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+    assert_eq!(b.apply(add, &AcceptAll).unwrap(), Outcome::Applied);
+    assert_eq!(b.get("s", "k").unwrap(), a.get("s", "k").unwrap());
+    assert_eq!(
+        b.get_entry("s", "k").unwrap(),
+        a.get_entry("s", "k").unwrap()
+    );
+    assert!(b.set_contains("s", "m", b"x").unwrap());
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 2);
+}
+
+#[test]
+fn own_op_echo_is_duplicate() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let op = a.set("s", "k", b"v").unwrap();
+    assert_eq!(a.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Duplicate);
+    assert_eq!(a.version_vector_local_seq(), 1);
+    assert_eq!(a.vv_of(a.node_id()).unwrap(), 1);
+    assert_eq!(a.pending_len().unwrap(), 0);
+    assert_eq!(a.set("s", "k", b"w").unwrap().body.seq, 2);
+}
+
+#[test]
+fn bad_signature_rejected_and_not_counted() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let mut op = a.set("s", "k", b"v").unwrap();
+    op.sig[0] ^= 1;
+    assert_eq!(
+        b.apply(op.clone(), &AcceptAll).unwrap(),
+        Outcome::Rejected(RejectReason::BadSig)
+    );
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 0);
+    assert_eq!(b.get("s", "k").unwrap(), None);
+    assert_eq!(b.pending_len().unwrap(), 0);
+    // The genuine op still applies afterwards.
+    op.sig[0] ^= 1;
+    assert_eq!(b.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+}
+
+#[test]
+fn wrong_mesh_rejected() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    let mut body = hand_op(1, 1, T0, "k", b"v").body;
+    body.mesh = MeshId([8; 32]);
+    let op = SignedOp::sign(body, &key(1));
+    assert_eq!(
+        b.apply(op, &AcceptAll).unwrap(),
+        Outcome::Rejected(RejectReason::WrongMesh)
+    );
+    assert_eq!(b.vv_of(node(1)).unwrap(), 0);
+}
+
+#[test]
+fn equivocation_keeps_first() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    let first = hand_op(1, 1, T0, "k", b"first");
+    let second = hand_op(1, 1, T0, "k", b"second");
+    assert_eq!(
+        b.apply(first.clone(), &AcceptAll).unwrap(),
+        Outcome::Applied
+    );
+    assert_eq!(
+        b.apply(second, &AcceptAll).unwrap(),
+        Outcome::Rejected(RejectReason::Equivocation)
+    );
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"first".to_vec()));
+    assert_eq!(b.apply(first, &AcceptAll).unwrap(), Outcome::Duplicate);
+}
+
+#[test]
+fn equivocation_against_pending_keeps_first() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    let first = hand_op(1, 2, T0, "k", b"first");
+    let second = hand_op(1, 2, T0, "k", b"second");
+    assert_eq!(
+        b.apply(first.clone(), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(
+        b.apply(second, &AcceptAll).unwrap(),
+        Outcome::Rejected(RejectReason::Equivocation)
+    );
+    assert_eq!(b.apply(first, &AcceptAll).unwrap(), Outcome::Duplicate);
+    assert_eq!(b.pending_len().unwrap(), 1);
+    assert_eq!(
+        b.apply(hand_op(1, 1, T0, "j", b"one"), &AcceptAll).unwrap(),
+        Outcome::Applied
+    );
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"first".to_vec()));
+    assert_eq!(b.vv_of(node(1)).unwrap(), 2);
+    assert_eq!(b.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn gap_is_deferred_then_applied() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let o1 = a.set("s", "x", b"1").unwrap();
+    let o2 = a.set("s", "y", b"2").unwrap();
+    let o3 = a.set("s", "z", b"3").unwrap();
+    assert_eq!(
+        b.apply(o3, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(
+        b.apply(o2, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(b.get("s", "z").unwrap(), None);
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 0);
+    assert_eq!(b.apply(o1, &AcceptAll).unwrap(), Outcome::Applied);
+    for (k, v) in [("x", b"1"), ("y", b"2"), ("z", b"3")] {
+        assert_eq!(b.get("s", k).unwrap(), Some(v.to_vec()));
+    }
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 3);
+    assert_eq!(b.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn identical_pending_op_is_duplicate() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    let o2 = hand_op(1, 2, T0, "k", b"v");
+    assert_eq!(
+        b.apply(o2.clone(), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(b.apply(o2, &AcceptAll).unwrap(), Outcome::Duplicate);
+    assert_eq!(b.pending_len().unwrap(), 1);
+}
+
+#[test]
+fn unknown_origin_deferred_until_member() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let op = a.set("s", "k", b"v").unwrap();
+    assert_eq!(
+        b.apply(op, &members(&[])).unwrap(),
+        Outcome::Deferred(DeferReason::UnknownOrigin)
+    );
+    assert_eq!(b.get("s", "k").unwrap(), None);
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 0);
+    assert_eq!(b.retry_pending(&members(&[])).unwrap(), 0);
+    assert_eq!(b.pending_len().unwrap(), 1);
+    assert_eq!(b.retry_pending(&members(&[a.node_id()])).unwrap(), 1);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(b.vv_of(a.node_id()).unwrap(), 1);
+    assert_eq!(b.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn drain_rechecks_origin_of_unblocked_ops() {
+    // Op 2 waits on a gap; op 1 arrives under an acceptor that does not know the origin
+    // yet, so both stay pending until a retry with the origin as a member.
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    let a = node(1);
+    assert_eq!(
+        b.apply(hand_op(1, 2, T0, "k2", b"2"), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    assert_eq!(
+        b.apply(hand_op(1, 1, T0, "k1", b"1"), &members(&[]))
+            .unwrap(),
+        Outcome::Deferred(DeferReason::UnknownOrigin)
+    );
+    assert_eq!(b.pending_len().unwrap(), 2);
+    assert_eq!(b.retry_pending(&members(&[a])).unwrap(), 2);
+    assert_eq!(b.get("s", "k2").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(b.vv_of(a).unwrap(), 2);
+    assert_eq!(b.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn drained_op_is_judged_again() {
+    // Op 2 was deferred for a gap under a permissive acceptor; when op 1 arrives under a
+    // stricter acceptor that only admits op 1, op 2 stays pending (now as UnknownOrigin).
+    struct OnlySeq1;
+    impl Acceptor for OnlySeq1 {
+        fn judge(&self, op: &OpBody, _view: &ReadView<'_>) -> Verdict {
+            if op.seq == 1 {
+                Verdict::Valid
+            } else {
+                Verdict::UnknownOrigin
+            }
+        }
+    }
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    b.apply(hand_op(1, 2, T0, "k2", b"2"), &AcceptAll).unwrap();
+    assert_eq!(
+        b.apply(hand_op(1, 1, T0, "k1", b"1"), &OnlySeq1).unwrap(),
+        Outcome::Applied
+    );
+    assert_eq!(b.vv_of(node(1)).unwrap(), 1);
+    assert_eq!(b.get("s", "k2").unwrap(), None);
+    assert_eq!(b.pending_len().unwrap(), 1);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 1);
+    assert_eq!(b.vv_of(node(1)).unwrap(), 2);
+}
+
+#[test]
+fn skew_deferred_then_applied_when_clock_catches_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock_a = ManualClock::new(T0 + 300_001);
+    let clock_b = ManualClock::new(T0);
+    let a = store(dir.path(), 1, &clock_a);
+    let b = store(dir.path(), 2, &clock_b);
+    let op = a.set("s", "k", b"v").unwrap();
+    assert_eq!(
+        b.apply(op.clone(), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Skew)
+    );
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 0);
+    clock_b.advance(2);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 1);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"v".to_vec()));
+    // The observed HLC raised B's clock.
+    assert!(b.set("s", "j", b"w").unwrap().body.hlc > op.body.hlc);
+}
+
+#[test]
+fn observed_hlc_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock_a = ManualClock::new(T0 + 200_000);
+    let clock_b = ManualClock::new(T0);
+    let a = store(dir.path(), 1, &clock_a);
+    let op = a.set("s", "k", b"v").unwrap();
+    {
+        let b = store(dir.path(), 2, &clock_b);
+        assert_eq!(b.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Applied);
+    }
+    let b = store(dir.path(), 2, &clock_b);
+    assert!(b.set("s", "j", b"w").unwrap().body.hlc > op.body.hlc);
+}
+
+#[test]
+fn pending_dropped_after_24h() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    assert_eq!(
+        b.apply(hand_op(1, 2, T0, "k", b"v"), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    clock.advance(DAY_MS + 1);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 0);
+    assert_eq!(b.pending_len().unwrap(), 0);
+    assert_eq!(b.vv_of(node(1)).unwrap(), 0);
+}
+
+#[test]
+fn retry_keeps_first_seen() {
+    let (dir, clock) = setup();
+    let b = store(dir.path(), 2, &clock);
+    assert_eq!(
+        b.apply(hand_op(1, 2, T0, "k", b"v"), &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Gap)
+    );
+    clock.advance(DAY_MS / 2);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 0);
+    assert_eq!(b.pending_len().unwrap(), 1);
+    clock.advance(DAY_MS / 2);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 0);
+    assert_eq!(b.pending_len().unwrap(), 1); // exactly 24 h old: kept
+    clock.advance(1);
+    assert_eq!(b.retry_pending(&AcceptAll).unwrap(), 0);
+    assert_eq!(b.pending_len().unwrap(), 0);
+}
+
+#[test]
+fn change_events_after_commit() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let mut rx = b.subscribe();
+    b.set("s", "mine", b"1").unwrap();
+    let op = a.set_add("t", "group", b"x").unwrap();
+    assert_eq!(b.apply(op.clone(), &AcceptAll).unwrap(), Outcome::Applied);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Change {
+            ns: "s".into(),
+            kind: ChangeKind::Key("mine".into()),
+            local: true
+        }
+    );
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Change {
+            ns: "t".into(),
+            kind: ChangeKind::Set("group".into()),
+            local: false
+        }
+    );
+    // A duplicate changes nothing and publishes nothing.
+    assert_eq!(b.apply(op, &AcceptAll).unwrap(), Outcome::Duplicate);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn drained_chain_emits_one_event_per_op() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let ops = [
+        a.set("s", "x", b"1").unwrap(),
+        a.set("s", "y", b"2").unwrap(),
+        a.set("s", "z", b"3").unwrap(),
+    ];
+    let mut rx = b.subscribe();
+    b.apply(ops[2].clone(), &AcceptAll).unwrap();
+    b.apply(ops[1].clone(), &AcceptAll).unwrap();
+    assert!(rx.try_recv().is_err());
+    b.apply(ops[0].clone(), &AcceptAll).unwrap();
+    let kinds: Vec<ChangeKind> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|c| c.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ChangeKind::Key("x".into()),
+            ChangeKind::Key("y".into()),
+            ChangeKind::Key("z".into())
+        ]
+    );
+}
+
+#[test]
+fn publishing_without_subscribers_is_fine() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let op = a.set("s", "k", b"v").unwrap();
+    assert_eq!(b.apply(op, &AcceptAll).unwrap(), Outcome::Applied);
+    drop(b.subscribe());
+    b.set("s", "j", b"w").unwrap();
+}
+
+/// Admits an origin only if `_mesh/members` contains it (read through the view).
+struct MembersFromStore;
+
+impl Acceptor for MembersFromStore {
+    fn judge(&self, op: &OpBody, view: &ReadView<'_>) -> Verdict {
+        match view.set_contains("_mesh", "members", &op.origin.0) {
+            Ok(true) => Verdict::Valid,
+            _ => Verdict::UnknownOrigin,
+        }
+    }
+}
+
+#[test]
+fn acceptor_reads_the_store_inside_the_transaction() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let op = a.set("s", "k", b"v").unwrap();
+    assert_eq!(
+        b.apply(op, &MembersFromStore).unwrap(),
+        Outcome::Deferred(DeferReason::UnknownOrigin)
+    );
+    b.set_add("_mesh", "members", &a.node_id().0).unwrap();
+    assert_eq!(b.retry_pending(&MembersFromStore).unwrap(), 1);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn concurrent_writes_converge_in_any_order() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let c = store(dir.path(), 3, &clock);
+    let oa = a.set("s", "k", b"from-a").unwrap();
+    let oc = c.set("s", "k", b"from-c").unwrap();
+    let b = store(dir.path(), 2, &clock);
+    let d = store(dir.path(), 4, &clock);
+    b.apply(oa.clone(), &AcceptAll).unwrap();
+    b.apply(oc.clone(), &AcceptAll).unwrap();
+    d.apply(oc, &AcceptAll).unwrap();
+    d.apply(oa, &AcceptAll).unwrap();
+    assert_eq!(
+        b.get_entry("s", "k").unwrap(),
+        d.get_entry("s", "k").unwrap()
+    );
+    assert!(b.get("s", "k").unwrap().is_some());
 }

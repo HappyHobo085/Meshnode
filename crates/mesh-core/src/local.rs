@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
-use mesh_proto::{MeshGenesis, NodeId, Role, SignedOp};
+use mesh_proto::{MeshGenesis, NodeAddrBytes, NodeId, Role, SignedOp};
 use mesh_store::SyncItem;
 use serde::{Deserialize, Serialize};
 
@@ -207,14 +207,23 @@ impl Invites {
 }
 
 /// The in-progress re-bootstrap export (spec §7 step 2), persisted before the store is reset.
+///
+/// Beyond spec §7's `{ s, items, expired }` it carries `last_seq` (to check that no own op
+/// slipped in between the export and the reset, and to cover a trailing hole) and `peers`
+/// (so a node resumed after a crash can reach a peer although its emptied store holds no
+/// addresses). Not a stable format: a file from an older build fails to decode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebootstrapFile {
     /// `synced_self_seq` read before the reset.
     pub s: u64,
+    /// The last own seq used before the reset (`next_seq - 1`).
+    pub last_seq: u64,
     /// `Export::items`, re-applied once the catch-up reached `s`.
     pub items: Vec<SyncItem>,
     /// `Export::expired`, own edits too old to re-apply.
     pub expired: Vec<SignedOp>,
+    /// Effective members (but this node) with their last known address.
+    pub peers: Vec<(NodeId, NodeAddrBytes)>,
 }
 
 /// Writes `rebootstrap.bin` atomically (temp file, fsync, rename).
@@ -236,8 +245,8 @@ pub fn read_rebootstrap(dir: &Path) -> Result<Option<RebootstrapFile>, NodeError
 }
 
 /// Whether `rebootstrap.bin` exists (a re-bootstrap must resume).
-pub fn rebootstrap_pending(dir: &Path) -> bool {
-    dir.join(REBOOTSTRAP_FILE).exists()
+pub fn rebootstrap_pending(dir: &Path) -> Result<bool, NodeError> {
+    Ok(dir.join(REBOOTSTRAP_FILE).try_exists()?)
 }
 
 /// Deletes `rebootstrap.bin` (no error if it is already gone).

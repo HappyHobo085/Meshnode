@@ -281,7 +281,10 @@ async fn stale_rebootstrap() {
     );
     assert_outcome(&t.a, &t.b, &t.c).await;
     let dir = t.dirs[0].path();
-    assert!(!rebootstrap_pending(dir), "rebootstrap.bin deleted");
+    assert!(
+        !rebootstrap_pending(dir).unwrap(),
+        "rebootstrap.bin deleted"
+    );
     assert_eq!(expired_keys(dir), vec![(NS.to_owned(), "k".to_owned())]);
     let Trio {
         a, b, c, dirs: _d, ..
@@ -311,7 +314,7 @@ async fn rebootstrap_resumes_after_crash() {
     );
     let dir = t.dirs[0].path().to_path_buf();
     assert!(
-        rebootstrap_pending(&dir),
+        rebootstrap_pending(&dir).unwrap(),
         "rebootstrap.bin written before the reset"
     );
 
@@ -337,12 +340,11 @@ async fn rebootstrap_resumes_after_crash() {
             Err(e) => panic!("reopen failed: {e}"),
         }
     };
-    // Discovery is off and the reset store holds no addresses.
-    a.add_hint(b.node_id(), own_addr(&b).await);
-    a.add_hint(c.node_id(), own_addr(&c).await);
 
+    // No hints: the resumed run dials the peers remembered in rebootstrap.bin (discovery is
+    // off and the reset store holds no addresses).
     wait_until("the resumed re-bootstrap completes", T, || async {
-        a.status() == NodeStatus::Running && !rebootstrap_pending(&dir)
+        a.status() == NodeStatus::Running && !rebootstrap_pending(&dir).unwrap()
     })
     .await;
     assert_outcome(&a, &b, &c).await;
@@ -352,8 +354,19 @@ async fn rebootstrap_resumes_after_crash() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rebootstrap_waits_for_self_seq() {
+/// A stale and re-bootstrapping, connected only to C, which lacks A's synced ops (only B
+/// holds them, and B is cut off from both). C knows A as a member.
+struct StuckOnC {
+    a: Node,
+    b: Node,
+    c: Node,
+    /// A's `synced_self_seq`.
+    s: u64,
+    events: broadcast::Receiver<NodeEvent>,
+    _dirs: [TempDir; 3],
+}
+
+async fn stuck_on_c() -> StuckOnC {
     let dirs = [
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
@@ -413,9 +426,9 @@ async fn rebootstrap_waits_for_self_seq() {
     .await;
     assert_eq!(vv_of(&c, ia).await, 0, "C holds no op of A");
 
-    // 81 days later A meets only C.
+    // 81 days later (A's clock only) A meets only C.
     clock_a.set(clock_a.now() + 81 * DAY);
-    let mut events = a.subscribe();
+    let events = a.subscribe();
     c.heal();
     wait_until("A is re-bootstrapping", T, || async {
         a.status()
@@ -438,6 +451,26 @@ async fn rebootstrap_waits_for_self_seq() {
             waiting_for_self_seq: s
         }
     );
+    StuckOnC {
+        a,
+        b,
+        c,
+        s,
+        events,
+        _dirs: dirs,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebootstrap_waits_for_self_seq() {
+    let StuckOnC {
+        a,
+        b,
+        c,
+        s,
+        mut events,
+        _dirs,
+    } = stuck_on_c().await;
     let r = a.store().set(NS, "x", b"1".to_vec()).await;
     assert!(matches!(r, Err(NodeError::Rebootstrapping)), "{r:?}");
 
@@ -446,10 +479,119 @@ async fn rebootstrap_waits_for_self_seq() {
     a.heal();
     common::wait_event(&mut events, |e| *e == NodeEvent::RebootstrapDone, T).await;
     assert_eq!(a.status(), NodeStatus::Running);
-    assert!(vv_of(&a, ia).await >= s);
+    assert!(vv_of(&a, a.node_id()).await >= s);
     converged(&[&a, &b, &c], T).await;
     // Local writes are accepted again (B and C hold this one back: A's clock is ahead).
     a.store().set(NS, "x", b"1".to_vec()).await.unwrap();
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_while_stale_ends_removed() {
+    let StuckOnC { a, b, c, _dirs, .. } = stuck_on_c().await;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    let dir = _dirs[0].path().to_path_buf();
+    assert!(rebootstrap_pending(&dir).unwrap());
+
+    // C removes A; the record reaches A's half-refilled store (by hand: C also closes A).
+    c.remove(ia).await.unwrap();
+    a.deliver_from(&c).await.unwrap();
+
+    wait_until("A ends Removed", T, || async {
+        a.status() == NodeStatus::Removed { by: ic }
+    })
+    .await;
+    wait_until("the abandoned run cleaned up", T, || async {
+        !rebootstrap_pending(&dir).unwrap()
+    })
+    .await;
+    let r = a.store().set(NS, "x", b"1".to_vec()).await;
+    assert!(matches!(r, Err(NodeError::Removed)), "{r:?}");
+    assert_eq!(a.status(), NodeStatus::Removed { by: ic });
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_writes_race_rebootstrap_start() {
+    let t = trio().await;
+    let (a, b, c) = (&t.a, &t.b, &t.c);
+    let (ia, ib, ic) = (a.node_id(), b.node_id(), c.node_id());
+    a.partition(&[ib, ic]);
+    b.partition(&[ia]);
+    c.partition(&[ia]);
+    wait_until("A cut off", T, || async {
+        !online(a, ib) && !online(a, ic) && !online(b, ia) && !online(c, ia)
+    })
+    .await;
+    // All clocks move together; B and C keep syncing so only A goes stale.
+    let day0 = t.clocks[1].now();
+    for d in [40, 81] {
+        for clock in &t.clocks {
+            clock.set(day0 + d * DAY);
+        }
+        full_sync_since(b, day0 + d * DAY).await;
+        full_sync_since(c, day0 + d * DAY).await;
+    }
+
+    // Several writers hammer A while the re-bootstrap starts.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4 {
+        let (store, stop) = (a.store().clone(), stop.clone());
+        writers.push(tokio::spawn(async move {
+            let (mut ok, mut refused) = (Vec::new(), 0usize);
+            let mut i = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let key = format!("w{w}-{i}");
+                match store.set(NS, &key, b"v".to_vec()).await {
+                    Ok(()) => ok.push(key),
+                    Err(NodeError::Rebootstrapping) => {
+                        refused += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => panic!("unexpected write error: {e}"),
+                }
+                i += 1;
+            }
+            (ok, refused)
+        }));
+    }
+    let mut events = a.subscribe();
+    wait_until("writes are landing", T, || async {
+        vv_of(a, ia).await > 20
+    })
+    .await;
+    heal_all(&t).await;
+    common::wait_event(&mut events, |e| *e == NodeEvent::RebootstrapDone, T).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (mut ok, mut refused) = (Vec::new(), 0);
+    for w in writers {
+        let (o, r) = w.await.unwrap();
+        ok.extend(o);
+        refused += r;
+    }
+    assert!(refused > 0, "no write hit the re-bootstrap");
+
+    // Writes work again; every accepted write survives everywhere.
+    a.store().set(NS, "after", b"1".to_vec()).await.unwrap();
+    ok.push("after".to_owned());
+    converged(&[a, b, c], T).await;
+    for n in [a, b, c] {
+        for key in &ok {
+            assert!(
+                val(n, key).await.is_some(),
+                "{key} lost on {}",
+                n.node_id().short()
+            );
+        }
+    }
+    let Trio {
+        a, b, c, dirs: _d, ..
+    } = t;
     for n in [a, b, c] {
         timeout(T, n.shutdown()).await.unwrap();
     }

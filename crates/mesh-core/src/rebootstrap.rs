@@ -73,7 +73,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
         Some(file) => {
             // Crash safety: resume at step 3; the export is never recomputed.
             warn!(s = file.s, "resuming an interrupted re-bootstrap");
-            pause(inner);
+            pause(inner).await;
             file
         }
         None => {
@@ -81,22 +81,34 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
                 resume_serving(inner);
                 return Ok(());
             }
-            pause(inner);
+            // From here no own op can be written until step 7.
+            pause(inner).await;
             // 1.
             warn!("store is stale (no full sync for 80 days); re-bootstrapping");
             let _ = inner.events.send(NodeEvent::RebootstrapStarting);
             // 2. `synced_self_seq` before the reset, which deletes it.
-            let (s, export) = inner
+            let (s, last_seq, export) = inner
                 .store
                 .call(|st| {
                     let s = st.synced_self_seq()?.unwrap_or(0);
-                    Ok((s, st.export_unsynced_local_ops()?))
+                    let last_seq = st.next_seq()?.saturating_sub(1);
+                    Ok((s, last_seq, st.export_unsynced_local_ops()?))
                 })
                 .await?;
+            let peers = {
+                let snap = inner.membership.borrow();
+                snap.effective_members()
+                    .into_iter()
+                    .filter(|id| *id != inner.me)
+                    .filter_map(|id| snap.addr(&id).map(|a| (id, a.clone())))
+                    .collect()
+            };
             let file = RebootstrapFile {
                 s,
+                last_seq,
                 items: export.items,
                 expired: export.expired,
+                peers,
             };
             let (d, f) = (dir.clone(), file.clone());
             blocking(move || write_rebootstrap(&d, &f)).await?;
@@ -105,16 +117,35 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     };
 
     // 3.
-    inner.store.call(|st| st.reset_to_empty()).await?;
+    let next = inner
+        .store
+        .call(|st| {
+            st.reset_to_empty()?;
+            st.next_seq()
+        })
+        .await?;
+    if next.saturating_sub(1) != file.last_seq {
+        // An own op was written after the export: it is gone, and the store would refuse
+        // every later local write. Never carry on silently.
+        error!(
+            last_seq = file.last_seq,
+            next_seq = next,
+            "an own op was written between the re-bootstrap export and the reset; stopping"
+        );
+        return Err(NodeError::Io(std::io::Error::other(
+            "own op written between the re-bootstrap export and the reset",
+        )));
+    }
     let s = file.s;
-    inner.status.send_if_modified(|st| match st {
-        NodeStatus::Running | NodeStatus::RefusedAsRemoved { .. } => {
+    // `RefusedAsRemoved` stays visible.
+    inner.status.send_if_modified(|st| {
+        let running = matches!(st, NodeStatus::Running);
+        if running {
             *st = NodeStatus::Rebootstrapping {
                 waiting_for_self_seq: s,
             };
-            true
         }
-        _ => false,
+        running
     });
     info!(waiting_for_self_seq = s, "store reset; catching up");
     #[cfg(any(test, feature = "test-hooks"))]
@@ -125,12 +156,23 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     }
 
     // 4. Rounds (a pull: nothing is served) until a peer gave back the synced own ops.
-    if !wait_for_self_seq(inner, s).await? {
-        return Ok(());
+    match wait_for_self_seq(inner, s).await? {
+        Wait::Reached => {}
+        Wait::Stopped => return Ok(()),
+        Wait::Removed => {
+            // Nothing left to rebuild: the node is stopped for good (spec §3.3 step 6).
+            warn!("this node was removed during its re-bootstrap; abandoning it");
+            blocking(move || remove_rebootstrap(&dir)).await?;
+            inner.store.refuse_writes_rebootstrapping(false);
+            inner.serve_paused.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
     }
 
-    // 5. Covered markers and ops, in export order (a marker may follow ops).
-    let acc = inner.acc.clone();
+    // 5. Covered markers and ops, in export order (a marker may follow ops), then a
+    // marker up to the last own seq used: a trailing expired or compacted op leaves a hole
+    // the export has no marker for, and local writes need `vv[self] == next_seq - 1`.
+    let (acc, me, last_seq) = (inner.acc.clone(), inner.me, file.last_seq);
     let items = file.items;
     inner
         .store
@@ -146,7 +188,11 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
                     }
                 }
             }
-            st.apply_batch(ops, &*acc).map(drop)
+            st.apply_batch(ops, &*acc)?;
+            if last_seq > 0 {
+                st.apply_covered(me, last_seq, last_seq, &*acc)?;
+            }
+            Ok(())
         })
         .await?;
 
@@ -191,10 +237,21 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Stops serving and refuses local writes until the re-bootstrap is done.
-fn pause(inner: &Inner) {
+/// Stops serving, refuses local writes until the re-bootstrap is done, and waits for the
+/// local writes already admitted to finish.
+async fn pause(inner: &Inner) {
     inner.serve_paused.store(true, Ordering::SeqCst);
     inner.store.refuse_writes_rebootstrapping(true);
+    inner.store.drain_writes().await;
+}
+
+/// How step 4 ended.
+enum Wait {
+    Reached,
+    /// The node is shutting down.
+    Stopped,
+    /// This node's removal arrived.
+    Removed,
 }
 
 /// Lets sessions serve again and wakes every one of them.
@@ -204,11 +261,12 @@ fn resume_serving(inner: &Inner) {
     }
 }
 
-/// Waits until `vv[self] >= s`, checking after each completed round and every
-/// [`CHECK_EVERY`]. False if the node was stopped first.
-async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<bool, NodeError> {
+/// Waits until `vv[self] >= s`, checking after each completed round, each status change
+/// and every [`CHECK_EVERY`]; gives up if the node stops or is removed meanwhile.
+async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
     let me = inner.me;
     let mut events = inner.events.subscribe();
+    let mut status = inner.status.subscribe();
     let mut poll = tokio::time::interval(CHECK_EVERY);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -216,18 +274,25 @@ async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<bool, NodeError> {
             .store
             .call(move |st| Ok(st.version_vector()?.get(&me)))
             .await?;
+        if matches!(*status.borrow_and_update(), NodeStatus::Removed { .. }) {
+            return Ok(Wait::Removed);
+        }
         if have >= s {
-            return Ok(true);
+            return Ok(Wait::Reached);
         }
         debug!(have, s, "waiting for this node's synced ops");
         loop {
             tokio::select! {
-                _ = inner.cancel.cancelled() => return Ok(false),
+                _ = inner.cancel.cancelled() => return Ok(Wait::Stopped),
                 _ = poll.tick() => break,
+                r = status.changed() => match r {
+                    Ok(()) => break,
+                    Err(_) => return Ok(Wait::Stopped),
+                },
                 ev = events.recv() => match ev {
                     Ok(NodeEvent::RoundComplete(_)) | Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Closed) => return Ok(false),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(Wait::Stopped),
                 },
             }
         }

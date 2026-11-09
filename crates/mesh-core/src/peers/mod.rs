@@ -234,6 +234,20 @@ impl PeerManager {
         }
     }
 
+    /// Adds targets without dropping or changing any (the remembered peers of a resumed
+    /// re-bootstrap, spec §7); their addresses come from hints.
+    pub fn add_targets(&self, ids: &[NodeId]) {
+        let mut st = self.lock();
+        if st.stopped {
+            return;
+        }
+        for id in ids {
+            if *id != self.0.env.me && !st.slots.contains_key(id) {
+                self.spawn_slot(&mut st, *id, None);
+            }
+        }
+    }
+
     fn spawn_slot(&self, st: &mut PmState, peer: NodeId, addr: Option<NodeAddrBytes>) -> Arc<Slot> {
         let slot = Arc::new(Slot {
             peer,

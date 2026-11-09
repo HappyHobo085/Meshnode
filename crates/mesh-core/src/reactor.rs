@@ -121,11 +121,10 @@ impl Reactor {
     /// One full membership rescan (spec §3.3 steps 1–7).
     ///
     /// While a re-bootstrap runs, the store is emptied and refilled by the catch-up, so a
-    /// snapshot read from it may lack members it held before. Then only steps 1–3 run, and
-    /// the new snapshot replaces the current one (with the dial targets) only if every
-    /// currently effective member is still effective in it: membership only grows, no
-    /// connection is closed and nothing is concluded about this node until the
-    /// re-bootstrap ends with a full rescan.
+    /// snapshot read from it may lack members it held before. Then, unless the snapshot
+    /// holds a removal record of this node, only steps 1–3 run followed by
+    /// [`Reactor::hold`]: membership only grows, only peers with a removal record are
+    /// closed, and the re-bootstrap ends with a full rescan.
     pub async fn rescan(&mut self, lagged: bool) -> Result<(), NodeError> {
         let c = &self.ctx;
         if lagged {
@@ -164,28 +163,10 @@ impl Reactor {
         c.store.call(move |s| s.retry_pending(&*acc)).await?;
 
         let snap = Arc::new(snap);
-        if c.rebootstrapping.load(Ordering::SeqCst) {
-            let targets = {
-                let cur = c.membership.borrow();
-                let grows = cur
-                    .effective_members()
-                    .iter()
-                    .all(|id| snap.is_effective(id));
-                // An address register may not be back yet: keep the one known before.
-                grows.then(|| {
-                    let mut t = targets_of(&snap, c.me);
-                    for (id, addr) in &mut t {
-                        if addr.is_none() {
-                            *addr = cur.addr(id).cloned();
-                        }
-                    }
-                    t
-                })
-            };
-            if let Some(targets) = targets {
-                self.publish(&snap);
-                c.peers.set_targets(targets);
-            }
+        // A removal record of this node is positive evidence even in a half-refilled
+        // store: then the full rescan below applies it (and stops the node).
+        if c.rebootstrapping.load(Ordering::SeqCst) && snap.removed_by(&c.me).is_none() {
+            self.hold(&snap);
             return Ok(());
         }
         self.publish(&snap);
@@ -234,6 +215,46 @@ impl Reactor {
         }
         self.no_host = no_host;
         Ok(())
+    }
+
+    /// The rescan's end while a re-bootstrap runs (see [`Reactor::rescan`]): peers with a
+    /// removal record are closed (presence is reliable, absence is not); the snapshot and
+    /// the targets are replaced only if membership grows, and no target is dropped.
+    fn hold(&self, snap: &Arc<MembershipSnapshot>) {
+        let c = &self.ctx;
+        let current = c.peers.target_ids();
+        for id in &current {
+            if snap.removed_by(id).is_some() {
+                c.peers.close(*id, REMOVED);
+            }
+        }
+        let targets = {
+            let cur = c.membership.borrow();
+            let grows = cur
+                .effective_members()
+                .iter()
+                .all(|id| snap.is_effective(id));
+            grows.then(|| {
+                let mut t = targets_of(snap, c.me);
+                // An address register may not be back yet: keep the one known before.
+                for (id, addr) in &mut t {
+                    if addr.is_none() {
+                        *addr = cur.addr(id).cloned();
+                    }
+                }
+                // Targets added from a resumed re-bootstrap's remembered peers stay.
+                for id in current {
+                    if !t.iter().any(|(t, _)| *t == id) {
+                        t.push((id, cur.addr(&id).cloned()));
+                    }
+                }
+                t
+            })
+        };
+        if let Some(targets) = targets {
+            self.publish(snap);
+            c.peers.set_targets(targets);
+        }
     }
 
     /// Replaces the membership snapshot; `MembersChanged` if it differs.

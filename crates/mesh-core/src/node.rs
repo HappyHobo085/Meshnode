@@ -24,7 +24,9 @@ use crate::db::{CoreStore, StoreHandle};
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::join::{JoinHandler, JoinInner};
-use crate::local::{Invites, load_or_create_key, read_genesis, rebootstrap_pending, write_genesis};
+use crate::local::{
+    Invites, load_or_create_key, read_genesis, read_rebootstrap, remove_rebootstrap, write_genesis,
+};
 use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
     encode_info, encode_removal, info_key, member_bytes,
@@ -98,7 +100,7 @@ pub(crate) struct Inner {
     join: Arc<JoinInner>,
     /// Sticky: true once any round has completed since start.
     first_sync: Arc<watch::Sender<bool>>,
-    membership: Arc<watch::Sender<Arc<MembershipSnapshot>>>,
+    pub(crate) membership: Arc<watch::Sender<Arc<MembershipSnapshot>>>,
     pub(crate) peers: PeerManager,
     pub(crate) events: broadcast::Sender<NodeEvent>,
     pub(crate) status: Arc<watch::Sender<NodeStatus>>,
@@ -253,10 +255,25 @@ pub(crate) async fn start(
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
     let g = genesis.clone();
     let snap = store.call(move |s| MembershipSnapshot::load(s, &g)).await?;
-    // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale
-    // (a removed node has nothing to rebuild). Serving is paused before any session starts.
-    let rebootstrap_due = rebootstrap_pending(&cfg.data_dir)
-        || (snap.removed_by(&me).is_none() && store.call(|s| s.is_stale()).await?);
+    // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale.
+    // A removed node has nothing to rebuild (an interrupted run is dropped). Serving is
+    // paused before any session starts.
+    let removed_self = snap.removed_by(&me).is_some();
+    let dir = cfg.data_dir.clone();
+    let pending = tokio::task::spawn_blocking(move || read_rebootstrap(&dir))
+        .await
+        .map_err(join_err)??;
+    if removed_self && pending.is_some() {
+        warn!("this node was removed; dropping its interrupted re-bootstrap");
+        remove_rebootstrap(&cfg.data_dir)?;
+    }
+    let rebootstrap_due =
+        !removed_self && (pending.is_some() || store.call(|s| s.is_stale()).await?);
+    // The remembered peers of a resumed run: the emptied store holds no addresses.
+    let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
+        .filter(|_| rebootstrap_due)
+        .map(|f| f.peers)
+        .unwrap_or_default();
     store.refuse_writes_rebootstrapping(rebootstrap_due);
     let (membership, membership_rx) = watch::channel(Arc::new(snap));
     let membership = Arc::new(membership);
@@ -292,7 +309,7 @@ pub(crate) async fn start(
         },
         cancel.child_token(),
     );
-    for (id, addr) in hints {
+    for (id, addr) in hints.into_iter().chain(resume_peers.iter().cloned()) {
         peers.add_hint(id, addr);
     }
     let join = Arc::new(JoinInner::new(
@@ -335,6 +352,8 @@ pub(crate) async fn start(
     let mut first_rx = Some(events.subscribe());
     let mut reactor = Reactor::new(rctx.clone());
     reactor.rescan_logged(false).await;
+    let resume_ids: Vec<NodeId> = resume_peers.iter().map(|(id, _)| *id).collect();
+    peers.add_targets(&resume_ids);
     let mut reactor = Some(reactor);
 
     let mut tasks = JoinSet::new();

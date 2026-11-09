@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mesh_store::{Store, StoreError};
+use tokio::sync::RwLock;
 
 use crate::config::DynClock;
 use crate::error::NodeError;
@@ -19,6 +20,9 @@ pub struct StoreHandle(Arc<CoreStore>, Arc<Refuse>);
 struct Refuse {
     removed: AtomicBool,
     rebootstrapping: AtomicBool,
+    /// Every local write holds a read guard from its refusal check until its store call
+    /// has returned; [`StoreHandle::drain_writes`] takes the write side to wait them out.
+    gate: Arc<RwLock<()>>,
 }
 
 impl StoreHandle {
@@ -44,6 +48,13 @@ impl StoreHandle {
         self.1.rebootstrapping.store(on, Ordering::SeqCst);
     }
 
+    /// Waits until every local write that passed its refusal check has finished in the
+    /// store. After `refuse_writes_rebootstrapping(true)` and this, no own op can be
+    /// written until the refusal is lifted.
+    pub(crate) async fn drain_writes(&self) {
+        drop(self.1.gate.write().await);
+    }
+
     fn check_writable(&self) -> Result<(), NodeError> {
         if self.1.removed.load(Ordering::SeqCst) {
             return Err(NodeError::Removed);
@@ -60,8 +71,16 @@ impl StoreHandle {
         &self,
         f: impl FnOnce(&CoreStore) -> Result<(), StoreError> + Send + 'static,
     ) -> Result<(), NodeError> {
+        let guard = self.1.gate.clone().read_owned().await;
         self.check_writable()?;
-        self.call(f).await.map_err(|e| match e {
+        // The guard moves into the blocking call: it is released only once the write is
+        // done, even if this future is dropped meanwhile.
+        self.call(move |s| {
+            let _guard = guard;
+            f(s)
+        })
+        .await
+        .map_err(|e| match e {
             NodeError::Store(StoreError::Rebootstrapping) => NodeError::Rebootstrapping,
             e => e,
         })

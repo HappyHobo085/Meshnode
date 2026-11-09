@@ -199,6 +199,13 @@ impl<W: WallClock> Store<W> {
         meta_u64(&m, meta::LAST_FULL_SYNC_MS)
     }
 
+    /// The seq the next local write will use (kept by [`Store::reset_to_empty`]).
+    pub fn next_seq(&self) -> Result<u64, StoreError> {
+        let tx = self.db.begin_read()?;
+        let m = tx.open_table(META)?;
+        crate::meta_u64_req(&m, meta::NEXT_SEQ)
+    }
+
     /// The own-seq boundary recorded by `mark_full_sync` (`None` if never synced).
     pub fn synced_self_seq(&self) -> Result<Option<u64>, StoreError> {
         let tx = self.db.begin_read()?;

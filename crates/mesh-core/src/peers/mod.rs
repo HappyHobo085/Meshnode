@@ -39,7 +39,7 @@ use slot::run_slot;
 
 mod slot;
 use crate::sync::{PeerMetrics, SessionCmd};
-use crate::transport::{SHUTDOWN, node_id_of};
+use crate::transport::{Provisional, SHUTDOWN, node_id_of};
 
 /// Upper bound on one dial attempt.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,6 +124,8 @@ struct Shared {
     env: PeerEnv,
     cancel: CancellationToken,
     st: Mutex<PmState>,
+    /// A joiner's provisional targets (see [`Provisional`]); `set_targets` keeps them.
+    provisional: Provisional,
 }
 
 #[derive(Default)]
@@ -192,7 +194,34 @@ impl PeerManager {
             env,
             cancel,
             st: Mutex::new(PmState::default()),
+            provisional: Provisional::default(),
         }))
+    }
+
+    /// The provisional set this manager keeps targets for; the `sync/1` gate admits it too.
+    pub(crate) fn provisional(&self) -> Provisional {
+        self.0.provisional.clone()
+    }
+
+    /// A joiner's inviter and listed peers (spec §5.3 step 5): dialled, and kept as targets
+    /// and admitted by the gate although the snapshot does not list them, until
+    /// [`PeerManager::end_provisional`]. A no-op once that was called.
+    pub fn add_provisional(&self, ids: &[NodeId]) {
+        let mut st = self.lock();
+        if st.stopped || !self.0.provisional.add(ids) {
+            return;
+        }
+        for id in ids {
+            if *id != self.0.env.me && !st.slots.contains_key(id) {
+                self.spawn_slot(&mut st, *id, None);
+            }
+        }
+    }
+
+    /// The first sync completed: provisional targets are no longer kept; the next
+    /// `set_targets` (the caller triggers a rescan) drops those that are not members.
+    pub fn end_provisional(&self) {
+        self.0.provisional.end();
     }
 
     fn lock(&self) -> MutexGuard<'_, PmState> {
@@ -200,7 +229,8 @@ impl PeerManager {
     }
 
     /// Replaces the target set: new peers get a task, dropped peers' tasks stop (closing
-    /// with `SHUTDOWN`), and a changed address resets that peer's backoff.
+    /// with `SHUTDOWN`), and a changed address resets that peer's backoff. Provisional
+    /// targets (see [`PeerManager::add_provisional`]) are kept.
     pub fn set_targets(&self, targets: Vec<(NodeId, Option<NodeAddrBytes>)>) {
         let mut st = self.lock();
         if st.stopped {
@@ -209,8 +239,9 @@ impl PeerManager {
         let me = self.0.env.me;
         let want: HashMap<NodeId, Option<NodeAddrBytes>> =
             targets.into_iter().filter(|(id, _)| *id != me).collect();
+        let prov = &self.0.provisional;
         st.slots.retain(|id, slot| {
-            let keep = want.contains_key(id);
+            let keep = want.contains_key(id) || prov.contains(id);
             if !keep {
                 slot.token.cancel();
             }

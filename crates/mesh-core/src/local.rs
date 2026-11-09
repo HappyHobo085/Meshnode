@@ -110,6 +110,15 @@ pub fn write_genesis(dir: &Path, g: &MeshGenesis) -> Result<(), NodeError> {
     atomic_write(&dir.join(GENESIS_FILE), &bytes)
 }
 
+/// Deletes `mesh.json` (no error if it is already gone): a join whose node failed to start
+/// leaves the directory reusable with the same ticket.
+pub fn remove_genesis(dir: &Path) -> Result<(), NodeError> {
+    match std::fs::remove_file(dir.join(GENESIS_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InviteEntry {
     pub role: Role,

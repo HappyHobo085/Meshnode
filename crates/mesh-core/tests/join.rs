@@ -146,6 +146,27 @@ async fn join_retry_same_node_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_start_after_accept_leaves_dir_retryable() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, _) = founder(da.path()).await;
+    let ticket = a.invite(Role::Host, TTL).await.unwrap();
+    // A directory where the store file goes: the join is accepted but the node cannot start.
+    std::fs::create_dir(db.path().join("store.redb")).unwrap();
+    assert!(join(db.path(), "b", &ticket).await.is_err());
+    assert!(
+        !db.path().join("mesh.json").exists(),
+        "mesh.json is removed when the start fails"
+    );
+
+    std::fs::remove_dir(db.path().join("store.redb")).unwrap();
+    let b = join(db.path(), "b", &ticket).await.unwrap();
+    assert!(b.wait_first_sync(T).await);
+    converged(&[&a, &b], T).await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forged_ticket_wrong_genesis() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (a, _) = founder(da.path()).await;

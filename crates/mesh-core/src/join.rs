@@ -24,7 +24,9 @@ use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, JOIN_MAX_FRAME, read_frame, write_frame};
-use crate::local::{InviteEntry, Invites, load_or_create_key, read_genesis, write_genesis};
+use crate::local::{
+    InviteEntry, Invites, load_or_create_key, read_genesis, remove_genesis, write_genesis,
+};
 use crate::membership::{
     CONSUMED, MEMBERS, MESH_NS, MembershipSnapshot, addr_key, encode_addr, encode_info, info_key,
     member_bytes,
@@ -340,8 +342,21 @@ pub(crate) async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, 
     if !peers.iter().any(|(id, _)| *id == inviter_id) {
         peers.push((inviter_id, ticket.inviter.clone()));
     }
-    write_genesis(&cfg.data_dir, &genesis)?;
-    let node = start(cfg, key, genesis, peers).await?;
+    let dir = cfg.data_dir.clone();
+    write_genesis(&dir, &genesis)?;
+    let ids: Vec<NodeId> = peers.iter().map(|(id, _)| *id).collect();
+    let node = match start(cfg, key, genesis, peers).await {
+        Ok(node) => node,
+        Err(e) => {
+            // Leave the directory reusable with the same ticket (the join is idempotent).
+            if let Err(e) = remove_genesis(&dir) {
+                warn!(error = %e, "could not remove mesh.json after a failed start");
+            }
+            return Err(e);
+        }
+    };
+    // The empty store's snapshot knows only the founder: dial the listed peers too.
+    node.add_join_peers(&ids);
     node.spawn_publish_own();
     Ok(node)
 }

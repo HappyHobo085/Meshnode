@@ -192,11 +192,15 @@ async fn publish_addrs(
 }
 
 /// Emits `FirstSyncComplete` the first time any round completes (nothing is persisted).
+/// It also ends a joiner's provisional targets and triggers the rescan that drops those
+/// the now complete membership does not list.
 async fn first_sync(
     mut rx: broadcast::Receiver<NodeEvent>,
     events: broadcast::Sender<NodeEvent>,
     done: Arc<AtomicBool>,
     sticky: Arc<watch::Sender<bool>>,
+    peers: PeerManager,
+    rescan: Arc<Notify>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -206,6 +210,8 @@ async fn first_sync(
         };
         match r {
             Ok(NodeEvent::RoundComplete(_)) => {
+                peers.end_provisional();
+                rescan.notify_one();
                 sticky.send_replace(true);
                 if !done.swap(true, Ordering::SeqCst) {
                     let _ = events.send(NodeEvent::FirstSyncComplete);
@@ -326,7 +332,8 @@ pub(crate) async fn start(
     let router = Router::builder(endpoint.clone())
         .accept(
             ALPN_SYNC,
-            Gate::new(SyncHandler(peers.clone()), membership_rx.clone()),
+            Gate::new(SyncHandler(peers.clone()), membership_rx.clone())
+                .with_provisional(peers.provisional()),
         )
         .accept(
             iroh_blobs::ALPN,
@@ -376,14 +383,24 @@ pub(crate) async fn start(
     }));
     let first_sync_flag = Arc::new(watch::channel(false).0);
     let fsf = first_sync_flag.clone();
-    let (ev, done, c) = (
+    let (ev, done, pm, fl, c) = (
         events.clone(),
         Arc::new(AtomicBool::new(false)),
+        peers.clone(),
+        force_lagged.clone(),
         cancel.clone(),
     );
     tasks.spawn(supervise("first-sync", cancel.clone(), t, move || {
         let rx = first_rx.take().unwrap_or_else(|| ev.subscribe());
-        first_sync(rx, ev.clone(), done.clone(), fsf.clone(), c.clone())
+        first_sync(
+            rx,
+            ev.clone(),
+            done.clone(),
+            fsf.clone(),
+            pm.clone(),
+            fl.clone(),
+            c.clone(),
+        )
     }));
 
     let inner = Arc::new(Inner {
@@ -476,6 +493,12 @@ impl Node {
     /// Issues a single-use invite ticket valid for `ttl` (spec §5.2).
     pub async fn invite(&self, role: Role, ttl: Duration) -> Result<InviteTicket, NodeError> {
         self.inner.join.invite(role, ttl).await
+    }
+
+    /// After a join: dials the inviter and the peers its reply listed, admitting them before
+    /// the membership lists them, until the first sync completes (spec §5.3 step 5).
+    pub(crate) fn add_join_peers(&self, ids: &[NodeId]) {
+        self.inner.peers.add_provisional(ids);
     }
 
     /// After a join: writes `info/<self>` and `addr/<self>` once the first round completed.

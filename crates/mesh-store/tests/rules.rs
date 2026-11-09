@@ -688,6 +688,34 @@ fn acceptor_reads_the_store_inside_the_transaction() {
 }
 
 #[test]
+fn echoed_own_ops_raise_next_seq() {
+    // Same node key, fresh DB (DB loss / re-bootstrap): peers echo our seqs 1..=3.
+    let (dir, clock) = setup();
+    let old_dir = tempfile::tempdir().unwrap();
+    let old = store(old_dir.path(), 1, &clock);
+    let echoed = [
+        old.set("s", "k", b"1").unwrap(),
+        old.set("s", "k", b"2").unwrap(),
+        old.set("s", "k", b"3").unwrap(),
+    ];
+    let s = store(dir.path(), 1, &clock);
+    // Out of order, so seqs 2 and 3 come in through the drain.
+    for i in [2, 1, 0] {
+        s.apply(echoed[i].clone(), &AcceptAll).unwrap();
+    }
+    assert_eq!(s.vv_of(s.node_id()).unwrap(), 3);
+    assert_eq!(s.version_vector_local_seq(), 3);
+    let new = s.set("s", "k", b"4").unwrap();
+    assert_eq!(new.body.seq, 4);
+    assert_eq!(s.get("s", "k").unwrap(), Some(b"4".to_vec()));
+    // The echoed ops' rows are untouched (identical op => Duplicate, not Equivocation).
+    for op in echoed {
+        assert_eq!(s.apply(op, &AcceptAll).unwrap(), Outcome::Duplicate);
+    }
+    assert_eq!(s.apply(new, &AcceptAll).unwrap(), Outcome::Duplicate);
+}
+
+#[test]
 fn concurrent_writes_converge_in_any_order() {
     let (dir, clock) = setup();
     let a = store(dir.path(), 1, &clock);

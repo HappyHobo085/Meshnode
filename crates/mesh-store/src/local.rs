@@ -6,6 +6,7 @@ use crate::tables::{self, META, OPS, OpRow, VV, meta};
 use crate::{Store, keys, merge, meta_u64_req};
 use mesh_hlc::{Hlc, WallClock};
 use mesh_proto::{OpBody, Payload, SignedOp};
+use redb::ReadableTable;
 
 impl<W: WallClock> Store<W> {
     /// Sets `ns/key` to `value` with the empty order.
@@ -63,6 +64,18 @@ impl<W: WallClock> Store<W> {
             let m = tx.open_table(META)?;
             meta_u64_req(&m, meta::NEXT_SEQ)?
         };
+        // Never overwrite an existing own op (would be equivocation). Unreachable while
+        // apply raises `next_seq` for echoed own ops; kept as a guard.
+        if tx
+            .open_table(OPS)?
+            .get(keys::op_key(&self.node, seq).as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::corrupt(
+                "meta",
+                format!("next_seq {seq} is already used by a stored op"),
+            ));
+        }
         let next_seq = seq
             .checked_add(1)
             .ok_or_else(|| StoreError::corrupt("meta", "next_seq overflow"))?;

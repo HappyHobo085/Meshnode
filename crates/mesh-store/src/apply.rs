@@ -9,7 +9,7 @@
 
 use crate::error::StoreError;
 use crate::tables::{self, META, OPS, OpRow, PENDING, PendingRow, REG, REMOVED, SET, VV, meta};
-use crate::{Store, keys, merge, read};
+use crate::{Store, keys, merge, meta_u64_req, read};
 use mesh_hlc::{Clock, WallClock};
 use mesh_proto::{MeshId, NodeId, OpBody, Payload, SignedOp};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, WriteTransaction};
@@ -195,6 +195,8 @@ pub(crate) struct Pipeline<'a, W: WallClock> {
     clock: &'a mut Clock<W>,
     acc: &'a dyn Acceptor,
     mesh: MeshId,
+    /// This node: echoes of its own ops must raise `meta.next_seq`.
+    node: NodeId,
     /// Wall time at the start of the transaction (`received_ms`, `first_seen_ms`, merge time).
     now_ms: u64,
     pub(crate) changes: Vec<Change>,
@@ -207,6 +209,7 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         clock: &'a mut Clock<W>,
         acc: &'a dyn Acceptor,
         mesh: MeshId,
+        node: NodeId,
     ) -> Self {
         let now_ms = clock.wall().now_ms();
         Pipeline {
@@ -214,6 +217,7 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
             clock,
             acc,
             mesh,
+            node,
             now_ms,
             changes: Vec::new(),
             applied: 0,
@@ -295,7 +299,7 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
 
         // 4. Above a removed origin's cutoff: keep as invalid (covered), don't merge.
         if removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff) {
-            insert_op(self.tx, &op, self.now_ms, true)?;
+            self.record(&op, true)?;
             if seq == vv.saturating_add(1) {
                 vv_set(self.tx, &origin, seq)?;
             }
@@ -315,13 +319,32 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
 
         // 7. Merge, record, advance the vv.
         let changed = merge::merge_op(self.tx, &op, self.now_ms)?;
-        insert_op(self.tx, &op, self.now_ms, false)?;
+        self.record(&op, false)?;
         vv_set(self.tx, &origin, seq)?;
         if changed {
             self.changes.push(change_for(&op.body, false));
         }
         self.applied += 1;
         Ok(Outcome::Applied)
+    }
+
+    /// Inserts `op` into `ops`. If it is one of this node's own ops (echoed back after
+    /// a DB loss or re-bootstrap) at or above `next_seq`, raises `next_seq` past it in
+    /// the same transaction so a later local write never reuses its seq.
+    fn record(&mut self, op: &SignedOp, invalid: bool) -> Result<(), StoreError> {
+        insert_op(self.tx, op, self.now_ms, invalid)?;
+        if op.body.origin == self.node {
+            let mut m = self.tx.open_table(META)?;
+            if op.body.seq >= meta_u64_req(&m, meta::NEXT_SEQ)? {
+                let next = op
+                    .body
+                    .seq
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::corrupt("meta", "next_seq overflow"))?;
+                m.insert(meta::NEXT_SEQ.as_bytes(), keys::u64_value(next).as_slice())?;
+            }
+        }
+        Ok(())
     }
 
     fn defer(
@@ -440,7 +463,7 @@ impl<W: WallClock> Store<W> {
         let mut clock = self.lock_clock();
         let tx = self.db.begin_write()?;
         let (out, changes) = {
-            let mut p = Pipeline::new(&tx, &mut clock, acc, self.mesh);
+            let mut p = Pipeline::new(&tx, &mut clock, acc, self.mesh, self.node);
             let out = p.admit(op)?;
             (out, p.changes)
         };
@@ -462,7 +485,7 @@ impl<W: WallClock> Store<W> {
         let mut clock = self.lock_clock();
         let tx = self.db.begin_write()?;
         let (applied, changes) = {
-            let mut p = Pipeline::new(&tx, &mut clock, acc, self.mesh);
+            let mut p = Pipeline::new(&tx, &mut clock, acc, self.mesh, self.node);
             p.retry_all()?;
             (p.applied, p.changes)
         };

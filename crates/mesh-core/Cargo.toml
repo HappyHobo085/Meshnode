@@ -22,6 +22,7 @@ iroh-blobs = { workspace = true, features = ["fs-store"] }
 bytes.workspace = true
 rand.workspace = true
 blake3.workspace = true
+n0-future = "0.3"
 tokio-util.workspace = true
 
 [target.'cfg(windows)'.dependencies]

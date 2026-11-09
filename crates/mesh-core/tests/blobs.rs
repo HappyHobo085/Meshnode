@@ -9,7 +9,7 @@ use bytes::Bytes;
 use common::{T, test_cfg, wait_until};
 use iroh::endpoint::ConnectionError;
 use mesh_core::transport::{NOT_MEMBER, build_endpoint};
-use mesh_core::{BlobHash, Node, NodeError};
+use mesh_core::{BlobHash, BlobKind, Node, NodeError};
 use mesh_proto::Role;
 use tokio::time::timeout;
 
@@ -202,4 +202,89 @@ async fn plain_blob_of_hash_size_is_not_a_collection() {
     assert!(matches!(r, Err(NodeError::BlobUnavailable)), "{r:?}");
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pins_lists_raw_and_collection() {
+    let da = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(da.path(), "a").0).await.unwrap();
+    assert!(a.blobs().pins().await.unwrap().is_empty());
+    let raw = a.blobs().add_bytes(data(1000)).await.unwrap();
+    let coll = a
+        .blobs()
+        .add_named_for_test(vec![("f.txt".into(), data(77))])
+        .await
+        .unwrap();
+    let mut pins = a.blobs().pins().await.unwrap();
+    pins.sort_by_key(|(h, _)| *h);
+    let mut want = vec![(raw, BlobKind::Raw), (coll, BlobKind::Collection)];
+    want.sort_by_key(|(h, _)| *h);
+    assert_eq!(pins, want);
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_deletes_unpinned_data() {
+    let da = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(da.path(), "a").0).await.unwrap();
+    let keep = a.blobs().add_bytes(data(2000)).await.unwrap();
+    let gone = a.blobs().add_bytes(data(3000)).await.unwrap();
+    timeout(T, a.blobs().remove(gone))
+        .await
+        .expect("remove timed out")
+        .unwrap();
+    assert!(!a.blobs().has(gone).await.unwrap());
+    assert!(!a.blobs().is_pinned(gone).await.unwrap());
+    let pins = a.blobs().pins().await.unwrap();
+    assert_eq!(pins, vec![(keep, BlobKind::Raw)]);
+    assert!(a.blobs().has(keep).await.unwrap());
+    // Removing again, or removing something never stored, is Ok.
+    timeout(T, a.blobs().remove(gone))
+        .await
+        .expect("second remove timed out")
+        .unwrap();
+    a.blobs()
+        .remove(BlobHash::new(b"never stored"))
+        .await
+        .unwrap();
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_collection_keeps_shared_child() {
+    let da = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(da.path(), "a").0).await.unwrap();
+    let shared = data(5000);
+    let c1 = a
+        .blobs()
+        .add_named_for_test(vec![
+            ("shared.bin".into(), shared.clone()),
+            ("only1.bin".into(), data(111)),
+        ])
+        .await
+        .unwrap();
+    let c2 = a
+        .blobs()
+        .add_named_for_test(vec![
+            ("shared.bin".into(), shared.clone()),
+            ("only2.bin".into(), data(222)),
+        ])
+        .await
+        .unwrap();
+    let only1 = BlobHash::new(data(111));
+    let shared_h = BlobHash::new(&shared);
+    assert!(a.blobs().has(only1).await.unwrap());
+    timeout(T, a.blobs().remove(c1))
+        .await
+        .expect("remove timed out")
+        .unwrap();
+    assert!(!a.blobs().has(c1).await.unwrap());
+    assert!(!a.blobs().has(only1).await.unwrap(), "unshared child gone");
+    assert!(a.blobs().has(shared_h).await.unwrap(), "shared child kept");
+    assert!(a.blobs().has_collection(c2).await.unwrap());
+    assert_eq!(
+        a.blobs().pins().await.unwrap(),
+        vec![(c2, BlobKind::Collection)]
+    );
+    a.shutdown().await;
 }

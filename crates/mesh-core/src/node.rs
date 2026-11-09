@@ -111,6 +111,81 @@ pub(crate) struct Inner {
     lose_events: Arc<AtomicBool>,
 }
 
+impl Inner {
+    fn members(&self) -> Vec<MemberStatus> {
+        let snap = self.membership.borrow().clone();
+        snap.members()
+            .map(|(id, m)| {
+                let mut s = MemberStatus {
+                    id: *id,
+                    role: m.role,
+                    info: m.info.clone(),
+                    effective: snap.is_effective(id),
+                    online: *id == self.me,
+                    rtt_ms: None,
+                    last_seen_ms: None,
+                    lag: 0,
+                };
+                if *id != self.me {
+                    if let Some(rtt) = self.peers.link(id) {
+                        s.online = true;
+                        s.rtt_ms = rtt;
+                    }
+                    if let Some(mx) = self.peers.metrics(id) {
+                        let seen = mx.last_seen_ms.load(Ordering::SeqCst);
+                        s.last_seen_ms = (seen != 0).then_some(seen);
+                        s.lag = mx.lag.load(Ordering::SeqCst);
+                    }
+                }
+                s
+            })
+            .collect()
+    }
+
+    fn status(&self) -> NodeStatus {
+        self.status.borrow().clone()
+    }
+}
+
+/// A non-owning, cloneable handle to a running [`Node`], for services that must neither
+/// keep the node running nor stop it: dropping a handle never cancels anything. A handle
+/// that outlives [`Node::shutdown`] keeps the store file open until it is dropped.
+#[derive(Clone)]
+pub struct NodeHandle {
+    inner: Arc<Inner>,
+}
+
+impl NodeHandle {
+    pub fn node_id(&self) -> NodeId {
+        self.inner.me
+    }
+
+    pub fn mesh(&self) -> MeshId {
+        self.inner.genesis.mesh_id()
+    }
+
+    pub fn store(&self) -> &StoreHandle {
+        &self.inner.store
+    }
+
+    pub fn blobs(&self) -> &Blobs {
+        &self.inner.blobs
+    }
+
+    pub fn members(&self) -> Vec<MemberStatus> {
+        self.inner.members()
+    }
+
+    pub fn status(&self) -> NodeStatus {
+        self.inner.status()
+    }
+
+    /// Resolves once the node is cancelled: shut down, or its owning `Node` dropped.
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.cancel.clone().cancelled_owned()
+    }
+}
+
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -577,38 +652,18 @@ impl Node {
 
     /// Every member of the mesh, with this node's view of its link.
     pub fn members(&self) -> Vec<MemberStatus> {
-        let snap = self.inner.membership.borrow().clone();
-        let peers = &self.inner.peers;
-        snap.members()
-            .map(|(id, m)| {
-                let mut s = MemberStatus {
-                    id: *id,
-                    role: m.role,
-                    info: m.info.clone(),
-                    effective: snap.is_effective(id),
-                    online: *id == self.inner.me,
-                    rtt_ms: None,
-                    last_seen_ms: None,
-                    lag: 0,
-                };
-                if *id != self.inner.me {
-                    if let Some(rtt) = peers.link(id) {
-                        s.online = true;
-                        s.rtt_ms = rtt;
-                    }
-                    if let Some(mx) = peers.metrics(id) {
-                        let seen = mx.last_seen_ms.load(Ordering::SeqCst);
-                        s.last_seen_ms = (seen != 0).then_some(seen);
-                        s.lag = mx.lag.load(Ordering::SeqCst);
-                    }
-                }
-                s
-            })
-            .collect()
+        self.inner.members()
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.inner.status.borrow().clone()
+        self.inner.status()
+    }
+
+    /// A cloneable, non-owning view of this node. Dropping it never cancels anything.
+    pub fn handle(&self) -> NodeHandle {
+        NodeHandle {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Reads and local writes; local writes fail with `Removed` once this node is removed.

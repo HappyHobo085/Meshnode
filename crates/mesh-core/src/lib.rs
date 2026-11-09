@@ -22,10 +22,10 @@ pub mod transport;
 #[cfg(windows)]
 mod winfs;
 
-pub use blobs::{BlobHash, Blobs};
+pub use blobs::{BlobHash, BlobKind, Blobs};
 pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
 pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;
 pub use maint::MaintJob;
-pub use node::{MemberStatus, Node, NodeStatus};
+pub use node::{MemberStatus, Node, NodeHandle, NodeStatus};

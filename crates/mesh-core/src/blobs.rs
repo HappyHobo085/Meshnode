@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::Endpoint;
@@ -15,9 +16,12 @@ use iroh_blobs::format::collection::Collection;
 use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options;
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use mesh_proto::NodeId;
+use n0_future::StreamExt;
 use tokio::sync::watch;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::error::NodeError;
@@ -32,8 +36,92 @@ const DIR: &str = "blobs";
 /// A collection root (32 bytes per entry) larger than this is not loaded.
 const MAX_COLLECTION_ROOT: u64 = 16 << 20;
 
+const PIN_PREFIX: &str = "meshnode/pin/";
+/// How often iroh-blobs' GC loop wakes (it only marks, and aborts unless `remove` armed it).
+const GC_TICK: Duration = Duration::from_secs(1);
+/// How long `remove` waits for its sweep (a few ticks plus the sweep itself).
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What a pin protects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobKind {
+    /// A plain blob.
+    Raw,
+    /// A collection root and its children.
+    Collection,
+}
+
 fn pin_tag(hash: &Hash) -> String {
-    format!("meshnode/pin/{hash}")
+    format!("{PIN_PREFIX}{hash}")
+}
+
+/// Coordinates `remove` with iroh-blobs' GC loop, which is the only public way to delete
+/// data. The loop wakes every [`GC_TICK`]; its protect callback (run after the mark phase,
+/// before the sweep) aborts the run unless a `remove` armed it, so nothing untagged is
+/// ever deleted otherwise.
+#[derive(Default)]
+struct Sweep {
+    /// Serialises `remove` calls.
+    lock: tokio::sync::Mutex<()>,
+    state: watch::Sender<SweepState>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SweepState {
+    /// 0 idle; 1 armed, but a run already past its mark phase may still call back (it may
+    /// have read the tags before the pin was deleted); 2 the next run's mark began after
+    /// arming, so that run sweeps.
+    phase: u8,
+    /// Callback invocations so far.
+    ticks: u64,
+    /// The tick that let a sweep proceed.
+    swept_at: u64,
+}
+
+impl Sweep {
+    /// The GC loop's protect callback.
+    fn on_run(&self) -> ProtectOutcome {
+        let mut out = ProtectOutcome::Abort;
+        self.state.send_modify(|s| {
+            s.ticks += 1;
+            match s.phase {
+                1 => s.phase = 2,
+                2 => {
+                    s.phase = 0;
+                    s.swept_at = s.ticks;
+                    out = ProtectOutcome::Continue;
+                }
+                _ => {}
+            }
+        });
+        out
+    }
+
+    /// Waits until a full GC run that started after this call has swept.
+    async fn run_sweep(&self) -> Result<(), NodeError> {
+        let _g = self.lock.lock().await;
+        let mut rx = self.state.subscribe();
+        let before = self.state.borrow().swept_at;
+        self.state.send_modify(|s| s.phase = 1);
+        let wait = async {
+            let at = rx
+                .wait_for(|s| s.swept_at > before)
+                .await
+                .map_err(err)?
+                .swept_at;
+            // The run that swept ends before the next one calls back.
+            rx.wait_for(|s| s.ticks > at).await.map_err(err)?;
+            Ok(())
+        };
+        let r = match timeout(SWEEP_TIMEOUT, wait).await {
+            Ok(r) => r,
+            Err(_) => Err(err("blob sweep timed out")),
+        };
+        if r.is_err() {
+            self.state.send_modify(|s| s.phase = 0);
+        }
+        r
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> NodeError {
@@ -72,6 +160,7 @@ pub struct Blobs {
     store: FsStore,
     downloader: Downloader,
     source: PeerSource,
+    sweep: Arc<Sweep>,
 }
 
 impl Blobs {
@@ -82,7 +171,17 @@ impl Blobs {
     ) -> Result<Blobs, NodeError> {
         let root = data_dir.join(DIR);
         let mut opts = Options::new(&root);
-        opts.gc = None; // spec §8: iroh-blobs GC stays off
+        // spec §8: iroh-blobs never collects on its own. Its loop only wakes to let
+        // `remove` run a sweep (see `Sweep`); every other run aborts.
+        let sweep = Arc::new(Sweep::default());
+        let cb = sweep.clone();
+        opts.gc = Some(GcConfig {
+            interval: GC_TICK,
+            add_protected: Some(Arc::new(move |_live| {
+                let out = cb.on_run();
+                Box::pin(async move { out })
+            })),
+        });
         let store = FsStore::load_with_opts(root.join("blobs.db"), opts)
             .await
             .map_err(err)?;
@@ -91,6 +190,7 @@ impl Blobs {
             store,
             downloader,
             source,
+            sweep,
         })
     }
 
@@ -122,6 +222,49 @@ impl Blobs {
     pub async fn is_pinned(&self, hash: Hash) -> Result<bool, NodeError> {
         let t = self.api().tags().get(pin_tag(&hash)).await.map_err(err)?;
         Ok(t.is_some_and(|t| t.hash == hash))
+    }
+
+    /// Every pin tag as (hash, kind).
+    pub async fn pins(&self) -> Result<Vec<(Hash, BlobKind)>, NodeError> {
+        let mut tags = Box::pin(
+            self.api()
+                .tags()
+                .list_prefix(PIN_PREFIX)
+                .await
+                .map_err(err)?,
+        );
+        let mut out = Vec::new();
+        while let Some(t) = tags.next().await {
+            let t = t.map_err(err)?;
+            let kind = if t.format == BlobFormat::Raw {
+                BlobKind::Raw
+            } else {
+                BlobKind::Collection
+            };
+            out.push((t.hash, kind));
+        }
+        Ok(out)
+    }
+
+    /// Drops the pin on `hash` and deletes its data; for a collection also the children no
+    /// other pin references. Ok if there is nothing to remove.
+    ///
+    /// iroh-blobs 0.104 has no public delete: blobs are deleted only by its GC, which
+    /// deletes everything untagged. So this deletes the pin tag, then lets one GC run
+    /// (started after the tag is gone) sweep; anything still tagged survives, including a
+    /// collection's children shared with another pin. It takes a few seconds. Data that is
+    /// untagged at that moment (an unfinished fetch) goes too and is fetched again later.
+    pub async fn remove(&self, hash: Hash) -> Result<(), NodeError> {
+        let deleted = self
+            .api()
+            .tags()
+            .delete(pin_tag(&hash))
+            .await
+            .map_err(err)?;
+        if deleted == 0 && !self.root_complete(hash).await? {
+            return Ok(());
+        }
+        self.sweep.run_sweep().await
     }
 
     pub async fn add_bytes(&self, bytes: Bytes) -> Result<Hash, NodeError> {

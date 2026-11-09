@@ -2242,6 +2242,7 @@ dependencies = [
  "mesh-hlc",
  "mesh-proto",
  "mesh-store",
+ "n0-future",
  "postcard",
  "rand 0.9.5",
  "serde",

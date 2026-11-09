@@ -89,7 +89,7 @@ pub struct Node {
 
 pub(crate) struct Inner {
     pub(crate) cfg: NodeConfig,
-    genesis: MeshGenesis,
+    pub(crate) genesis: MeshGenesis,
     pub(crate) me: NodeId,
     pub(crate) endpoint: Endpoint,
     router: Router,

@@ -596,3 +596,53 @@ async fn local_writes_race_rebootstrap_start() {
         timeout(T, n.shutdown()).await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebootstrap_waits_for_own_membership_before_reapply() {
+    let t = trio().await;
+    let (a, b, c) = (&t.a, &t.b, &t.c);
+    let (ia, ib, ic) = (a.node_id(), b.node_id(), c.node_id());
+    a.partition(&[ib, ic]);
+    b.partition(&[ia]);
+    c.partition(&[ia]);
+    wait_until("A cut off", T, || async {
+        !online(a, ib) && !online(a, ic) && !online(b, ia) && !online(c, ia)
+    })
+    .await;
+    a.store().set(NS, "offline", b"1".to_vec()).await.unwrap();
+    // s == 0: step 4 holds at once after the reset, before this node's `members` record
+    // (written by B) is back, so the re-applied own ops are held back as `UnknownOrigin`.
+    a.store()
+        .call(|s| s.__test_set_meta_u64("synced_self_seq", 0))
+        .await
+        .unwrap();
+    let day0 = t.clocks[1].now();
+    for d in [40, 81] {
+        for clock in &t.clocks {
+            clock.set(day0 + d * DAY);
+        }
+        full_sync_since(b, day0 + d * DAY).await;
+        full_sync_since(c, day0 + d * DAY).await;
+    }
+
+    let mut events = a.subscribe();
+    heal_all(&t).await;
+    common::wait_event(&mut events, |e| *e == NodeEvent::RebootstrapDone, T).await;
+    assert_eq!(a.status(), NodeStatus::Running);
+    // The unsynced edit was neither dropped nor covered over: it reaches every node.
+    converged(&[a, b, c], T).await;
+    for n in [a, b, c] {
+        assert_eq!(val(n, "offline").await, Some(b"1".to_vec()), "n/offline");
+    }
+    a.store().set(NS, "after", b"1".to_vec()).await.unwrap();
+    wait_until("A's later write reaches B", T, || async {
+        val(b, "after").await.is_some()
+    })
+    .await;
+    let Trio {
+        a, b, c, dirs: _d, ..
+    } = t;
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}

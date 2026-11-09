@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use mesh_proto::{NodeId, Payload};
+use mesh_proto::{NodeId, Payload, Role};
 use mesh_store::SyncItem;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{MissedTickBehavior, sleep};
@@ -24,6 +24,7 @@ use crate::events::NodeEvent;
 use crate::local::{
     RebootstrapFile, append_expired_edits, read_rebootstrap, remove_rebootstrap, write_rebootstrap,
 };
+use crate::membership::{MEMBERS, MESH_NS, member_bytes};
 use crate::node::{Inner, NodeStatus, publish_addr};
 
 /// How often step 4 re-checks `vv[self]` besides each `RoundComplete` (events are lossy).
@@ -155,46 +156,35 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
         return Ok(());
     }
 
-    // 4. Rounds (a pull: nothing is served) until a peer gave back the synced own ops.
-    match wait_for_self_seq(inner, s).await? {
-        Wait::Reached => {}
-        Wait::Stopped => return Ok(()),
-        Wait::Removed => {
-            // Nothing left to rebuild: the node is stopped for good (spec §3.3 step 6).
-            warn!("this node was removed during its re-bootstrap; abandoning it");
-            blocking(move || remove_rebootstrap(&dir)).await?;
-            inner.store.refuse_writes_rebootstrapping(false);
-            inner.serve_paused.store(false, Ordering::SeqCst);
-            return Ok(());
+    // 4. Rounds (a pull: nothing is served) until a peer gave back the synced own ops and
+    // this node's `members` record (without it the re-applied own ops would be held back).
+    // 5. Then re-apply the export; retried until every exported op was accepted.
+    let items = Arc::new(file.items);
+    loop {
+        match wait_for_self_seq(inner, s).await? {
+            Wait::Reached => {}
+            Wait::Stopped => return Ok(()),
+            Wait::Removed => {
+                // Nothing left to rebuild: the node is stopped for good (spec §3.3 step 6).
+                warn!("this node was removed during its re-bootstrap; abandoning it");
+                blocking(move || remove_rebootstrap(&dir)).await?;
+                inner.store.refuse_writes_rebootstrapping(false);
+                inner.serve_paused.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
         }
+        if reapply(inner, items.clone(), file.last_seq).await? {
+            break;
+        }
+        // `rebootstrap.bin` stays: a crash now resumes and re-applies again.
+        warn!("some re-applied own ops were held back; retrying");
+        tokio::select! {
+            _ = inner.cancel.cancelled() => return Ok(()),
+            _ = sleep(CHECK_EVERY) => {}
+        }
+        let acc = inner.acc.clone();
+        inner.store.call(move |st| st.retry_pending(&*acc)).await?;
     }
-
-    // 5. Covered markers and ops, in export order (a marker may follow ops), then a
-    // marker up to the last own seq used: a trailing expired or compacted op leaves a hole
-    // the export has no marker for, and local writes need `vv[self] == next_seq - 1`.
-    let (acc, me, last_seq) = (inner.acc.clone(), inner.me, file.last_seq);
-    let items = file.items;
-    inner
-        .store
-        .call(move |st| {
-            let mut ops = Vec::new();
-            for item in items {
-                match item {
-                    SyncItem::Op(op) => ops.push(op),
-                    SyncItem::Covered { origin, upto } => {
-                        st.apply_batch(std::mem::take(&mut ops), &*acc)?;
-                        // Trusted local data: the marker is its own bound.
-                        st.apply_covered(origin, upto, upto, &*acc)?;
-                    }
-                }
-            }
-            st.apply_batch(ops, &*acc)?;
-            if last_seq > 0 {
-                st.apply_covered(me, last_seq, last_seq, &*acc)?;
-            }
-            Ok(())
-        })
-        .await?;
 
     // 6. Own edits too old to re-apply (R19).
     if !file.expired.is_empty() {
@@ -237,6 +227,54 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Step 5: the export's ops and `Covered` markers in export order (a marker may follow
+/// ops), then a marker up to the last own seq used (a trailing expired or compacted op
+/// leaves a hole the export has no marker for, and local writes need
+/// `vv[self] == next_seq - 1`). A self marker drops every pending own op below it, so one is
+/// applied only once `vv[self]` covers every exported op before it; otherwise this stops
+/// and returns false (re-applying again later is harmless).
+async fn reapply(
+    inner: &Inner,
+    items: Arc<Vec<SyncItem>>,
+    last_seq: u64,
+) -> Result<bool, NodeError> {
+    let (acc, me) = (inner.acc.clone(), inner.me);
+    inner
+        .store
+        .call(move |st| {
+            let mut ops = Vec::new();
+            // The highest exported op seq seen so far.
+            let mut highest = 0;
+            let covered = |st: &crate::db::CoreStore, ops: &mut Vec<_>, highest: u64| {
+                st.apply_batch(std::mem::take(ops), &*acc)?;
+                Ok::<_, mesh_store::StoreError>(st.version_vector()?.get(&me) >= highest)
+            };
+            for item in items.iter() {
+                match item {
+                    SyncItem::Op(op) => {
+                        highest = highest.max(op.body.seq);
+                        ops.push(op.clone());
+                    }
+                    SyncItem::Covered { origin, upto } => {
+                        if !covered(st, &mut ops, highest)? {
+                            return Ok(false);
+                        }
+                        // Trusted local data: the marker is its own bound.
+                        st.apply_covered(*origin, *upto, *upto, &*acc)?;
+                    }
+                }
+            }
+            if !covered(st, &mut ops, highest)? {
+                return Ok(false);
+            }
+            if last_seq > 0 {
+                st.apply_covered(me, last_seq, last_seq, &*acc)?;
+            }
+            Ok(true)
+        })
+        .await
+}
+
 /// Stops serving, refuses local writes until the re-bootstrap is done, and waits for the
 /// local writes already admitted to finish.
 async fn pause(inner: &Inner) {
@@ -261,26 +299,44 @@ fn resume_serving(inner: &Inner) {
     }
 }
 
-/// Waits until `vv[self] >= s`, checking after each completed round, each status change
+/// Waits until `vv[self] >= s` and this node's `members` record is back, checking after each completed round, each status change
 /// and every [`CHECK_EVERY`]; gives up if the node stops or is removed meanwhile.
 async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
-    let me = inner.me;
+    let (me, founder) = (inner.me, inner.genesis.founder);
     let mut events = inner.events.subscribe();
     let mut status = inner.status.subscribe();
     let mut poll = tokio::time::interval(CHECK_EVERY);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let have = inner
+        let (have, member) = inner
             .store
-            .call(move |st| Ok(st.version_vector()?.get(&me)))
+            .call(move |st| {
+                let member = me == founder
+                    || [Role::Host, Role::Client]
+                        .into_iter()
+                        .try_fold(false, |found, role| {
+                            Ok::<_, mesh_store::StoreError>(
+                                found
+                                    || st.set_contains(
+                                        MESH_NS,
+                                        MEMBERS,
+                                        &member_bytes(&me, role),
+                                    )?,
+                            )
+                        })?;
+                Ok((st.version_vector()?.get(&me), member))
+            })
             .await?;
         if matches!(*status.borrow_and_update(), NodeStatus::Removed { .. }) {
             return Ok(Wait::Removed);
         }
-        if have >= s {
+        if have >= s && member {
             return Ok(Wait::Reached);
         }
-        debug!(have, s, "waiting for this node's synced ops");
+        debug!(
+            have,
+            s, member, "waiting for this node's synced ops and members record"
+        );
         loop {
             tokio::select! {
                 _ = inner.cancel.cancelled() => return Ok(Wait::Stopped),

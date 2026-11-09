@@ -95,6 +95,8 @@ struct Inner {
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     invites: Arc<Mutex<Invites>>,
     join: Arc<JoinInner>,
+    /// Sticky: true once any round has completed since start.
+    first_sync: Arc<watch::Sender<bool>>,
     membership: Arc<watch::Sender<Arc<MembershipSnapshot>>>,
     peers: PeerManager,
     events: broadcast::Sender<NodeEvent>,
@@ -193,6 +195,7 @@ async fn first_sync(
     mut rx: broadcast::Receiver<NodeEvent>,
     events: broadcast::Sender<NodeEvent>,
     done: Arc<AtomicBool>,
+    sticky: Arc<watch::Sender<bool>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -202,6 +205,7 @@ async fn first_sync(
         };
         match r {
             Ok(NodeEvent::RoundComplete(_)) => {
+                sticky.send_replace(true);
                 if !done.swap(true, Ordering::SeqCst) {
                     let _ = events.send(NodeEvent::FirstSyncComplete);
                 }
@@ -342,6 +346,8 @@ pub(crate) async fn start(
     tasks.spawn(supervise("addr", cancel.clone(), t.clone(), move || {
         publish_addrs(ep.clone(), st.clone(), me, c.clone())
     }));
+    let first_sync_flag = Arc::new(watch::channel(false).0);
+    let fsf = first_sync_flag.clone();
     let (ev, done, c) = (
         events.clone(),
         Arc::new(AtomicBool::new(false)),
@@ -349,7 +355,7 @@ pub(crate) async fn start(
     );
     tasks.spawn(supervise("first-sync", cancel.clone(), t, move || {
         let rx = first_rx.take().unwrap_or_else(|| ev.subscribe());
-        first_sync(rx, ev.clone(), done.clone(), c.clone())
+        first_sync(rx, ev.clone(), done.clone(), fsf.clone(), c.clone())
     }));
     tasks.spawn(stale_hook(stale_rx, cancel.clone()));
 
@@ -364,6 +370,7 @@ pub(crate) async fn start(
             acc,
             invites,
             join,
+            first_sync: first_sync_flag,
             membership,
             peers,
             events,
@@ -438,6 +445,20 @@ impl Node {
         let genesis = read_genesis(&cfg.data_dir)?.ok_or(NodeError::NotInitialised)?;
         let key = load_or_create_key(&cfg.data_dir)?;
         start(cfg, key, genesis, Vec::new()).await
+    }
+
+    /// Whether a sync round has completed since this node started (sticky; no race with
+    /// `subscribe`).
+    pub fn first_sync_complete(&self) -> bool {
+        *self.inner.first_sync.borrow()
+    }
+
+    /// Waits until [`Node::first_sync_complete`] holds; false if `limit` passes first.
+    pub async fn wait_first_sync(&self, limit: Duration) -> bool {
+        let mut rx = self.inner.first_sync.subscribe();
+        timeout(limit, rx.wait_for(|done| *done))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 
     pub fn node_id(&self) -> NodeId {

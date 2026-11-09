@@ -166,7 +166,17 @@ impl JoinInner {
             .await?;
         // A retry after a lost reply: the same node redeeming the same ticket again.
         let retry = entry.redeemed_by == Some(joiner);
-        if (consumed || entry.redeemed_by.is_some()) && !retry {
+        // A crash between the store writes and `set_redeemed` leaves the token consumed and
+        // the joiner a member, but unmarked; the same joiner's retry completes it.
+        let member = member_bytes(&joiner, entry.role).to_vec();
+        let m = member.clone();
+        let half_done = consumed
+            && entry.redeemed_by.is_none()
+            && self
+                .store
+                .call(move |s| s.set_contains(MESH_NS, MEMBERS, &m))
+                .await?;
+        if consumed && !retry && !half_done {
             return refuse(RefuseReason::Used);
         }
         if !self.running() || !snap.is_effective(&self.me) {
@@ -175,9 +185,8 @@ impl JoinInner {
 
         if !retry {
             // Store writes first, then the redemption mark, then (in `serve`) the reply.
-            self.store
-                .set_add(MESH_NS, MEMBERS, member_bytes(&joiner, entry.role).to_vec())
-                .await?;
+            // All three writes are idempotent, so completing a half-done join re-applies them.
+            self.store.set_add(MESH_NS, MEMBERS, member).await?;
             self.store.set_add(MESH_NS, CONSUMED, hash.to_vec()).await?;
             self.store
                 .set(MESH_NS, &info_key(&joiner), encode_info(&req.info))

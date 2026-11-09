@@ -66,6 +66,11 @@ async fn create_then_invite_join() {
     let mut cfg = cfg;
     cfg.tags = vec!["laptop".into()];
     let b = timeout(T, Node::join(cfg, ticket)).await.unwrap().unwrap();
+    assert!(
+        b.wait_first_sync(Duration::from_secs(5)).await,
+        "FirstSyncComplete"
+    );
+    assert!(b.first_sync_complete());
     assert_eq!(b.mesh(), a.mesh());
     converged(&[&a, &b], T).await;
     wait_until("B's info in A's members()", T, || async {
@@ -186,6 +191,43 @@ async fn client_role_invite_records_client() {
             .any(|m| m.id == b.node_id() && m.role == Role::Client)
     })
     .await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_after_inviter_crash_before_redeemed() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, _) = founder(da.path()).await;
+    let ticket = a.invite(Role::Host, TTL).await.unwrap();
+    // The joiner's identity is its node.key, which exists before it joins.
+    let b_id = mesh_proto::NodeId(
+        mesh_core::local::load_or_create_key(db.path())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    // The inviter wrote members + consumed, then crashed before `redeemed_by`.
+    a.store()
+        .set_add(
+            MESH_NS,
+            MEMBERS,
+            mesh_core::membership::member_bytes(&b_id, Role::Host).to_vec(),
+        )
+        .await
+        .unwrap();
+    a.store()
+        .set_add(
+            MESH_NS,
+            mesh_core::membership::CONSUMED,
+            blake3::hash(&ticket.token).as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+    let b = join(db.path(), "b", &ticket).await.unwrap();
+    assert_eq!(b.node_id(), b_id);
+    converged(&[&a, &b], T).await;
+    assert_eq!(member_records(&a, &b_id).await.len(), 1);
     a.shutdown().await;
     b.shutdown().await;
 }

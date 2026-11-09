@@ -155,6 +155,91 @@ where
     Ok(false)
 }
 
+/// Live keys of `ns` starting with `prefix` in `reg` (read or write table), sorted,
+/// strictly after `start_after` (which need not exist), at most `limit`.
+pub(crate) fn list_keys_in<T>(
+    reg: &T,
+    ns: &str,
+    prefix: &str,
+    start_after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<String>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let mut out = Vec::new();
+    if limit == 0 || has_nul(ns) || has_nul(prefix) {
+        return Ok(out);
+    }
+    let mut within = keys::ns_prefix(ns);
+    within.extend_from_slice(prefix.as_bytes());
+    let mut start = within.clone();
+    if let Some(after) = start_after {
+        // Stored keys contain no NUL, so "after `x\0…`" is the same as "after `x`".
+        let after = after.split('\0').next().unwrap_or("");
+        // Every row of a key > `after` sorts at or above `ns ‖ 0 ‖ after ‖ 0x01`,
+        // and every row of `after` itself (`ns ‖ 0 ‖ after ‖ 0 ‖ origin`) below it.
+        let mut s = keys::ns_prefix(ns);
+        s.extend_from_slice(after.as_bytes());
+        s.push(1);
+        start = start.max(s);
+    }
+    scan_reg_winners(reg, &start, &within, |_, key, _, row| {
+        if row.value.is_some() {
+            out.push(utf8("reg", key)?);
+        }
+        Ok(out.len() < limit as usize)
+    })?;
+    Ok(out)
+}
+
+/// Members of `ns/set` in `table` (read or write `set` table), byte-sorted, strictly
+/// after `start_after`, at most `limit`.
+///
+/// Rows are keyed `member ‖ origin`, so a member's rows can sort after a longer member
+/// that extends it; this scans every row of the set at or above `start_after` and keeps
+/// the `limit` smallest members.
+pub(crate) fn set_members_in<T>(
+    table: &T,
+    ns: &str,
+    set: &str,
+    start_after: Option<&[u8]>,
+    limit: u32,
+) -> Result<Vec<Vec<u8>>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    if limit == 0 || has_nul(ns) || has_nul(set) {
+        return Ok(Vec::new());
+    }
+    let prefix = keys::item_prefix(ns, set);
+    let mut start = prefix.clone();
+    if let Some(after) = start_after {
+        // Every row of a member > `after` sorts at or above `prefix ‖ after`.
+        start.extend_from_slice(after);
+    }
+    let mut best: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for item in table.range::<&[u8]>(start.as_slice()..)? {
+        let (k, _) = item?;
+        let k = k.value();
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        let member = keys::split_set_key(k)?.member;
+        if start_after.is_some_and(|a| member <= a) {
+            continue;
+        }
+        if best.len() == limit as usize && best.last().is_some_and(|max| member >= max.as_slice()) {
+            continue;
+        }
+        best.insert(member.to_vec());
+        if best.len() > limit as usize {
+            best.pop_last();
+        }
+    }
+    Ok(best.into_iter().collect())
+}
+
 impl<W: WallClock> Store<W> {
     /// The live value of `ns/key`, or `None` if absent or deleted.
     pub fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -176,31 +261,8 @@ impl<W: WallClock> Store<W> {
         start_after: Option<&str>,
         limit: u32,
     ) -> Result<Vec<String>, StoreError> {
-        let mut out = Vec::new();
-        if limit == 0 || has_nul(ns) || has_nul(prefix) {
-            return Ok(out);
-        }
-        let mut within = keys::ns_prefix(ns);
-        within.extend_from_slice(prefix.as_bytes());
-        let mut start = within.clone();
-        if let Some(after) = start_after {
-            // Stored keys contain no NUL, so "after `x\0…`" is the same as "after `x`".
-            let after = after.split('\0').next().unwrap_or("");
-            // Every row of a key > `after` sorts at or above `ns ‖ 0 ‖ after ‖ 0x01`,
-            // and every row of `after` itself (`ns ‖ 0 ‖ after ‖ 0 ‖ origin`) below it.
-            let mut s = keys::ns_prefix(ns);
-            s.extend_from_slice(after.as_bytes());
-            s.push(1);
-            start = start.max(s);
-        }
         let reg = self.db.begin_read()?.open_table(REG)?;
-        scan_reg_winners(&reg, &start, &within, |_, key, _, row| {
-            if row.value.is_some() {
-                out.push(utf8("reg", key)?);
-            }
-            Ok(out.len() < limit as usize)
-        })?;
-        Ok(out)
+        list_keys_in(&reg, ns, prefix, start_after, limit)
     }
 
     /// True if `member` is in the add-only set `ns/set`.
@@ -210,10 +272,6 @@ impl<W: WallClock> Store<W> {
     }
 
     /// Members of `ns/set`, byte-sorted, strictly after `start_after`, at most `limit`.
-    ///
-    /// Rows are keyed `member ‖ origin`, so a member's rows can sort after a longer member
-    /// that extends it; this scans every row of the set at or above `start_after` and keeps
-    /// the `limit` smallest members.
     pub fn set_members(
         &self,
         ns: &str,
@@ -221,38 +279,8 @@ impl<W: WallClock> Store<W> {
         start_after: Option<&[u8]>,
         limit: u32,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        if limit == 0 || has_nul(ns) || has_nul(set) {
-            return Ok(Vec::new());
-        }
-        let prefix = keys::item_prefix(ns, set);
-        let mut start = prefix.clone();
-        if let Some(after) = start_after {
-            // Every row of a member > `after` sorts at or above `prefix ‖ after`.
-            start.extend_from_slice(after);
-        }
         let table = self.db.begin_read()?.open_table(SET)?;
-        let mut best: BTreeSet<Vec<u8>> = BTreeSet::new();
-        for item in table.range::<&[u8]>(start.as_slice()..)? {
-            let (k, _) = item?;
-            let k = k.value();
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            let member = keys::split_set_key(k)?.member;
-            if start_after.is_some_and(|a| member <= a) {
-                continue;
-            }
-            if best.len() == limit as usize
-                && best.last().is_some_and(|max| member >= max.as_slice())
-            {
-                continue;
-            }
-            best.insert(member.to_vec());
-            if best.len() > limit as usize {
-                best.pop_last();
-            }
-        }
-        Ok(best.into_iter().collect())
+        set_members_in(&table, ns, set, start_after, limit)
     }
 
     /// Per namespace: total bytes of live register values plus distinct set members.

@@ -2,6 +2,23 @@
 //!
 //! Registers are multi-origin last-writer-wins by `(order, hlc, origin)`; sets are
 //! add-only. See the sub-spec §5 for the full model.
+//!
+//! # Contracts for callers
+//!
+//! - **Blocking I/O.** Every [`Store`] method is synchronous; writing methods commit a
+//!   redb transaction and fsync before returning, and all of them may block on the
+//!   store's internal writer lock. On a tokio runtime, call them from
+//!   `tokio::task::spawn_blocking` (or a dedicated thread), never directly from an async
+//!   task.
+//! - **Acceptor.** [`Acceptor::judge`] runs inside the write transaction with the clock
+//!   mutex held: it reads only through its [`ReadView`] and never calls the `Store`.
+//! - **Change events are lossy.** [`Store::subscribe`] is a bounded broadcast channel; on
+//!   `Lagged`, rescan. `on_removal` and `retry_pending` are idempotent, so re-running
+//!   them after a missed event is safe.
+//! - **Full syncs.** Call [`Store::mark_full_sync`] after every completed two-way
+//!   exchange (including the catch-up after joining) with the peer's `vv[self]`.
+//! - **Covered markers.** Pass the sender's `Hello` `vv[origin]` as `advertised` to
+//!   [`Store::apply_covered`].
 
 mod apply;
 mod error;
@@ -33,6 +50,8 @@ use std::sync::{Mutex, MutexGuard};
 use tables::{META, SCHEMA_VERSION, meta};
 
 /// The replicated store. All methods take `&self`; writers are serialized internally.
+/// Every method blocks (and writing methods fsync): see the crate docs for using it
+/// from async code.
 pub struct Store<W: WallClock = SystemClock> {
     db: Database,
     mesh: MeshId,

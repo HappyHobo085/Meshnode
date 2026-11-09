@@ -687,6 +687,54 @@ fn acceptor_reads_the_store_inside_the_transaction() {
     assert_eq!(b.get("s", "k").unwrap(), Some(b"v".to_vec()));
 }
 
+/// Admits node 1 always; others only if listed by `view.set_members("_mesh", "members")`
+/// and `view.list_keys("_mesh", "open/")` holds `open/now`.
+struct ListingAcceptor;
+
+impl Acceptor for ListingAcceptor {
+    fn judge(&self, op: &OpBody, view: &ReadView<'_>) -> Verdict {
+        if op.origin == node(1) {
+            return Verdict::Valid;
+        }
+        let members = view
+            .set_members("_mesh", "members", None, 100)
+            .unwrap_or_default();
+        let open = view
+            .list_keys("_mesh", "open/", None, 100)
+            .unwrap_or_default();
+        if members.contains(&op.origin.0.to_vec()) && open == vec!["open/now".to_string()] {
+            Verdict::Valid
+        } else {
+            Verdict::UnknownOrigin
+        }
+    }
+}
+
+#[test]
+fn acceptor_lists_keys_and_members_inside_the_transaction() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let c = store(dir.path(), 3, &clock);
+    let add = a.set_add("_mesh", "members", &node(2).0).unwrap();
+    let open = a.set("_mesh", "open/now", b"1").unwrap();
+    let op = b.set("s", "k", b"v").unwrap();
+    // The view sees the earlier ops of the same (uncommitted) batch.
+    assert_eq!(
+        c.apply_batch(vec![add, open, op], &ListingAcceptor)
+            .unwrap(),
+        vec![Outcome::Applied; 3]
+    );
+    assert_eq!(c.get("s", "k").unwrap(), Some(b"v".to_vec()));
+    // Without the membership, the op waits.
+    let d = store(dir.path(), 4, &clock);
+    let op2 = b.set("s", "k", b"w").unwrap();
+    assert_eq!(
+        d.apply(op2, &ListingAcceptor).unwrap(),
+        Outcome::Deferred(DeferReason::UnknownOrigin)
+    );
+}
+
 #[test]
 fn echoed_own_ops_raise_next_seq() {
     // Same node key, fresh DB (DB loss / re-bootstrap): peers echo our seqs 1..=3.

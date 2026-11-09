@@ -34,12 +34,19 @@ pub enum Verdict {
 }
 
 /// Decides whether a remote op's origin is acceptable (implemented by `mesh-core`).
+///
+/// **Contract:** `judge` runs *inside* the store's write transaction, with the store's
+/// clock mutex held (from `apply`, `apply_batch`, `apply_covered` and `retry_pending`). It
+/// must read the store only through the given [`ReadView`] and must never call any
+/// [`Store`] method: a writing method would deadlock on the clock mutex, and a reading
+/// one would open a separate read transaction that does not see the batch's uncommitted
+/// writes. It should be quick and must not block (it delays every other writer).
 pub trait Acceptor: Send + Sync {
     fn judge(&self, op: &OpBody, view: &ReadView<'_>) -> Verdict;
 }
 
 /// Read access to the store from inside the apply transaction (sees earlier writes of
-/// the same transaction, e.g. a membership op drained just before).
+/// the same transaction, e.g. a membership op drained or batched just before).
 pub struct ReadView<'a> {
     tx: &'a WriteTransaction,
 }
@@ -55,6 +62,30 @@ impl ReadView<'_> {
     pub fn set_contains(&self, ns: &str, set: &str, member: &[u8]) -> Result<bool, StoreError> {
         let table = self.tx.open_table(SET)?;
         read::set_contains_in(&table, ns, set, member)
+    }
+
+    /// As [`Store::set_members`], inside the transaction.
+    pub fn set_members(
+        &self,
+        ns: &str,
+        set: &str,
+        start_after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let table = self.tx.open_table(SET)?;
+        read::set_members_in(&table, ns, set, start_after, limit)
+    }
+
+    /// As [`Store::list_keys`], inside the transaction.
+    pub fn list_keys(
+        &self,
+        ns: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let reg = self.tx.open_table(REG)?;
+        read::list_keys_in(&reg, ns, prefix, start_after, limit)
     }
 }
 
@@ -105,6 +136,12 @@ pub enum RejectReason {
 }
 
 /// A change to the store, published after the transaction that made it commits.
+///
+/// Change events are **lossy**: they go through a bounded broadcast channel, and a
+/// receiver that falls behind gets `RecvError::Lagged` and misses events. On `Lagged`,
+/// rescan whatever state the receiver derives from the store. Events carry no data, only
+/// what changed; re-delivering work is safe because `on_removal` and `retry_pending` are
+/// idempotent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub ns: String,
@@ -541,7 +578,8 @@ impl<W: WallClock> Store<W> {
         Ok(applied)
     }
 
-    /// Subscribes to change events (capacity 1024; a slow receiver sees `Lagged`).
+    /// Subscribes to change events (capacity 1024). Lossy: a slow receiver sees `Lagged`
+    /// and must rescan; see [`Change`].
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Change> {
         self.events.subscribe()
     }

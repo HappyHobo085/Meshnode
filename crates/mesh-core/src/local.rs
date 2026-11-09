@@ -1,9 +1,11 @@
 //! Node-local files in the data directory: `node.key`, `mesh.json`, `invites.json`,
 //! `rebootstrap.bin` and `expired-edits.bin`.
 //!
-//! `node.key` is the raw 32-byte signing seed. On Unix it is created with mode 0600. On Windows
-//! no extra ACL code is run: the file inherits the ACL of the data directory, which normally lives
-//! under the user profile (or `%ProgramData%` for services) and is therefore not world-readable.
+//! `node.key` is the raw 32-byte signing seed, readable by its owner only (spec §3.1): on Unix
+//! it is created with mode 0600; on Windows it gets a protected DACL (nothing inherited from
+//! the data directory) whose only ACE grants the current user full access. The permissions
+//! are set on the temp file before the seed is written, and the file is moved into place
+//! atomically.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -55,13 +57,15 @@ fn temp_path(path: &Path) -> PathBuf {
     dir.unwrap_or(Path::new(".")).join(format!(".{name}.tmp"))
 }
 
-/// Writes `bytes` to a fresh temp file next to `path` (opened with `opts`), fsyncs it and
-/// renames it to `path` durably; the temp file is removed on failure.
+/// Writes `bytes` to a fresh temp file next to `path` (opened with `opts`; on Windows with
+/// `owner_only` its DACL is restricted to the current user before anything is written),
+/// fsyncs it and renames it to `path` durably; the temp file is removed on failure.
 fn write_durably(
     path: &Path,
     bytes: &[u8],
     opts: &std::fs::OpenOptions,
     replace: bool,
+    owner_only: bool,
 ) -> std::io::Result<()> {
     let tmp = temp_path(path);
     // A leftover from a crash: start afresh, so `opts` (permissions) apply.
@@ -71,6 +75,12 @@ fn write_durably(
     }
     let res = (|| -> std::io::Result<()> {
         let mut f = opts.open(&tmp)?;
+        #[cfg(windows)]
+        if owner_only {
+            crate::winfs::restrict_to_current_user(&tmp)?;
+        }
+        #[cfg(not(windows))]
+        let _ = owner_only; // Unix: the mode in `opts` does it.
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -88,7 +98,7 @@ fn write_durably(
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    Ok(write_durably(path, bytes, &opts, true)?)
+    Ok(write_durably(path, bytes, &opts, true, false)?)
 }
 
 /// Load `node.key`, creating a fresh random key if the file does not exist.
@@ -123,7 +133,7 @@ fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    write_durably(path, bytes, &opts, false)
+    write_durably(path, bytes, &opts, false, true)
 }
 
 #[derive(Serialize, Deserialize)]

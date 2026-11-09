@@ -1,33 +1,93 @@
-//! Serving one HTTP request with a fresh instance of a loaded component.
+//! Serving one HTTP request with a fresh instance of a loaded component, within the
+//! service's limits (sub-spec 3 §3.3).
 
-use bytes::Bytes;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
-use wasmtime::Store;
+use mesh_proto::Limits;
+use tokio::sync::Semaphore;
+use wasmtime::{Store, Trap};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
 use crate::RequestCtx;
-use crate::engine::EPOCH_TICK;
+use crate::engine::deadline_ticks;
 use crate::host::{KvStatus, State};
 
-/// Placeholder deadline, one hour in epoch ticks, so requests run until per-request
-/// timeouts are wired from `Limits::request_timeout_ms`.
-const PROVISIONAL_DEADLINE_TICKS: u64 = 3_600_000 / EPOCH_TICK.as_millis() as u64;
+/// Node-wide state shared by every request a `Runtime` serves.
+pub(crate) struct Shared {
+    /// One permit per request allowed to run at once.
+    pub(crate) in_flight: Arc<Semaphore>,
+    /// Instances created so far (a test hook reads it).
+    pub(crate) instantiations: Arc<AtomicU64>,
+}
 
-/// Instantiates `pre` in a new store, calls `wasi:http/incoming-handler.handle` and
-/// collects the response. Every failure becomes an error status.
+/// Serves `req` within `ctx.limits`: an oversized request body is refused before
+/// anything is instantiated (`413`); everything after that, including the wait for an
+/// in-flight slot and host calls, runs under `request_timeout_ms` (`504`).
 pub(crate) async fn serve(
     pre: &ProxyPre<State>,
+    shared: &Shared,
     req: Request<Bytes>,
     ctx: RequestCtx,
 ) -> Response<Bytes> {
-    let service = ctx.service;
+    let limits = ctx.limits;
+    let body_len = req.body().len() as u64;
+    if body_len > limits.max_body_bytes {
+        tracing::warn!(
+            service = ctx.service,
+            "request body of {body_len} bytes exceeds the {} byte limit",
+            limits.max_body_bytes
+        );
+        return status(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let timeout = Duration::from_millis(limits.request_timeout_ms);
+    let service = ctx.service.clone();
+    // On timeout `run` is dropped, which aborts the guest task (`AbortOnDrop`); a guest
+    // busy in wasm is stopped by its epoch deadline, which expires at the same time.
+    match tokio::time::timeout(timeout, run(pre, shared, req, ctx)).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            tracing::warn!(service, "request timed out after {timeout:?}");
+            status(StatusCode::GATEWAY_TIMEOUT)
+        }
+    }
+}
+
+/// Waits for an in-flight slot, instantiates `pre` in a new store, calls
+/// `wasi:http/incoming-handler.handle` and collects the response. Every failure becomes
+/// an error status.
+async fn run(
+    pre: &ProxyPre<State>,
+    shared: &Shared,
+    req: Request<Bytes>,
+    ctx: RequestCtx,
+) -> Response<Bytes> {
+    let RequestCtx {
+        service,
+        node_id,
+        kv,
+        limits,
+        ..
+    } = ctx;
+    // The permit moves into the guest task, so the slot stays taken until the guest has
+    // actually stopped, not merely until this request has been answered.
+    let permit = match shared.in_flight.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return failed(&service, "in-flight slot", &e),
+    };
+
     let kv_status = KvStatus::default();
-    let state = State::new(&service, ctx.kv, ctx.node_id, kv_status.clone());
+    let state = State::new(&service, kv, node_id, kv_status.clone(), limits.memory_mb);
     let mut store = Store::new(pre.engine(), state);
-    store.set_epoch_deadline(PROVISIONAL_DEADLINE_TICKS);
+    store.limiter(State::limiter);
+    store.set_epoch_deadline(deadline_ticks(limits.request_timeout_ms));
 
     let scheme = match req.uri().scheme_str() {
         Some("https") => Scheme::Https,
@@ -46,7 +106,10 @@ pub(crate) async fn serve(
     };
 
     let pre = pre.clone();
+    let instantiations = shared.instantiations.clone();
     let mut guest = AbortOnDrop(tokio::spawn(async move {
+        let _permit = permit;
+        instantiations.fetch_add(1, Ordering::Relaxed);
         let proxy = pre.instantiate_async(&mut store).await?;
         proxy
             .wasi_http_incoming_handler()
@@ -66,15 +129,50 @@ pub(crate) async fn serve(
         }
     };
     let (parts, body) = resp.into_parts();
-    let body = match body.collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => return failed(&service, "response body", &e),
+    let body = match collect_capped(body, limits).await {
+        Ok(body) => body,
+        Err(BodyError::TooLarge) => {
+            tracing::warn!(
+                service,
+                "response body exceeds the {} byte limit",
+                limits.max_body_bytes
+            );
+            return status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        // A broken body stream usually means the guest trapped mid-body; report the trap.
+        Err(BodyError::Stream(err)) => {
+            return match (&mut guest.0).await {
+                Ok(Err(e)) => trapped(&service, &kv_status, &e),
+                _ => failed(&service, "response body", &err),
+            };
+        }
     };
     match (&mut guest.0).await {
         Ok(Ok(())) => Response::from_parts(parts, body),
         Ok(Err(e)) => trapped(&service, &kv_status, &e),
         Err(e) => failed(&service, "guest task", &e),
     }
+}
+
+enum BodyError {
+    TooLarge,
+    Stream(wasmtime_wasi_http::Error),
+}
+
+/// Reads `body` frame by frame, failing as soon as it would exceed `max_body_bytes`, so
+/// at most the limit plus one frame is ever buffered. Trailers are ignored.
+async fn collect_capped(mut body: HyperOutgoingBody, limits: Limits) -> Result<Bytes, BodyError> {
+    let mut buf = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(BodyError::Stream)?;
+        if let Ok(data) = frame.into_data() {
+            if (buf.len() + data.len()) as u64 > limits.max_body_bytes {
+                return Err(BodyError::TooLarge);
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(buf.freeze())
 }
 
 /// `wasi:http` needs an authority; a path-only request without `Host` gets the service name.
@@ -88,8 +186,13 @@ fn with_authority(mut req: Request<Bytes>, service: &str) -> Request<Bytes> {
     req
 }
 
-/// A guest trap: the status of the KV error that caused it, else `500`.
-fn trapped(service: &str, kv_status: &KvStatus, err: &dyn std::fmt::Debug) -> Response<Bytes> {
+/// A guest trap: `504` for an expired epoch deadline, else the status of the KV error
+/// that caused it, else `500` (out-of-memory included).
+fn trapped(service: &str, kv_status: &KvStatus, err: &wasmtime::Error) -> Response<Bytes> {
+    if err.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
+        tracing::warn!(service, "guest exceeded its deadline: {err:?}");
+        return status(StatusCode::GATEWAY_TIMEOUT);
+    }
     match kv_status.get() {
         Some(code) => {
             tracing::warn!(service, "guest trapped on a KV error: {err:?}");

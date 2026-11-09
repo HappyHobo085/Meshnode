@@ -10,9 +10,12 @@ mod kv;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use mesh_proto::{Limits, NodeId};
+use tokio::sync::Semaphore;
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
@@ -23,13 +26,15 @@ pub use kv::MemKv;
 pub use kv::{KvBackend, KvError};
 
 use engine::EpochTicker;
+use handle::Shared;
 use host::State;
 
 /// Runtime settings.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub cache: CodeCache,
-    /// Requests served at once by this node; further requests wait.
+    /// Requests served at once by this node (at least 1); further requests wait, and the
+    /// wait counts against their timeout.
     pub max_in_flight: usize,
 }
 
@@ -67,11 +72,7 @@ pub struct RequestCtx {
 pub struct Runtime {
     engine: Engine,
     linker: Linker<State>,
-    #[expect(
-        dead_code,
-        reason = "the code cache and in-flight cap are wired in later tasks"
-    )]
-    config: RuntimeConfig,
+    shared: Shared,
     _ticker: EpochTicker,
 }
 
@@ -91,13 +92,24 @@ impl fmt::Debug for Loaded {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, RuntimeError> {
+        // `config.cache` is wired in with the code cache.
+        let RuntimeConfig {
+            cache: _,
+            max_in_flight,
+        } = config;
         let engine = engine::new_engine()?;
         let linker = host::world_linker(&engine)?;
         let ticker = EpochTicker::start(&engine)?;
+        let shared = Shared {
+            in_flight: Arc::new(Semaphore::new(
+                max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
+            )),
+            instantiations: Arc::default(),
+        };
         Ok(Runtime {
             engine,
             linker,
-            config,
+            shared,
             _ticker: ticker,
         })
     }
@@ -126,6 +138,12 @@ impl Runtime {
         req: http::Request<Bytes>,
         ctx: RequestCtx,
     ) -> http::Response<Bytes> {
-        handle::serve(&svc.pre, req, ctx).await
+        handle::serve(&svc.pre, &self.shared, req, ctx).await
+    }
+
+    /// How many component instances this runtime has created.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn instantiations(&self) -> u64 {
+        self.shared.instantiations.load(Ordering::Relaxed)
     }
 }

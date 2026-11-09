@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 use http::StatusCode;
 use mesh_proto::NodeId;
-use wasmtime::Engine;
 use wasmtime::component::{HasData, HasSelf, Linker, ResourceTable};
+use wasmtime::{Engine, ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView};
 use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
 use wasmtime_wasi::p2::bindings as wasi;
@@ -43,6 +43,7 @@ pub(crate) struct State {
     kv: Arc<dyn KvBackend>,
     node_id: NodeId,
     kv_status: KvStatus,
+    limits: StoreLimits,
 }
 
 /// The HTTP status of a backend error that trapped the guest; 0 while there was none.
@@ -58,12 +59,13 @@ impl KvStatus {
 
 impl State {
     /// No preopens, no environment, no arguments, stdin closed, stdout and stderr to
-    /// [`guest_output`].
+    /// [`guest_output`]; resources capped by [`store_limits`].
     pub(crate) fn new(
         service: &str,
         kv: Arc<dyn KvBackend>,
         node_id: NodeId,
         kv_status: KvStatus,
+        memory_mb: u32,
     ) -> Self {
         let wasi = WasiCtx::builder()
             .stdout(guest_output(service, Stream::Stdout))
@@ -76,8 +78,37 @@ impl State {
             kv,
             node_id,
             kv_status,
+            limits: store_limits(memory_mb),
         }
     }
+
+    /// For [`wasmtime::Store::limiter`].
+    pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
+        &mut self.limits
+    }
+}
+
+/// Core instances one request may create. A component's instance count is fixed by its
+/// binary (wstd guests use a handful), so this only bounds what a hostile binary declares.
+const MAX_INSTANCES: usize = 32;
+/// Tables, and elements per table: at most 16 x 100k funcref slots (about 13 MiB of host
+/// memory), which wasmtime does not count against `memory_mb`.
+const MAX_TABLES: usize = 16;
+const MAX_TABLE_ELEMENTS: usize = 100_000;
+/// One linear memory, so `memory_mb` caps the request's whole linear memory, not each of
+/// several memories (wasmtime's `memory_size` limit applies per memory).
+const MAX_MEMORIES: usize = 1;
+
+/// Caps a request's linear memory at `memory_mb` MiB (failing growth makes the guest's
+/// allocator fail, which traps) and bounds the instances and tables it can create.
+fn store_limits(memory_mb: u32) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size((memory_mb as usize).saturating_mul(1 << 20))
+        .memories(MAX_MEMORIES)
+        .instances(MAX_INSTANCES)
+        .tables(MAX_TABLES)
+        .table_elements(MAX_TABLE_ELEMENTS)
+        .build()
 }
 
 #[derive(Clone, Copy)]

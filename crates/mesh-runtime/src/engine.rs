@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wasmtime::{Config, Engine, Strategy};
 
@@ -10,6 +10,12 @@ use crate::RuntimeError;
 
 /// How often the engine's epoch advances; request deadlines are counted in these ticks.
 pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// The epoch deadline, in ticks from now, for a request allowed `timeout_ms`: at least
+/// one tick.
+pub(crate) fn deadline_ticks(timeout_ms: u64) -> u64 {
+    (timeout_ms / EPOCH_TICK.as_millis() as u64).max(1)
+}
 
 /// One engine per node: Cranelift, epoch interruption for deadlines. Async host calls and
 /// async instantiation come with wasmtime's `async` feature (`Config::async_support` is a
@@ -23,6 +29,9 @@ pub(crate) fn new_engine() -> Result<Engine, RuntimeError> {
 
 /// Advances the engine's epoch every [`EPOCH_TICK`] on a dedicated thread until dropped.
 /// A plain thread, not a tokio task, so `Runtime::new` needs no async context.
+///
+/// Ticks follow elapsed time rather than counting sleeps, so a coarse OS timer (about
+/// 15.6 ms on Windows) or a late wake-up does not stretch request deadlines.
 pub(crate) struct EpochTicker {
     stop: Arc<AtomicBool>,
 }
@@ -35,11 +44,17 @@ impl EpochTicker {
         std::thread::Builder::new()
             .name("mesh-runtime-epoch".into())
             .spawn(move || {
+                let start = Instant::now();
+                let mut ticks: u128 = 0;
                 while !flag.load(Ordering::Relaxed) {
                     std::thread::sleep(EPOCH_TICK);
-                    match engine.upgrade() {
-                        Some(engine) => engine.increment_epoch(),
-                        None => break,
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
+                    let due = start.elapsed().as_nanos() / EPOCH_TICK.as_nanos();
+                    while ticks < due {
+                        engine.increment_epoch();
+                        ticks += 1;
                     }
                 }
             })

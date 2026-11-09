@@ -28,3 +28,4 @@ tokio.workspace = true
 http.workspace = true
 bytes.workspace = true
 wat.workspace = true
+async-trait.workspace = true

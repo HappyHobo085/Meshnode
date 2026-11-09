@@ -12,6 +12,7 @@ use iroh_blobs::api::Store;
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::format::collection::Collection;
+use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options;
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
@@ -196,7 +197,18 @@ impl Blobs {
             BlobStatus::Complete { size } if size <= MAX_COLLECTION_ROOT => {}
             _ => return Ok(None),
         }
-        Ok(Collection::load(hash, self.api()).await.ok())
+        // `Collection::load` also reads the names blob (the first link): cap it too.
+        let root = self.api().blobs().get_bytes(hash).await.map_err(err)?;
+        let Some(meta) = HashSeq::try_from(root).ok().and_then(|s| s.get(0)) else {
+            return Ok(None);
+        };
+        match self.api().blobs().status(meta).await.map_err(err)? {
+            BlobStatus::Complete { size } if size > MAX_COLLECTION_ROOT => {
+                Err(err("collection metadata too large"))
+            }
+            BlobStatus::Complete { .. } => Ok(Collection::load(hash, self.api()).await.ok()),
+            _ => Ok(None),
+        }
     }
 
     /// Fetches a plain blob from online members, nearest first, moving on after a failure.
@@ -270,7 +282,7 @@ impl Blobs {
     }
 
     /// Test hook: stores a collection with arbitrary entry names, pinned as a collection.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub async fn add_named_for_test(
         &self,
         entries: Vec<(String, Bytes)>,

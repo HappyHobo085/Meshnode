@@ -290,7 +290,9 @@ impl PeerManager {
     pub(crate) fn accept(&self, conn: Connection) {
         let peer = node_id_of(conn.remote_id());
         let mut st = self.lock();
-        if st.stopped || st.blocked.contains(&peer) || peer == self.0.env.me {
+        // After cancellation (shutdown has begun) nothing new may start.
+        let refuse = st.stopped || self.0.cancel.is_cancelled();
+        if refuse || st.blocked.contains(&peer) || peer == self.0.env.me {
             conn.close(SHUTDOWN, b"not accepting");
             return;
         }

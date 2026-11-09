@@ -42,15 +42,23 @@ Forced Doze over adb (`dumpsys battery unplug`, screen off, `deviceidle force-id
 
 - **A foreground service keeps network access in Doze even without the exemption.** The exemption is still worth requesting as insurance against OEM app sleeping (Samsung "sleeping apps").
 - `START_STICKY` / repeated `onStartCommand` are handled (`start()` is idempotent).
-- **Pending, needs the owner (physical device handling):**
-  1. Overnight run unplugged, screen off (started 2026-11-08 ~22:46, 300 s pings, batterystats reset at start).
-  2. Swiping the app away from recents → the service should keep running (`onTaskRemoved` is logged).
-  3. Reboot → `BOOT_COMPLETED` should start the service after the first unlock.
 
-## Q4 — Keepalive / NAT binding  **partly answered**
+### Real-world checks (owner, 2026-11-08/09, no wake lock, battery exemption granted)
+
+| Check | Result |
+|---|---|
+| **Reboot** | ✅ `BOOT_COMPLETED` started the service; it reconnected to the desktop 4 s later. |
+| **Swipe away from recents** | ❌ **The node stopped.** `onTaskRemoved` was logged, then nothing more. The desktop saw the connection time out 46 s later, and `START_STICKY` hadn't restarted it before the reboot about 2 min later. One UI kills (or freezes) the process on swipe even with a foreground service and the exemption. |
+| **Overnight, unplugged, screen off, 10 h 12 m** | ✅ The service stayed alive through 5 deep-Doze cycles. **One** reconnect in 10 h (relay → direct again within seconds). Every WASM tick succeeded (4–50 ms). |
+| **Battery** | ✅ **The spike app used 5.0 mAh in 10.2 h** (batterystats, 3900 mAh battery) ≈ **0.13 % → ~0.3 % per 24 h**, far under the ≤ 5 % target. The whole phone used 559 mAh (14 %), mostly the system. The CPU was awake only 15.5 % of the time. |
+
+**Surprise: timers stretch while the CPU is suspended.** The 300 s ping timer (tokio, monotonic clock) fired every **18–43 min of wall time**, because the monotonic clock doesn't advance while the CPU is suspended. The app's own timers effectively pause in deep sleep. All periodic work (catch-up every 60 s, address refresh, keepalives) will run far less often on a sleeping phone unless it's scheduled on a wall-clock wakeup.
+
+## Q4 — Keepalive / NAT binding  **answered for Wi-Fi**
 
 - Direct paths stayed up with 30 s application pings on both Wi-Fi and mobile data (for 90 s on mobile data).
-- The overnight run at a 300 s interval answers whether connections survive long idle gaps, and how often a reconnect happens. See the log once it's done.
+- **Overnight on Wi-Fi, the connection survived gaps of 18–43 min with no app traffic and the CPU suspended**, with just one QUIC idle timeout in 10 h. The desktop didn't time out the phone, so the phone must still have been answering the desktop's keepalives. That points to incoming packets waking the phone ("wakeupap=u0a392" entries in batterystats). It's an inference, not yet measured directly.
+- **Not yet measured:** (a) the same on mobile data overnight, and (b) **the latency of an incoming request to a sleeping phone**: the desktop sends, and we time how long the phone takes to answer. That decides whether success criterion 7 ("applies a desktop write within 60 s") and serving client-role devices through a sleeping phone are realistic without a wake lock.
 
 ## Requirements found (feed into the sub-specs)
 
@@ -58,7 +66,14 @@ Forced Doze over adb (`dumpsys battery unplug`, screen off, `deviceidle force-id
 2. The Rust library is ~51 MB unstripped (wasmtime + Cranelift + iroh). It needs `strip` + LTO in sub-project 5, and the APK size should be measured then.
 3. Starting the service from adb needs the activity (the service isn't exported). Irrelevant in production.
 4. Gradle/AGP 8.7.3 pulled build-tools 34 automatically. Pin the build-tools version in the real project.
+5. **Recovering from swipe-away:** `START_STICKY` isn't enough on One UI. Proposed: in `onTaskRemoved`, schedule an exact alarm (`setExactAndAllowWhileIdle`, a few seconds out) whose receiver restarts the service. Exact alarms are an allowed way to start a foreground service from the background. Keep the 15-min WorkManager watchdog as a backstop. Tell the user in onboarding to lock the app in recents. Verify on the S23 in sub-project 5.
+6. **Periodic work must not rely on in-process monotonic timers alone on Android.** Catch-up and address refresh need a wall-clock trigger: an `AlarmManager` inexact/while-idle alarm, or doing the work whenever the network or a peer wakes the process. Design for "the phone's timers run rarely, but it answers incoming traffic".
 
-## Verdict so far
+## Verdict
 
-The spec's Android approach (§10.2: one process, a Rust core via JNI, a `specialUse` foreground service, an in-memory wasmtime cache) is **feasible on current Android**. No design changes are needed. The only new requirement is the `ndk-context` setup. The remaining risk is long-duration behaviour on battery (Q3 pending items, Q4, battery drain). It doesn't block starting sub-specs 1–4, which are platform-independent.
+The spec's Android approach (§10.2: one process, a Rust core via JNI, a `specialUse` foreground service, an in-memory wasmtime cache) is **feasible on current Android, and cheap on battery** (~0.3 %/day with no wake lock). Changes it needs:
+- the `ndk-context` setup (requirement 1)
+- recovery from swipe-away (requirement 5)
+- wall-clock scheduling for periodic work (requirement 6)
+
+**Still open:** how quickly a sleeping phone answers incoming requests, and overnight behaviour on mobile data. Neither blocks sub-specs 1–4, which are platform-independent. Both can be measured in a second overnight run, or early in sub-project 5.

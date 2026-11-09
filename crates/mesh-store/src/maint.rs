@@ -5,15 +5,16 @@ use crate::apply::{Change, ChangeKind, vv_get};
 use crate::error::StoreError;
 use crate::keys::{self, OP_KEY_LEN};
 use crate::read::scan_reg_winners;
-use crate::tables::{self, ALL, META, OPS, OpRow, REG, RegRow, SUPERSEDED, meta};
-use crate::{Store, meta_u64};
-use mesh_hlc::WallClock;
-use mesh_proto::{Payload, SignedOp};
+use crate::sync::SyncItem;
+use crate::tables::{self, ALL, META, OPS, OpRow, REG, REMOVED, RegRow, SUPERSEDED, meta};
+use crate::{Store, merge, meta_u64};
+use mesh_hlc::{Hlc, WallClock};
+use mesh_proto::{NodeId, Payload, SignedOp};
 use redb::{ReadableDatabase, ReadableTable, TableHandle, WriteTransaction};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
-/// How long an op must have been superseded (or stored invalid) before compaction may
-/// delete it (§5.5). Retraction of a removed origin can restore ops younger than this.
+/// How long an op must have been superseded (or invalid) before compaction may delete
+/// it (§5.5). Retraction of a removed origin can restore ops younger than this.
 pub const SETTLE_MS: u64 = 7 * 86_400_000;
 /// Age (by the winner's HLC wall time) after which a winning tombstone is GC'd (§5.7).
 pub const TOMBSTONE_TTL_MS: u64 = 90 * 86_400_000;
@@ -30,8 +31,9 @@ const KEEP_ON_RESET: [&str; 5] = [
 ];
 
 /// True if the `ops` row under `k` may be deleted by compaction: it exists, is not a
-/// `SetAdd`, is at or below `vv[origin]` (so its absence is reported as `Covered`), and
-/// is not its origin's current `reg` row for its key.
+/// valid `SetAdd` (an invalid op was never merged, so any kind may go), is at or below
+/// `vv[origin]` (so its absence is reported as `Covered`), and is not its origin's
+/// current `reg` row for its key.
 fn compactable(tx: &WriteTransaction, k: &[u8; OP_KEY_LEN]) -> Result<bool, StoreError> {
     let (origin, seq) = keys::split_op_key("ops", k)?;
     let row: OpRow = {
@@ -41,23 +43,24 @@ fn compactable(tx: &WriteTransaction, k: &[u8; OP_KEY_LEN]) -> Result<bool, Stor
             None => return Ok(false),
         }
     };
-    let (ns, key) = match &row.op.body.payload {
-        Payload::Set { ns, key, .. } => (ns, key),
-        Payload::SetAdd { .. } => return Ok(false),
-    };
     if seq > vv_get(tx, &origin)? {
         return Ok(false);
     }
-    // Defensive: the merge guard keeps a current winner out of `superseded`, but
-    // compaction must never delete the op a `reg` row points at.
-    let reg = tx.open_table(REG)?;
-    if let Some(g) = reg.get(keys::reg_key(ns, key, &origin).as_slice())? {
-        let cur: RegRow = tables::decode("reg", g.value())?;
-        if cur.seq == seq {
-            return Ok(false);
+    match &row.op.body.payload {
+        Payload::SetAdd { .. } => Ok(row.invalid),
+        Payload::Set { ns, key, .. } => {
+            // Defensive: the merge guard keeps a current winner out of `superseded`, but
+            // compaction must never delete the op a `reg` row points at.
+            let reg = tx.open_table(REG)?;
+            if let Some(g) = reg.get(keys::reg_key(ns, key, &origin).as_slice())? {
+                let cur: RegRow = tables::decode("reg", g.value())?;
+                if cur.seq == seq {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
-    Ok(true)
 }
 
 /// Deletes the `ops` row and the `superseded` entry under each key of `doomed`.
@@ -75,13 +78,24 @@ fn utf8(b: &[u8]) -> Result<String, StoreError> {
     String::from_utf8(b.to_vec()).map_err(|_| StoreError::corrupt("reg", "name is not UTF-8"))
 }
 
+/// A key due for GC: its winner and what deleting it would remove.
+struct Doomed {
+    order: Vec<u8>,
+    hlc: Hlc,
+    origin: NodeId,
+    change: Change,
+    ops: Vec<[u8; OP_KEY_LEN]>,
+    /// Deleting would drop one of this node's own ops not yet covered by a full sync.
+    unsafe_own: bool,
+}
+
 impl<W: WallClock> Store<W> {
-    /// Compaction (§5.5), in one write transaction. Deletes an `ops` row if it has been
-    /// superseded for at least [`SETTLE_MS`], or was stored invalid at least
-    /// [`SETTLE_MS`] ago, together with its `superseded` entry. Never deletes a `SetAdd`
-    /// op, an op above its origin's vv, or an op that is its origin's current `reg` row.
-    /// Peers asking for a deleted seq receive a `Covered` marker from `diff_since`.
-    /// Returns the number of `ops` rows deleted.
+    /// Compaction (§5.5), in one write transaction. Deletes an `ops` row whose
+    /// `superseded` entry is at least [`SETTLE_MS`] old, together with that entry. Valid
+    /// ops enter `superseded` when they lose; invalid ops when they become invalid. Never
+    /// deletes a valid `SetAdd` op, an op above its origin's vv, or an op that is its
+    /// origin's current `reg` row. Peers asking for a deleted seq receive a `Covered`
+    /// marker from `diff_since`. Returns the number of `ops` rows deleted.
     pub fn compact(&self) -> Result<usize, StoreError> {
         let clock = self.lock_clock();
         let now = clock.wall().now_ms();
@@ -97,18 +111,7 @@ impl<W: WallClock> Store<W> {
                     candidates.push(keys::op_key(&origin, seq));
                 }
             }
-            let ops = tx.open_table(OPS)?;
-            for item in ops.iter()? {
-                let (k, v) = item?;
-                let row: OpRow = tables::decode("ops", v.value())?;
-                if row.invalid && now.saturating_sub(row.received_ms) >= SETTLE_MS {
-                    let (origin, seq) = keys::split_op_key("ops", k.value())?;
-                    candidates.push(keys::op_key(&origin, seq));
-                }
-            }
         }
-        candidates.sort_unstable();
-        candidates.dedup();
         let mut doomed = Vec::new();
         for k in candidates {
             if compactable(&tx, &k)? {
@@ -120,85 +123,120 @@ impl<W: WallClock> Store<W> {
         Ok(doomed.len())
     }
 
-    /// Tombstone GC (§5.7), in one write transaction. For every key whose winner (over
-    /// all origins) is a tombstone with `hlc.ms() < now - TOMBSTONE_TTL_MS`, deletes
-    /// **all** of the key's `reg` rows (deleting only the tombstone would bring back an
-    /// older value of another origin) and every valid `ops` row of the key with its
-    /// `superseded` entry — including superseded ops compaction has not removed yet, so
-    /// a fresh peer catching up from this store can't resurrect an old value. Invalid ops
-    /// are left to compaction. Set rows are untouched. Publishes one `Change` per GC'd key
+    /// Tombstone GC (§5.7), in one write transaction. Does nothing while the store is
+    /// stale. For every key whose winner (over all origins) is a tombstone with
+    /// `hlc.ms() < now - TOMBSTONE_TTL_MS`, deletes **all** of the key's `reg` rows
+    /// (deleting only the tombstone would bring back an older value of another origin),
+    /// every valid `ops` row of the key (including superseded ops compaction has not
+    /// removed yet, so a fresh peer catching up from this store can't resurrect an old
+    /// value) and every invalid op of the key that does not beat the winner, each with its
+    /// `superseded` entry. A key is skipped if that would delete one of this node's own
+    /// ops received after the last full sync (or if it never synced): the op may not have
+    /// reached any peer yet. Set rows are untouched. Publishes one `Change` per GC'd key
     /// after commit (`local: false`: nothing to broadcast). Returns the number of keys.
     pub fn gc(&self) -> Result<usize, StoreError> {
         let clock = self.lock_clock();
-        let cutoff = clock.wall().now_ms().saturating_sub(TOMBSTONE_TTL_MS);
+        let now = clock.wall().now_ms();
+        let cutoff = now.saturating_sub(TOMBSTONE_TTL_MS);
         let tx = self.db.begin_write()?;
+        let synced = meta_u64(&tx.open_table(META)?, meta::LAST_FULL_SYNC_MS)?;
+        if synced.is_some_and(|t| t < now.saturating_sub(STALE_MS)) {
+            tx.abort()?;
+            return Ok(0);
+        }
 
-        // `ns ‖ 0 ‖ key ‖ 0` of each doomed key, plus its change event.
-        let mut groups: HashSet<Vec<u8>> = HashSet::new();
-        let mut changes = Vec::new();
+        // Keyed by `ns ‖ 0 ‖ key ‖ 0`.
+        let mut doomed: BTreeMap<Vec<u8>, Doomed> = BTreeMap::new();
         {
             let reg = tx.open_table(REG)?;
-            scan_reg_winners(&reg, &[], &[], |ns, key, _, row| {
+            scan_reg_winners(&reg, &[], &[], |ns, key, origin, row| {
                 if row.value.is_none() && row.hlc.ms() < cutoff {
                     let mut g = Vec::with_capacity(ns.len() + key.len() + 2);
                     g.extend_from_slice(ns);
                     g.push(keys::SEP);
                     g.extend_from_slice(key);
                     g.push(keys::SEP);
-                    groups.insert(g);
-                    changes.push(Change {
+                    let change = Change {
                         ns: utf8(ns)?,
                         kind: ChangeKind::Key(utf8(key)?),
                         local: false,
-                    });
+                    };
+                    doomed.insert(
+                        g,
+                        Doomed {
+                            order: row.order,
+                            hlc: row.hlc,
+                            origin,
+                            change,
+                            ops: Vec::new(),
+                            unsafe_own: false,
+                        },
+                    );
                 }
                 Ok(true)
             })?;
         }
-        if groups.is_empty() {
+        if doomed.is_empty() {
             tx.abort()?;
             return Ok(0);
         }
 
-        // Every reg row of each doomed key (all origins).
-        let mut reg_rows: Vec<Vec<u8>> = Vec::new();
-        {
-            let reg = tx.open_table(REG)?;
-            for g in &groups {
-                for item in reg.range::<&[u8]>(g.as_slice()..)? {
-                    let (k, _) = item?;
-                    if !k.value().starts_with(g) {
-                        break;
-                    }
-                    reg_rows.push(k.value().to_vec());
-                }
-            }
-        }
-        // Every valid op of each doomed key (the reg rows' ops and superseded ones).
-        let mut doomed_ops: Vec<[u8; OP_KEY_LEN]> = Vec::new();
+        // The ops of each doomed key that go with it. Every reg row's op is valid, so
+        // it is among them.
         {
             let ops = tx.open_table(OPS)?;
             for item in ops.iter()? {
                 let (k, v) = item?;
                 let row: OpRow = tables::decode("ops", v.value())?;
-                if row.invalid {
+                let b = &row.op.body;
+                let Payload::Set { ns, key, order, .. } = &b.payload else {
+                    continue;
+                };
+                let Some(d) = doomed.get_mut(&keys::item_prefix(ns, key)) else {
+                    continue;
+                };
+                if row.invalid
+                    && merge::beats((order, b.hlc, b.origin), (&d.order, d.hlc, d.origin))
+                {
+                    // Would win if a raised cutoff re-validated it: keep.
                     continue;
                 }
-                if let Payload::Set { ns, key, .. } = &row.op.body.payload
-                    && groups.contains(&keys::item_prefix(ns, key))
-                {
-                    let (origin, seq) = keys::split_op_key("ops", k.value())?;
-                    doomed_ops.push(keys::op_key(&origin, seq));
+                if b.origin == self.node && synced.is_none_or(|t| row.received_ms > t) {
+                    d.unsafe_own = true;
                 }
+                let (origin, seq) = keys::split_op_key("ops", k.value())?;
+                d.ops.push(keys::op_key(&origin, seq));
             }
         }
+        doomed.retain(|_, d| !d.unsafe_own);
+        if doomed.is_empty() {
+            tx.abort()?;
+            return Ok(0);
+        }
+
+        let mut changes = Vec::with_capacity(doomed.len());
         {
             let mut reg = tx.open_table(REG)?;
-            for k in &reg_rows {
-                reg.remove(k.as_slice())?;
+            for (g, d) in &doomed {
+                let mut rows = Vec::new();
+                for item in reg.range::<&[u8]>(g.as_slice()..)? {
+                    let (k, _) = item?;
+                    if !k.value().starts_with(g) {
+                        break;
+                    }
+                    rows.push(k.value().to_vec());
+                }
+                for k in rows {
+                    reg.remove(k.as_slice())?;
+                }
+                changes.push(d.change.clone());
             }
         }
-        delete_ops(&tx, &doomed_ops)?;
+        let all_ops: Vec<_> = doomed
+            .values()
+            .flat_map(|d| d.ops.iter().copied())
+            .collect();
+        delete_ops(&tx, &all_ops)?;
         tx.commit()?;
         let n = changes.len();
         self.publish(changes);
@@ -215,33 +253,55 @@ impl<W: WallClock> Store<W> {
     }
 
     /// This node's own ops received (written) after the last full sync — all of them if
-    /// it never synced — in seq order. Re-bootstrap re-applies them after the catch-up.
-    /// Own ops already compacted (superseded) are not returned.
-    pub fn export_unsynced_local_ops(&self) -> Result<Vec<SignedOp>, StoreError> {
+    /// it never synced — in seq order, for re-applying after re-bootstrap. Own ops
+    /// already compacted leave holes; before each op that does not directly follow the
+    /// previous exported one (or, for the first, whenever its seq is above 1) a
+    /// `Covered { origin: self, upto: seq - 1 }` is emitted, so re-applying never parks
+    /// an op behind a gap. Re-apply `Op` items with `apply` and `Covered` items with
+    /// `apply_covered`, in order.
+    pub fn export_unsynced_local_ops(&self) -> Result<Vec<SyncItem>, StoreError> {
         let tx = self.db.begin_read()?;
         let since = meta_u64(&tx.open_table(META)?, meta::LAST_FULL_SYNC_MS)?;
         let ops = tx.open_table(OPS)?;
         let lo = keys::op_key(&self.node, 0);
         let hi = keys::op_key(&self.node, u64::MAX);
         let mut out = Vec::new();
+        let mut prev: u64 = 0;
         for item in ops.range(lo.as_slice()..=hi.as_slice())? {
             let (_, v) = item?;
             let row: OpRow = tables::decode("ops", v.value())?;
-            if since.is_none_or(|t| row.received_ms > t) {
-                out.push(row.op);
+            if since.is_some_and(|t| row.received_ms <= t) {
+                continue;
             }
+            let seq = row.op.body.seq;
+            // Seqs are >= 1 and ascending, so `seq - 1 >= prev` here.
+            if seq != prev.saturating_add(1) {
+                out.push(SyncItem::Covered {
+                    origin: self.node,
+                    upto: seq - 1,
+                });
+            }
+            prev = seq;
+            out.push(SyncItem::Op(row.op));
         }
         Ok(out)
     }
 
-    /// Clears every table except `meta`, in one write transaction. `meta` keeps the mesh
-    /// and node ids, schema, `next_seq` and `last_hlc` (so seqs and HLCs never repeat);
-    /// `last_full_sync_ms` is removed because the store is now empty. Publishes nothing.
+    /// Clears every table except `meta` and `removed`, in one write transaction. `meta`
+    /// keeps the mesh and node ids, schema, `next_seq` and `last_hlc` (so seqs and HLCs
+    /// never repeat); `last_full_sync_ms` is removed because the store is now empty.
+    /// `removed` is kept so the catch-up that follows still stores ops above a removal
+    /// cutoff as invalid. Publishes nothing.
+    ///
+    /// **Contract:** callers must not issue local writes between `reset_to_empty` and
+    /// the end of re-applying the items from [`Store::export_unsynced_local_ops`]. A local
+    /// write in between sets `vv[self]` past seqs this store no longer holds, so
+    /// `diff_since` would report the unsynced ops as `Covered` and peers would skip them.
     pub fn reset_to_empty(&self) -> Result<(), StoreError> {
         let _clock = self.lock_clock();
         let tx = self.db.begin_write()?;
         for def in ALL {
-            if def.name() != META.name() {
+            if def.name() != META.name() && def.name() != REMOVED.name() {
                 tx.open_table(def)?.retain(|_, _| false)?;
             }
         }
@@ -263,9 +323,10 @@ impl<W: WallClock> Store<W> {
         Ok(())
     }
 
-    /// Writes a local tombstone (via [`Store::delete`], so each gets its own seq and op)
-    /// for every live key of `ns`, and returns the ops in key order for broadcasting.
-    /// Not atomic: keys are listed first, then deleted one by one.
+    /// Writes a local tombstone for every live key of `ns` (via [`Store::set_ordered`]
+    /// with the winner's order, so it beats ordered winners too; each gets its own seq
+    /// and op) and returns the ops in key order for broadcasting. Not atomic: keys are
+    /// listed first, then deleted one by one.
     ///
     /// Set members are untouched: sets are grow-only, so they survive a purge until the
     /// namespace itself is tombstoned in `_mesh` (sub-spec 3). A `ns` containing NUL has
@@ -281,7 +342,17 @@ impl<W: WallClock> Store<W> {
                 break;
             }
         }
-        live.into_iter().map(|k| self.delete(ns, &k)).collect()
+        let mut out = Vec::with_capacity(live.len());
+        for k in live {
+            // The clock ticks past every observed HLC, so the same order with a newer
+            // HLC always beats the current winner.
+            if let Some(e) = self.get_entry(ns, &k)?
+                && e.value.is_some()
+            {
+                out.push(self.set_ordered(ns, &k, &e.order, None)?);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -289,7 +360,6 @@ impl<W: WallClock> Store<W> {
 mod tests {
     use super::*;
     use crate::apply::{Acceptor, Outcome, ReadView, Verdict};
-    use crate::tables::REMOVED;
     use ed25519_dalek::SigningKey;
     use mesh_hlc::{Hlc, ManualClock};
     use mesh_proto::{MeshId, NodeId, OpBody, VersionVector};
@@ -401,5 +471,126 @@ mod tests {
                 upto: 1
             }]
         );
+    }
+
+    fn set_removed(s: &Store<ManualClock>, origin: &NodeId, cutoff: u64) {
+        let tx = s.db.begin_write().unwrap();
+        tx.open_table(REMOVED)
+            .unwrap()
+            .insert(
+                keys::origin_key(origin).as_slice(),
+                keys::u64_value(cutoff).as_slice(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn hand(key: &SigningKey, seq: u64, hlc_ms: u64, payload: Payload) -> SignedOp {
+        SignedOp::sign(
+            OpBody {
+                mesh: MeshId([7; 32]),
+                origin: NodeId(key.verifying_key().to_bytes()),
+                seq,
+                hlc: Hlc::new(hlc_ms, 0),
+                payload,
+            },
+            key,
+        )
+    }
+
+    fn set_k(value: Option<&[u8]>) -> Payload {
+        Payload::Set {
+            ns: "s".into(),
+            key: "k".into(),
+            order: Vec::new(),
+            value: value.map(<[u8]>::to_vec),
+        }
+    }
+
+    fn has_superseded(s: &Store<ManualClock>, origin: &NodeId, seq: u64) -> bool {
+        let tx = s.db.begin_read().unwrap();
+        let t = tx.open_table(SUPERSEDED).unwrap();
+        t.get(keys::op_key(origin, seq).as_slice())
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn ignored_op_is_aged_from_arrival_including_set_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(10_000);
+        let s = open(dir.path(), 2, &clock);
+        let x = SigningKey::from_bytes(&[1; 32]);
+        let xid = NodeId(x.verifying_key().to_bytes());
+        set_removed(&s, &xid, 0);
+        clock.advance(DAY);
+        let add = Payload::SetAdd {
+            ns: "s".into(),
+            set: "m".into(),
+            member: b"x".to_vec(),
+        };
+        assert_eq!(
+            s.apply(hand(&x, 1, 1_000, add), &All).unwrap(),
+            Outcome::Ignored
+        );
+        assert!(has_superseded(&s, &xid, 1));
+        clock.advance(SETTLE_MS - 1);
+        assert_eq!(s.compact().unwrap(), 0);
+        clock.advance(1);
+        // An invalid SetAdd was never merged, so it is compacted too.
+        assert_eq!(s.compact().unwrap(), 1);
+        assert!(!has_op(&s, &xid, 1));
+        assert!(!has_superseded(&s, &xid, 1));
+        assert!(!s.set_contains("s", "m", b"x").unwrap());
+    }
+
+    #[test]
+    fn reset_keeps_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(10_000);
+        let s = open(dir.path(), 2, &clock);
+        let x = SigningKey::from_bytes(&[1; 32]);
+        let xid = NodeId(x.verifying_key().to_bytes());
+        set_removed(&s, &xid, 0);
+        s.reset_to_empty().unwrap();
+        assert_eq!(s.apply(op(&x, 1, "a"), &All).unwrap(), Outcome::Ignored);
+        assert_eq!(s.get("s", "a").unwrap(), None);
+    }
+
+    #[test]
+    fn gc_deletes_invalid_ops_that_lose_and_keeps_ones_that_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(10_000);
+        let s = open(dir.path(), 2, &clock);
+        let x = SigningKey::from_bytes(&[1; 32]);
+        let xid = NodeId(x.verifying_key().to_bytes());
+        let y = SigningKey::from_bytes(&[3; 32]);
+        let yid = NodeId(y.verifying_key().to_bytes());
+        set_removed(&s, &xid, 0);
+        // y's tombstone (hlc 5000) is the winner; x's invalid ops straddle it.
+        assert_eq!(
+            s.apply(hand(&y, 1, 5_000, set_k(None)), &All).unwrap(),
+            Outcome::Applied
+        );
+        assert_eq!(
+            s.apply(hand(&x, 1, 4_000, set_k(Some(b"old"))), &All)
+                .unwrap(),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            s.apply(hand(&x, 2, 6_000, set_k(Some(b"new"))), &All)
+                .unwrap(),
+            Outcome::Ignored
+        );
+        clock.advance(TOMBSTONE_TTL_MS);
+        assert_eq!(s.gc().unwrap(), 1);
+        assert!(s.get_entry("s", "k").unwrap().is_none());
+        assert!(!has_op(&s, &yid, 1));
+        // Loses to the GC'd tombstone: could only resurrect k, so it goes.
+        assert!(!has_op(&s, &xid, 1));
+        assert!(!has_superseded(&s, &xid, 1));
+        // Would beat the tombstone if re-validated: kept (compaction ages it).
+        assert!(has_op(&s, &xid, 2));
+        assert!(has_superseded(&s, &xid, 2));
     }
 }

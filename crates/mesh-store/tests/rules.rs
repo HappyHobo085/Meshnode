@@ -1073,6 +1073,8 @@ fn tombstone_gc_after_90_days() {
     a.delete("s", "k").unwrap();
     let mut rx = a.subscribe();
     clock.advance(TOMBSTONE_TTL_MS);
+    // A's own ops of k must be covered by a full sync before they can be GC'd.
+    a.mark_full_sync().unwrap();
     assert_eq!(a.gc().unwrap(), 0);
     clock.advance(1);
     assert_eq!(a.gc().unwrap(), 1);
@@ -1106,6 +1108,7 @@ fn gc_without_compaction_does_not_resurrect_on_fresh_peer() {
     a.delete("s", "k").unwrap();
     a.set("s", "other", b"o").unwrap();
     clock.advance(TOMBSTONE_TTL_MS + 1);
+    a.mark_full_sync().unwrap();
     // No compact() ran: the superseded ops of k must not outlive the GC.
     assert_eq!(a.gc().unwrap(), 1);
     feed(&c, a.diff_since(&VersionVector::default(), 100).unwrap());
@@ -1141,7 +1144,10 @@ fn export_unsynced_local_ops_after_last_full_sync() {
     let o2 = a.set_add("s", "m", b"x").unwrap();
     a.apply(b.set("s", "j", b"b").unwrap(), &AcceptAll).unwrap();
     // Never synced: every own op.
-    assert_eq!(a.export_unsynced_local_ops().unwrap(), vec![o1, o2]);
+    assert_eq!(
+        a.export_unsynced_local_ops().unwrap(),
+        vec![SyncItem::Op(o1), SyncItem::Op(o2)]
+    );
     a.mark_full_sync().unwrap();
     assert!(a.export_unsynced_local_ops().unwrap().is_empty());
     clock.advance(1);
@@ -1149,7 +1155,18 @@ fn export_unsynced_local_ops_after_last_full_sync() {
     let o4 = a.set("s", "z", b"z").unwrap();
     a.apply(b.set("s", "j", b"b2").unwrap(), &AcceptAll)
         .unwrap();
-    assert_eq!(a.export_unsynced_local_ops().unwrap(), vec![o3, o4]);
+    // Seqs 1..=2 were synced: covered before the first exported op.
+    assert_eq!(
+        a.export_unsynced_local_ops().unwrap(),
+        vec![
+            SyncItem::Covered {
+                origin: node(1),
+                upto: 2
+            },
+            SyncItem::Op(o3),
+            SyncItem::Op(o4)
+        ]
+    );
 }
 
 #[test]
@@ -1201,6 +1218,8 @@ fn purge_namespace_tombstones_live_keys() {
     s.delete("p", "gone").unwrap();
     s.set_add("p", "m", b"x").unwrap();
     s.set("q", "a", b"other").unwrap();
+    // An ordered winner: a plain (empty-order) delete would lose to it.
+    s.set_ordered("p", "o", &[9], Some(b"ordered")).unwrap();
     let ops = s.purge_namespace("p").unwrap();
     let keys: Vec<_> = ops
         .iter()
@@ -1213,10 +1232,138 @@ fn purge_namespace_tombstones_live_keys() {
             Payload::SetAdd { .. } => panic!("purge emitted a set op"),
         })
         .collect();
-    assert_eq!(keys, strings(&["a", "b", "c"]));
+    assert_eq!(keys, strings(&["a", "b", "c", "o"]));
+    assert_eq!(s.get_entry("p", "o").unwrap().unwrap().order, vec![9]);
     assert!(s.list_keys("p", "", None, 100).unwrap().is_empty());
     assert_eq!(s.get("q", "a").unwrap(), Some(b"other".to_vec()));
     // Sets are grow-only: members survive a purge.
     assert!(s.set_contains("p", "m", b"x").unwrap());
     assert!(s.purge_namespace("p").unwrap().is_empty());
+}
+
+/// Re-applies exported items (ops with `apply`, markers with `apply_covered`).
+fn reapply(to: &Store<ManualClock>, items: Vec<SyncItem>) {
+    for item in items {
+        match item {
+            SyncItem::Op(o) => {
+                assert_eq!(to.apply(o, &AcceptAll).unwrap(), Outcome::Applied);
+            }
+            SyncItem::Covered { origin, upto } => {
+                to.apply_covered(origin, upto, &AcceptAll).unwrap()
+            }
+        }
+    }
+}
+
+#[test]
+fn export_after_compaction_reapplies_without_gaps() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"1").unwrap();
+    a.set("s", "k", b"2").unwrap();
+    a.set("s", "k2", b"x").unwrap();
+    clock.advance(SETTLE_MS + 1);
+    assert_eq!(a.compact().unwrap(), 1);
+    let items = a.export_unsynced_local_ops().unwrap();
+    assert!(matches!(
+        items.as_slice(),
+        [
+            SyncItem::Covered { upto: 1, .. },
+            SyncItem::Op(_),
+            SyncItem::Op(_)
+        ]
+    ));
+
+    // A fresh second store re-applying the export.
+    let c = store(dir.path(), 3, &clock);
+    reapply(&c, items.clone());
+    assert_eq!(c.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(c.get("s", "k2").unwrap(), Some(b"x".to_vec()));
+    assert_eq!(c.version_vector().unwrap().get(&node(1)), 3);
+    assert_eq!(c.pending_len().unwrap(), 0);
+
+    // The same store after a reset.
+    a.reset_to_empty().unwrap();
+    reapply(&a, items);
+    assert_eq!(a.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(a.get("s", "k2").unwrap(), Some(b"x".to_vec()));
+    assert_eq!(a.version_vector().unwrap().get(&node(1)), 3);
+    assert_eq!(a.pending_len().unwrap(), 0);
+    assert_eq!(a.set("s", "k", b"3").unwrap().body.seq, 4);
+}
+
+#[test]
+fn export_covers_holes_between_exported_ops() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"1").unwrap(); // 1
+    a.set("s", "j", b"1").unwrap(); // 2
+    a.set("s", "k", b"2").unwrap(); // 3 supersedes 1
+    a.set("s", "j", b"2").unwrap(); // 4 supersedes 2
+    clock.advance(SETTLE_MS);
+    assert_eq!(a.compact().unwrap(), 2);
+    let items = a.export_unsynced_local_ops().unwrap();
+    assert!(matches!(
+        items.as_slice(),
+        [
+            SyncItem::Covered { upto: 2, .. },
+            SyncItem::Op(o3),
+            SyncItem::Op(o4)
+        ] if o3.body.seq == 3 && o4.body.seq == 4
+    ));
+}
+
+#[test]
+fn gc_does_nothing_while_stale() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"v").unwrap();
+    a.delete("s", "k").unwrap();
+    a.mark_full_sync().unwrap();
+    clock.advance(TOMBSTONE_TTL_MS + 1);
+    assert!(a.is_stale().unwrap());
+    assert_eq!(a.gc().unwrap(), 0);
+    assert!(a.get_entry("s", "k").unwrap().is_some());
+    a.mark_full_sync().unwrap();
+    assert_eq!(a.gc().unwrap(), 1);
+}
+
+#[test]
+fn gc_keeps_keys_with_own_unsynced_ops() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    // Never synced: A's own tombstone may not have reached anyone.
+    a.set("s", "own", b"v").unwrap();
+    a.delete("s", "own").unwrap();
+    // B's ordered tombstone of `k`; later A writes k with a losing (empty) order.
+    a.apply(b.set_ordered("s", "k", &[9], None).unwrap(), &AcceptAll)
+        .unwrap();
+    clock.advance(TOMBSTONE_TTL_MS - 5 * DAY_MS);
+    assert_eq!(a.gc().unwrap(), 0);
+    a.mark_full_sync().unwrap();
+    clock.advance(6 * DAY_MS);
+    // A's losing write of k comes after the last full sync.
+    a.set("s", "k", b"late").unwrap();
+    assert_eq!(a.get("s", "k").unwrap(), None);
+    // `own` is synced now; `k` holds an unsynced own op.
+    assert_eq!(a.gc().unwrap(), 1);
+    assert!(a.get_entry("s", "own").unwrap().is_none());
+    assert!(a.get_entry("s", "k").unwrap().is_some());
+    a.mark_full_sync().unwrap();
+    assert_eq!(a.gc().unwrap(), 1);
+    assert!(a.get_entry("s", "k").unwrap().is_none());
+}
+
+#[test]
+fn gc_never_runs_on_own_ops_of_a_never_synced_store() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.set("s", "k", b"v").unwrap();
+    a.delete("s", "k").unwrap();
+    clock.advance(TOMBSTONE_TTL_MS + 1);
+    assert!(!a.is_stale().unwrap());
+    assert_eq!(a.gc().unwrap(), 0);
+    a.mark_full_sync().unwrap();
+    assert_eq!(a.gc().unwrap(), 1);
 }

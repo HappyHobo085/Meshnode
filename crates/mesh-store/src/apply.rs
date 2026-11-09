@@ -8,7 +8,9 @@
 //! removal check and judge).
 
 use crate::error::StoreError;
-use crate::tables::{self, META, OPS, OpRow, PENDING, PendingRow, REG, REMOVED, SET, VV, meta};
+use crate::tables::{
+    self, META, OPS, OpRow, PENDING, PendingRow, REG, REMOVED, SET, SUPERSEDED, VV, meta,
+};
 use crate::{Store, keys, merge, meta_u64_req, read};
 use mesh_hlc::{Clock, WallClock};
 use mesh_proto::{MeshId, NodeId, OpBody, Payload, SignedOp};
@@ -300,6 +302,11 @@ impl<'a, W: WallClock> Pipeline<'a, W> {
         // 4. Above a removed origin's cutoff: keep as invalid (covered), don't merge.
         if removed_get(self.tx, &origin)?.is_some_and(|cutoff| seq > cutoff) {
             self.record(&op, true)?;
+            // Compaction ages an invalid op from when it became invalid (Ruling R9).
+            self.tx.open_table(SUPERSEDED)?.insert(
+                keys::op_key(&origin, seq).as_slice(),
+                keys::u64_value(self.now_ms).as_slice(),
+            )?;
             if seq == vv.saturating_add(1) {
                 vv_set(self.tx, &origin, seq)?;
             }

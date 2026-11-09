@@ -1,6 +1,7 @@
 //! Meshnode's WASM service host: runs `wasi:http` components targeting world
 //! `meshnode:service/service` (`wit/world.wit`) on wasmtime, one fresh instance per request.
 
+mod cache;
 mod engine;
 mod error;
 mod handle;
@@ -19,7 +20,7 @@ use bytes::Bytes;
 use mesh_proto::{Limits, NodeId};
 use tokio::sync::Semaphore;
 use wasmtime::Engine;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Linker;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 
 pub use error::RuntimeError;
@@ -27,6 +28,7 @@ pub use error::RuntimeError;
 pub use kv::MemKv;
 pub use kv::{KvBackend, KvError};
 
+use cache::Cache;
 use engine::EpochTicker;
 use handle::Shared;
 use host::State;
@@ -75,6 +77,7 @@ pub struct Runtime {
     engine: Engine,
     linker: Linker<State>,
     shared: Shared,
+    cache: Arc<Cache>,
     _ticker: EpochTicker,
 }
 
@@ -94,14 +97,14 @@ impl fmt::Debug for Loaded {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, RuntimeError> {
-        // `config.cache` is wired in with the code cache.
         let RuntimeConfig {
-            cache: _,
+            cache,
             max_in_flight,
         } = config;
         let engine = engine::new_engine()?;
         let linker = host::world_linker(&engine)?;
         let ticker = EpochTicker::start(&engine)?;
+        let cache = Arc::new(Cache::new(cache, &engine));
         let shared = Shared {
             in_flight: Arc::new(Semaphore::new(
                 max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
@@ -112,16 +115,20 @@ impl Runtime {
             engine,
             linker,
             shared,
+            cache,
             _ticker: ticker,
         })
     }
 
-    /// Compiles `wasm` and validates it against the world: it must export
-    /// `wasi:http/incoming-handler` and import nothing outside the world.
+    /// Compiles `wasm` (or takes it from the code cache) and validates it against the
+    /// world: it must export `wasi:http/incoming-handler` and import nothing outside the
+    /// world. `hash` is trusted to identify `wasm` (callers pass the blob hash); it keys
+    /// the cache and is not checked against the bytes.
     pub async fn load(&self, hash: [u8; 32], wasm: &[u8]) -> Result<Loaded, RuntimeError> {
         let engine = self.engine.clone();
         let wasm = wasm.to_vec();
-        let component = tokio::task::spawn_blocking(move || Component::from_binary(&engine, &wasm))
+        let cache = Arc::clone(&self.cache);
+        let component = tokio::task::spawn_blocking(move || cache.load(&engine, &hash, &wasm))
             .await
             .map_err(|e| RuntimeError::Compile(format!("compile task: {e}")))?
             .map_err(|e| RuntimeError::Compile(format!("{e:#}")))?;
@@ -141,6 +148,12 @@ impl Runtime {
         ctx: RequestCtx,
     ) -> http::Response<Bytes> {
         handle::serve(&svc.pre, &self.shared, req, ctx).await
+    }
+
+    /// Code cache `(hits, misses)` since this runtime was created.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.cache.stats()
     }
 
     /// How many component instances this runtime has created.

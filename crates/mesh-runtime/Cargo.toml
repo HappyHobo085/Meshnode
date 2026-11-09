@@ -17,6 +17,8 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+blake3.workspace = true
+hex.workspace = true
 
 [features]
 # Test-only helpers (`MemKv`), also used by later crates' tests.
@@ -28,6 +30,7 @@ tokio.workspace = true
 http.workspace = true
 bytes.workspace = true
 wat.workspace = true
+tempfile.workspace = true
 async-trait.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true

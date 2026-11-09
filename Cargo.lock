@@ -2281,11 +2281,14 @@ name = "mesh-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
+ "hex",
  "http",
  "http-body-util",
  "mesh-proto",
  "mesh-runtime",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

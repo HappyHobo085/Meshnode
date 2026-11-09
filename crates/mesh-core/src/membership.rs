@@ -157,8 +157,11 @@ impl MembershipSnapshot {
             members.insert(id, MemberEntry { role, info, addr });
         }
 
-        // Per node: the record with the highest cutoff (its bytes identify the set element).
-        let mut best: BTreeMap<NodeId, (u64, Vec<u8>)> = BTreeMap::new();
+        // Per node: the highest cutoff, with every element that decodes to it. Postcard
+        // ignores trailing bytes, so one record can exist as several byte variants (one
+        // element each); they are the same record, and its remover is the lowest origin
+        // of any of them, so adding a variant cannot change `by`.
+        let mut best: BTreeMap<NodeId, (u64, Vec<Vec<u8>>)> = BTreeMap::new();
         for raw in all_members(store, REMOVED)? {
             let rec = match postcard::from_bytes::<RemovalRecord>(&raw) {
                 Ok(r) => r,
@@ -167,21 +170,24 @@ impl MembershipSnapshot {
                     continue;
                 }
             };
-            let better = best
-                .get(&rec.node_id)
-                .is_none_or(|(c, _)| rec.cutoff_seq > *c);
-            if better {
-                best.insert(rec.node_id, (rec.cutoff_seq, raw));
+            match best.get_mut(&rec.node_id) {
+                Some((c, raws)) if rec.cutoff_seq == *c => raws.push(raw),
+                Some((c, _)) if rec.cutoff_seq < *c => {}
+                _ => {
+                    best.insert(rec.node_id, (rec.cutoff_seq, vec![raw]));
+                }
             }
         }
         let mut removed = BTreeMap::new();
-        for (id, (cutoff, raw)) in best {
+        for (id, (cutoff, raws)) in best {
             // Identical records from several removers are one element; take the lowest origin.
-            let Some(by) = store
-                .set_member_origins(MESH_NS, REMOVED, &raw)?
-                .into_iter()
-                .min()
-            else {
+            let mut by: Option<NodeId> = None;
+            for raw in &raws {
+                for origin in store.set_member_origins(MESH_NS, REMOVED, raw)? {
+                    by = Some(by.map_or(origin, |b| b.min(origin)));
+                }
+            }
+            let Some(by) = by else {
                 continue;
             };
             removed.insert(id, Removal { cutoff, by });

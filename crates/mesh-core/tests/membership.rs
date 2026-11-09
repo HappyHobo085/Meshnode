@@ -174,6 +174,37 @@ fn removed_by_tie_goes_to_lowest_origin() {
 }
 
 #[test]
+fn removed_by_ignores_byte_variants() {
+    // Postcard ignores trailing bytes: `removal(3, 5) + [0]` is the same record as a
+    // different set element. The remover is the lowest origin over every variant.
+    let dir = tempfile::tempdir().unwrap();
+    let g = genesis();
+    let a = open(dir.path(), 1, &g);
+    let b = open(dir.path(), 2, &g);
+    let acc = MeshAcceptor::new(g.clone());
+    a.set_add(MESH_NS, MEMBERS, &member_bytes(&id(2), Role::Host))
+        .unwrap();
+    apply_all(&b, &a, &acc);
+    let (lo, hi) = if id(1) < id(2) { (&a, &b) } else { (&b, &a) };
+    let mut variant = removal(3, 5);
+    variant.push(0);
+    // The canonical bytes sort first; only the variant carries the lowest origin.
+    hi.set_add(MESH_NS, REMOVED, &removal(3, 5)).unwrap();
+    lo.set_add(MESH_NS, REMOVED, &variant).unwrap();
+    // A lower-cutoff variant does not count.
+    let mut low = removal(3, 4);
+    low.push(1);
+    hi.set_add(MESH_NS, REMOVED, &low).unwrap();
+    apply_all(&a, &b, &acc);
+    apply_all(&b, &a, &acc);
+    for s in [&a, &b] {
+        let snap = MembershipSnapshot::load(s, &g).unwrap();
+        assert_eq!(snap.cutoff(&id(3)), Some(5));
+        assert_eq!(snap.removed_by(&id(3)), Some(id(1).min(id(2))));
+    }
+}
+
+#[test]
 fn effective_excludes_removed() {
     let dir = tempfile::tempdir().unwrap();
     let g = genesis();

@@ -19,6 +19,8 @@ mod rebootstrap;
 pub mod sync;
 #[doc(hidden)]
 pub mod transport;
+#[cfg(windows)]
+mod winfs;
 
 pub use blobs::{BlobHash, Blobs};
 pub use config::{DynClock, NodeConfig, RelayChoice, Timings};

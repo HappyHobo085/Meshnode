@@ -24,6 +24,9 @@ rand.workspace = true
 blake3.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [features]
 # Test-only helpers; the crate's own tests enable it through the dev-dependency below.
 test-hooks = ["mesh-store/test-hooks"]

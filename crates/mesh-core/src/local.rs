@@ -22,22 +22,73 @@ const INVITES_FILE: &str = "invites.json";
 const REBOOTSTRAP_FILE: &str = "rebootstrap.bin";
 const EXPIRED_FILE: &str = "expired-edits.bin";
 
-/// Write `bytes` to `path` via a temp file in the same directory, fsync, then rename over.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
+/// Renames `from` over `to` (or, without `replace`, only if `to` does not exist: then it
+/// fails with `AlreadyExists`) so that the rename survives a power loss once this returns.
+fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::winfs::durable_rename(from, to, replace)
+    }
+    #[cfg(not(windows))]
+    {
+        if replace {
+            std::fs::rename(from, to)?;
+        } else {
+            // A hard link fails if `to` exists, unlike a rename.
+            std::fs::hard_link(from, to)?;
+            std::fs::remove_file(from)?;
+        }
+        // The rename is durable only once the directory entry is.
+        #[cfg(unix)]
+        {
+            let dir = to.parent().filter(|p| !p.as_os_str().is_empty());
+            std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+/// The temp file next to `path` that `write_durably` writes first.
+fn temp_path(path: &Path) -> PathBuf {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let dir = dir.unwrap_or(Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp: PathBuf = dir.join(format!(".{name}.tmp"));
+    dir.unwrap_or(Path::new(".")).join(format!(".{name}.tmp"))
+}
+
+/// Writes `bytes` to a fresh temp file next to `path` (opened with `opts`), fsyncs it and
+/// renames it to `path` durably; the temp file is removed on failure.
+fn write_durably(
+    path: &Path,
+    bytes: &[u8],
+    opts: &std::fs::OpenOptions,
+    replace: bool,
+) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    // A leftover from a crash: start afresh, so `opts` (permissions) apply.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        drop(f);
+        durable_rename(&tmp, path, replace)
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    Ok(res?)
+    res
+}
+
+/// Write `bytes` to `path` via a temp file in the same directory, fsync, then a durable
+/// rename over `path` (the directory entry is synced too: on Unix by fsyncing the
+/// directory, on Windows by `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    Ok(write_durably(path, bytes, &opts, true)?)
 }
 
 /// Load `node.key`, creating a fresh random key if the file does not exist.
@@ -51,13 +102,19 @@ pub fn load_or_create_key(dir: &Path) -> Result<SigningKey, NodeError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(dir)?;
             let seed: [u8; 32] = rand::random();
-            create_private(&path, &seed)?;
-            Ok(SigningKey::from_bytes(&seed))
+            match create_private(&path, &seed) {
+                Ok(()) => Ok(SigningKey::from_bytes(&seed)),
+                // Created meanwhile by someone else: use that one.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_or_create_key(dir),
+                Err(e) => Err(e.into()),
+            }
         }
         Err(e) => Err(e.into()),
     }
 }
 
+/// Creates `path` holding `bytes`, readable by the owner only, atomically (temp file and a
+/// durable rename that never replaces): a crash leaves either no file or the whole one.
 fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -66,9 +123,7 @@ fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    write_durably(path, bytes, &opts, false)
 }
 
 #[derive(Serialize, Deserialize)]

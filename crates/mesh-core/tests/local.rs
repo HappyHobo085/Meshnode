@@ -74,6 +74,31 @@ fn atomic_write_replaces() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
+#[test]
+fn atomic_write_survives_a_leftover_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("f.bin");
+    std::fs::write(dir.path().join(".f.bin.tmp"), b"half-written").unwrap();
+    local::atomic_write(&p, b"one").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"one");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn key_created_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    // A crash mid-creation leaves at most the temp file, never a short `node.key`.
+    std::fs::write(dir.path().join(".node.key.tmp"), [1u8; 5]).unwrap();
+    let a = local::load_or_create_key(dir.path()).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("node.key")).unwrap().len(),
+        32
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    let b = local::load_or_create_key(dir.path()).unwrap();
+    assert_eq!(a.verifying_key(), b.verifying_key());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn store_handle_runs_off_runtime() {
     let dir = tempfile::tempdir().unwrap();

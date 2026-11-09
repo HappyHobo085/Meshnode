@@ -127,6 +127,15 @@ pub(crate) fn own_info(cfg: &NodeConfig) -> MemberInfo {
     }
 }
 
+/// Aborts the task when dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs the task built by `make` and restarts it with backoff if it panics (spec §10).
 /// Returns when the task returns normally or is cancelled.
 pub(crate) async fn supervise<F, Fut>(
@@ -140,7 +149,10 @@ pub(crate) async fn supervise<F, Fut>(
 {
     let mut delay = timings.backoff_min;
     loop {
-        match tokio::spawn(make()).await {
+        // Aborting this supervisor (a timed-out shutdown) drops the guard, which aborts
+        // the inner task too, so nothing it holds (the store) outlives the abort.
+        let mut task = AbortOnDrop(tokio::spawn(make()));
+        match (&mut task.0).await {
             Ok(()) => return,
             Err(e) if e.is_panic() => {
                 error!(task = name, "task panicked; restarting");
@@ -843,5 +855,45 @@ impl Node {
     /// Open `sync/1` connections this node holds.
     pub fn connection_count(&self) -> usize {
         self.inner.peers.connection_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_supervise_aborts_the_inner_task() {
+        let held = Arc::new(());
+        let h = held.clone();
+        let sup = tokio::spawn(supervise(
+            "test",
+            CancellationToken::new(),
+            Timings::fast_for_tests(),
+            move || {
+                let h = h.clone();
+                async move {
+                    let _h = h;
+                    std::future::pending::<()>().await;
+                }
+            },
+        ));
+        // The factory's clone plus the running task's.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&held) < 3 && Instant::now() < deadline {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(Arc::strong_count(&held), 3, "inner task running");
+        sup.abort();
+        let _ = sup.await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&held) > 1 && Instant::now() < deadline {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "inner task aborted with its supervisor"
+        );
     }
 }

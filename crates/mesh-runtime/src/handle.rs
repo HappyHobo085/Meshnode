@@ -81,7 +81,7 @@ async fn run(
         node_id,
         kv,
         limits,
-        ..
+        outbound,
     } = ctx;
     // The permit moves into the guest task, so the slot stays taken until the guest has
     // actually stopped, not merely until this request has been answered.
@@ -91,7 +91,14 @@ async fn run(
     };
 
     let kv_status = KvStatus::default();
-    let state = State::new(&service, kv, node_id, kv_status.clone(), limits.memory_mb);
+    let state = State::new(
+        &service,
+        outbound,
+        kv,
+        node_id,
+        kv_status.clone(),
+        limits.memory_mb,
+    );
     let mut store = Store::new(pre.engine(), state);
     store.limiter(State::limiter);
     // The wait for a slot has used up part of the timeout; only the rest is left.

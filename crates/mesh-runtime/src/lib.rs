@@ -6,6 +6,8 @@ mod error;
 mod handle;
 mod host;
 mod kv;
+mod outbound;
+mod stdio;
 
 use std::fmt;
 use std::path::PathBuf;

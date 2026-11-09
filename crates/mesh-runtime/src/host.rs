@@ -13,11 +13,12 @@ use wasmtime::{Engine, ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView};
 use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
 use wasmtime_wasi::p2::bindings as wasi;
-use wasmtime_wasi::p2::pipe::SinkOutputStream;
 use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
+use crate::outbound::Outbound;
+use crate::stdio::{GuestOutput, Stream};
 use crate::{KvBackend, KvError, RuntimeError};
 
 mod bindings {
@@ -39,6 +40,7 @@ use bindings::meshnode::kv::store;
 pub(crate) struct State {
     wasi: WasiCtx,
     http: WasiHttpCtx,
+    outbound: Outbound,
     table: ResourceTable,
     kv: Arc<dyn KvBackend>,
     node_id: NodeId,
@@ -59,21 +61,23 @@ impl KvStatus {
 
 impl State {
     /// No preopens, no environment, no arguments, stdin closed, stdout and stderr to
-    /// [`guest_output`]; resources capped by a [`Limiter`].
+    /// the node log; outbound HTTP limited to `outbound`; resources capped by a [`Limiter`].
     pub(crate) fn new(
         service: &str,
+        outbound: Vec<String>,
         kv: Arc<dyn KvBackend>,
         node_id: NodeId,
         kv_status: KvStatus,
         memory_mb: u32,
     ) -> Self {
         let wasi = WasiCtx::builder()
-            .stdout(guest_output(service, Stream::Stdout))
-            .stderr(guest_output(service, Stream::Stderr))
+            .stdout(GuestOutput::new(service, Stream::Stdout))
+            .stderr(GuestOutput::new(service, Stream::Stderr))
             .build();
         State {
             wasi,
             http: WasiHttpCtx::new(),
+            outbound: Outbound::new(service, outbound),
             table: ResourceTable::new(),
             kv,
             node_id,
@@ -180,18 +184,6 @@ impl ResourceLimiter for Limiter {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
-/// Where a guest's stdout and stderr go. Discarded for now; routed into `tracing` later
-/// (sub-spec 3 §2.2). This is the only place that decides it.
-fn guest_output(_service: &str, _stream: Stream) -> SinkOutputStream {
-    SinkOutputStream
-}
-
 impl WasiView for State {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -206,7 +198,7 @@ impl WasiHttpView for State {
         WasiHttpCtxView {
             ctx: &mut self.http,
             table: &mut self.table,
-            hooks: Default::default(),
+            hooks: &mut self.outbound,
         }
     }
 }

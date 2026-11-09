@@ -4,3 +4,5 @@ spikes/**/.gradle/
 spikes/**/jniLibs/
 spikes/**/out/
 local.properties
+/target/
+.superpowers/

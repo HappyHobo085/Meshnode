@@ -218,4 +218,18 @@ impl<W: WallClock> Store<W> {
         tx.commit()?;
         Ok(())
     }
+
+    /// Test hook: overwrites a raw `meta` u64 row (`test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn __test_set_meta_u64(&self, name: &str, v: u64) -> Result<(), StoreError> {
+        let _clock = self.lock_clock();
+        let tx = self.db.begin_write()?;
+        {
+            let mut m = tx.open_table(META)?;
+            m.insert(name.as_bytes(), keys::u64_value(v).as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }

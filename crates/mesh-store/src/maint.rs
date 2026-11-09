@@ -20,6 +20,15 @@ pub const SETTLE_MS: u64 = 7 * 86_400_000;
 /// measured both by the tombstone's HLC wall time and by when this store received it
 /// (Ruling R14), so a tombstone arriving late from an offline device is kept here for
 /// this long after its arrival.
+/// Result of [`Store::export_unsynced_local_ops`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Export {
+    /// Items to re-apply, in order.
+    pub items: Vec<SyncItem>,
+    /// Own `Set` ops too old to re-apply (older than [`TOMBSTONE_TTL_MS`]).
+    pub expired: Vec<SignedOp>,
+}
+
 pub const TOMBSTONE_TTL_MS: u64 = 90 * 86_400_000;
 /// A store whose last full sync is older than this must re-bootstrap (§5.7).
 pub const STALE_MS: u64 = 80 * 86_400_000;
@@ -323,30 +332,43 @@ impl<W: WallClock> Store<W> {
     /// covered by an export: the catch-up from the peers brings them back. Re-apply `Op`
     /// items with `apply` and `Covered` items with `apply_covered(self, upto, upto, ..)`,
     /// in order.
-    pub fn export_unsynced_local_ops(&self) -> Result<Vec<SyncItem>, StoreError> {
+    ///
+    /// Own `Set` ops whose `hlc.ms()` is older than [`TOMBSTONE_TTL_MS`] (by the store's
+    /// wall clock) are not exported: they come back in [`Export::expired`] and their seqs
+    /// count as holes. `SetAdd` ops never expire.
+    pub fn export_unsynced_local_ops(&self) -> Result<Export, StoreError> {
+        let cutoff = self
+            .lock_clock()
+            .wall()
+            .now_ms()
+            .saturating_sub(TOMBSTONE_TTL_MS);
         let tx = self.db.begin_read()?;
         let synced = meta_u64(&tx.open_table(META)?, meta::SYNCED_SELF_SEQ)?.unwrap_or(0);
         let ops = tx.open_table(OPS)?;
         let Some(first) = synced.checked_add(1) else {
-            return Ok(Vec::new());
+            return Ok(Export::default());
         };
         let lo = keys::op_key(&self.node, first);
         let hi = keys::op_key(&self.node, u64::MAX);
-        let mut out = Vec::new();
+        let mut out = Export::default();
         let mut prev: u64 = synced;
         for item in ops.range(lo.as_slice()..=hi.as_slice())? {
             let (_, v) = item?;
             let row: OpRow = tables::decode("ops", v.value())?;
             let seq = row.op.body.seq;
+            if matches!(row.op.body.payload, Payload::Set { .. }) && row.op.body.hlc.ms() < cutoff {
+                out.expired.push(row.op);
+                continue;
+            }
             // Seqs are ascending and above `synced`, so `seq - 1 >= prev` here.
             if seq != prev.saturating_add(1) {
-                out.push(SyncItem::Covered {
+                out.items.push(SyncItem::Covered {
                     origin: self.node,
                     upto: seq - 1,
                 });
             }
             prev = seq;
-            out.push(SyncItem::Op(row.op));
+            out.items.push(SyncItem::Op(row.op));
         }
         Ok(out)
     }

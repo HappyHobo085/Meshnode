@@ -1282,11 +1282,11 @@ fn export_unsynced_local_ops_after_last_full_sync() {
     a.apply(b.set("s", "j", b"b").unwrap(), &AcceptAll).unwrap();
     // Never synced: every own op.
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o1), SyncItem::Op(o2)]
     );
     a.mark_full_sync(2).unwrap();
-    assert!(a.export_unsynced_local_ops().unwrap().is_empty());
+    assert!(a.export_unsynced_local_ops().unwrap().items.is_empty());
     clock.advance(1);
     let o3 = a.delete("s", "k").unwrap();
     let o4 = a.set("s", "z", b"z").unwrap();
@@ -1294,7 +1294,7 @@ fn export_unsynced_local_ops_after_last_full_sync() {
         .unwrap();
     // Seqs 1..=2 were synced: no marker below the boundary (catch-up brings them back).
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o3), SyncItem::Op(o4)]
     );
 }
@@ -1309,7 +1309,7 @@ fn own_write_during_sync_session_is_not_counted_as_synced() {
     let o2 = a.set("s", "k", b"2").unwrap();
     a.mark_full_sync(1).unwrap();
     assert_eq!(
-        a.export_unsynced_local_ops().unwrap(),
+        a.export_unsynced_local_ops().unwrap().items,
         vec![SyncItem::Op(o2)]
     );
 }
@@ -1327,7 +1327,7 @@ fn export_covers_only_holes_above_the_synced_seq() {
     let o6 = a.set("s", "j", b"3").unwrap(); // 6 supersedes 4
     clock.advance(SETTLE_MS);
     assert_eq!(a.compact().unwrap(), 4);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     // Holes 3..=4 lie above the boundary 2: one marker up to 4, nothing for 1..=2.
     assert!(matches!(
         items.as_slice(),
@@ -1390,7 +1390,7 @@ fn local_write_refused_until_exported_ops_are_reapplied() {
     let a = store(dir.path(), 1, &clock);
     a.set("s", "k", b"1").unwrap();
     a.set("s", "j", b"2").unwrap();
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     a.reset_to_empty().unwrap();
     assert!(matches!(
         a.set("s", "k", b"x"),
@@ -1473,7 +1473,7 @@ fn export_after_compaction_reapplies_without_gaps() {
     a.set("s", "k2", b"x").unwrap();
     clock.advance(SETTLE_MS + 1);
     assert_eq!(a.compact().unwrap(), 1);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     assert!(matches!(
         items.as_slice(),
         [
@@ -1511,7 +1511,7 @@ fn export_covers_holes_between_exported_ops() {
     a.set("s", "j", b"2").unwrap(); // 4 supersedes 2
     clock.advance(SETTLE_MS);
     assert_eq!(a.compact().unwrap(), 2);
-    let items = a.export_unsynced_local_ops().unwrap();
+    let items = a.export_unsynced_local_ops().unwrap().items;
     assert!(matches!(
         items.as_slice(),
         [
@@ -2073,4 +2073,54 @@ fn mutual_removal_both_records_kept() {
         assert!(r.set_contains("_mesh", "removed", &rec(1)).unwrap(), "r{n}");
         assert!(r.set_contains("_mesh", "removed", &rec(2)).unwrap(), "r{n}");
     }
+}
+
+#[test]
+fn export_puts_old_sets_in_expired() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let o1 = a.set("s", "k", b"1").unwrap();
+    let o2 = a.set_add("s", "m", b"x").unwrap();
+    clock.advance(91 * DAY_MS);
+    let o3 = a.set("s", "j", b"2").unwrap();
+    let ex = a.export_unsynced_local_ops().unwrap();
+    assert_eq!(ex.expired, vec![o1]);
+    assert_eq!(
+        ex.items,
+        vec![
+            SyncItem::Covered {
+                origin: a.node_id(),
+                upto: 1
+            },
+            SyncItem::Op(o2),
+            SyncItem::Op(o3)
+        ]
+    );
+}
+
+#[test]
+fn own_op_below_clock_skips_skew() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let o1 = a.set("s", "k", b"1").unwrap();
+    a.export_unsynced_local_ops().unwrap();
+    a.reset_to_empty().unwrap();
+    clock.set(T0 - 600_000);
+    assert_eq!(a.apply(o1, &AcceptAll).unwrap(), Outcome::Applied);
+    let foreign = hand_op(2, 1, T0, "f", b"x");
+    assert_eq!(
+        a.apply(foreign, &AcceptAll).unwrap(),
+        Outcome::Deferred(DeferReason::Skew)
+    );
+}
+
+#[test]
+fn corrupt_last_hlc_rejected() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    a.__test_set_meta_u64("last_hlc", Hlc::new((1 << 48) - 1, 0).as_u64())
+        .unwrap();
+    drop(a);
+    let r = Store::open(&db_path(dir.path(), 1), MESH, key(1), clock.clone());
+    assert!(matches!(r, Err(StoreError::Corrupt { table: "meta", .. })));
 }

@@ -15,7 +15,7 @@ Done when:
 1. Property tests show convergence across random op sets, delivery orders, duplicates, partial catch-ups and compaction, with ≥ 10 000 cases per property in CI.
 2. Every rule in §5 below has at least one example test named after the rule.
 3. The store survives a crash at any point in a write (redb transaction) with no lost or half-applied op. This is tested by killing a child process mid-write and reopening.
-4. `cargo test`, `clippy -D warnings`, `fmt --check` pass on Linux and Windows. `cargo ndk build -t arm64-v8a` compiles.
+4. `cargo test`, `clippy -D warnings`, `fmt --check` pass on Linux and Windows. `cargo ndk build -t arm64-v8a` compiles. The workspace MSRV is `rust-version = "1.90"` (raised from 1.85 during implementation: redb 4.x needs 1.90).
 
 ## 2. Change to the parent spec (made here, to be back-ported)
 
@@ -102,7 +102,7 @@ pub struct InviteTicket { pub mesh: MeshId, pub inviter: NodeAddrBytes, pub toke
 
 | Table | Key | Value |
 |---|---|---|
-| `meta` | `&str` | mesh id, local node id, local `next_seq`, `last_full_sync_ms`, schema version |
+| `meta` | `&str` | mesh id, local node id, local `next_seq`, `last_hlc`, `last_full_sync_ms`, `synced_self_seq` (§5.8), schema version |
 | `ops` | `(origin, seq)` | `SignedOp` bytes + `received_ms` |
 | `reg` | `(ns, key, origin)` | `{ order, hlc, seq, value: Option }`: **one entry per origin per key** (that origin's current winner) |
 | `set` | `(ns, set, member, origin)` | `{ hlc, seq }`: who added this member |
@@ -118,14 +118,15 @@ Reads compute the **winning register** for `(ns, key)` as the max over that key'
 The store doesn't understand membership. `mesh-core` passes it an acceptor, and the store calls it for every remote op:
 
 ```rust
-pub enum Verdict { Valid, UnknownOrigin, Invalid(&'static str) }
-pub trait Acceptor { fn judge(&self, op: &OpBody, store: &StoreView) -> Verdict; }
+pub enum Verdict { Valid, UnknownOrigin }
+pub trait Acceptor: Send + Sync { fn judge(&self, op: &OpBody, view: &ReadView<'_>) -> Verdict; }
 ```
 
-`mesh-core`'s acceptor (specified here, implemented in sub-spec 2):
-- `Valid` if the origin is in `_mesh/members` and (`origin` is not in `removed`, or `seq ≤ cutoff_seq`).
+The acceptor judges **membership only**; the removal cutoff is checked inside the store, against its `removed` table (§5.3 step 4), next to the retraction logic. `mesh-core`'s acceptor (specified here, implemented in sub-spec 2):
+- `Valid` if the origin is in `_mesh/members`.
 - `UnknownOrigin` if the origin isn't a member **yet**.
-- `Invalid` if `seq > cutoff_seq` of a removed origin.
+
+`judge` runs inside the store's write transaction with the clock mutex held: it reads only through `ReadView` (`get`, `set_contains`, `set_members`, `list_keys`, all seeing the transaction's own earlier writes) and never calls the `Store`.
 
 A test acceptor that accepts every op is provided for property tests.
 
@@ -135,13 +136,14 @@ All of these steps run in one write transaction:
 1. Check `op.body.mesh` matches and the signature verifies. Otherwise `Rejected(BadSig)`. The op isn't stored and doesn't count toward the vv.
 2. If `(origin, seq)` already exists: an identical op gives `Duplicate`. **A different op with the same seq is equivocation:** keep the first, log `error`, and return `Rejected(Equivocation)`.
 3. `Clock::observe(hlc)`. If that fails with `Skew`, put the op in `pending` (reason `Skew`) and return `Deferred`.
-4. `judge`:
+4. If the origin is in `removed` and `seq > cutoff_seq`: store it in `ops` **marked invalid** (so it counts as covered and isn't fetched again), don't merge, and return `Ignored`. Otherwise `judge`:
    - `UnknownOrigin` → put it in `pending` and return `Deferred`.
-   - `Invalid` → store it in `ops` **marked invalid** (so it counts as covered and isn't fetched again), don't merge, and return `Ignored`.
    - `Valid` → continue.
 5. If `seq > vv[origin] + 1` and the range in between isn't covered, put it in `pending` (reason `Gap`) and return `Deferred`.
 6. Merge (§5.4). Insert into `ops`, advance `vv[origin]`, then apply any `pending` ops of this origin that are now unblocked, in order.
 7. Return `Applied`, and publish `Change` events after commit.
+
+**Batches:** `apply_batch(ops, acc) -> Vec<Outcome>` applies a batch in one write transaction (one fsync) with exactly the outcomes and resulting state of calling `apply` on each op in turn; events are published after the commit. Sync sessions use it for `SyncMsg::Ops` batches.
 
 **Retrying pending ops:** `retry_pending()` runs after any `_mesh` change (a new member) and once a minute, which also covers skew that has resolved. Pending entries older than 24 h are dropped (and logged). They don't advance the vv, so a later catch-up can bring them back.
 
@@ -175,8 +177,10 @@ If a later removal record **raises** the effective cutoff (the highest one wins)
 
 ### 5.7 Tombstone GC (`gc(now)`, daily)
 
-- A `reg` row whose value is `None` and whose `hlc.ms < now − 90 days` is deleted, along with its op (leaving a "covered" marker).
-- `is_stale(now)` is true when `last_full_sync_ms < now − 80 days`. `mesh-core` then runs the re-bootstrap from parent spec §5: `export_unsynced_local_ops()`, `reset_to_empty()`, full catch-up, then re-apply the exported ops.
+- A key whose winner is a tombstone with the **empty order**, older than 90 days by **both** its `hlc.ms` and its local `received_ms`, is deleted: all of the key's `reg` rows and its ops (leaving "covered" markers). Measuring arrival too keeps a tombstone that reaches this node late (from a device that was offline) long enough to reach the other replicas. **Tombstones with a non-empty order are never GC'd:** later writes that lose to that order would otherwise resolve differently on replicas that GC'd and replicas that did not. GC does nothing while the store is stale, and skips a key that holds an own op above `synced_self_seq` (§5.8).
+- **Accepted limit:** a non-stale replica whose last full sync was with a peer that also lacked a tombstone may keep the value after the tombstone is GC'd elsewhere. A stale node must not serve `diff_since`.
+- `is_stale(now)` is true when `last_full_sync_ms < now − 80 days`; a store that never completed a full sync is never stale. `mesh-core` then runs the re-bootstrap from parent spec §5: `export_unsynced_local_ops()`, `reset_to_empty()`, full catch-up, then re-apply the exported items. `export_unsynced_local_ops()` returns `Vec<SyncItem>`: the own ops above `synced_self_seq` in seq order, with a `Covered { origin: self, upto: seq − 1 }` before each op that follows a hole above `synced_self_seq` (own ops already compacted), so re-applying never parks an op behind a gap; `Op` items are re-applied with `apply`, `Covered` items with `apply_covered`.
+- Local writes return `StoreError::Rebootstrapping` while `vv[self] ≠ next_seq − 1` (after `reset_to_empty` until the catch-up and the re-applied export restore the own ops): a write in between would set `vv[self]` past seqs the store no longer holds, and peers would skip them as covered.
 
 ### 5.8 Catch-up support
 
@@ -184,9 +188,12 @@ If a later removal record **raises** the effective cutoff (the highest one wins)
 pub fn version_vector(&self) -> VersionVector;
 /// Ops the peer lacks, in (origin, seq) order, at most `limit`, plus Covered markers for compacted ranges.
 pub fn diff_since(&self, theirs: &VersionVector, limit: usize) -> Vec<SyncItem>;   // SyncItem = Op(SignedOp) | Covered{origin, upto}
-pub fn apply_covered(&self, origin: NodeId, upto: u64);   // raise vv[origin] to `upto` (the sender compacted or GC'd that range), then drain unblocked `pending` ops of that origin
-pub fn mark_full_sync(&self, now_ms: u64);
+pub fn apply_covered(&self, origin: NodeId, upto: u64, advertised: u64, acc: &dyn Acceptor);   // raise vv[origin] to `upto` (the sender compacted or GC'd that range), then drain unblocked `pending` ops of that origin
+pub fn mark_full_sync(&self, synced_self_seq: u64);
 ```
+
+- `apply_covered`: `advertised` is the sender's `Hello` `vv[origin]`. A marker with `upto > advertised` is ignored (no-op, `warn`), and so is one for this node's own origin with `upto > u64::MAX / 2` (it would exhaust `next_seq`).
+- `mark_full_sync` is called after every **full sync**, a completed two-way exchange with a peer, including the catch-up right after joining. `synced_self_seq` is the peer's `vv[self]`: the highest own seq it confirmed holding. The store records `last_full_sync_ms = now` (for staleness) and `synced_self_seq` (the boundary for "unsynced own ops" used by GC and `export_unsynced_local_ops`, so an own write made during the session after the diff was computed never counts as synced).
 
 The store serves ops it received from other origins too. Any replica can catch up any other.
 
@@ -207,7 +214,7 @@ pub fn purge_namespace(&self, ns: &str) -> Vec<SignedOp>;             // tombsto
 
 ### 5.10 Errors and limits
 
-- All public functions return `Result<_, StoreError>` (`Io`, `Corrupt`, `Full`, `WrongMesh`, `Proto`). Read functions never panic on bad data on disk; they return `Corrupt` with the table and key.
+- All public functions return `Result<_, StoreError>` (`Io`, `Corrupt`, `Full`, `WrongMesh`, `Rebootstrapping`, `Proto`). Read functions never panic on bad data on disk; they return `Corrupt` with the table and key.
 - Opening a store whose `meta.mesh` doesn't match the expected mesh fails with `WrongMesh` (parent spec §12).
 - A disk-full error rolls the transaction back and returns `Full`.
 
@@ -218,7 +225,7 @@ pub fn purge_namespace(&self, ns: &str) -> Vec<SignedOp>;             // tombsto
 | Unit (`mesh-hlc`) | tick monotonic across a wall clock going backwards; counter overflow carries; observe rejects skew > 5 min and doesn't advance; floor respected after restart |
 | Unit (`mesh-proto`) | round-trip every type; version byte rejected; size limits; signature covers mesh id (an op from another mesh fails); ticket text round-trip and CRC failure |
 | Rule tests (`mesh-store`) | one per rule: `ordered_write_beats_newer_plain_hlc_only_when_order_higher`, `tombstone_wins_over_older_value`, `equivocation_keeps_first`, `gap_is_deferred_then_applied`, `unknown_origin_deferred_until_member`, `invalid_op_counts_as_covered`, `skew_deferred_then_applied_when_clock_catches_up`, `compaction_waits_for_settle_period`, `removal_retracts_and_restores_older_value`, `removal_after_settle_cannot_restore_and_warns`, `max_cutoff_wins_across_removals`, `tombstone_gc_after_90_days`, `stale_after_80_days`, `covered_marker_lets_peer_advance` |
-| Property (`proptest`) | **Convergence:** N ∈ 2..5 replicas, random writers/keys/orders/tombstones/set-adds; deliver to each replica in a random permutation with random duplicates and random partial catch-ups via `diff_since`; after a final full exchange all replicas give equal `get` / `list_keys` / `set_members` results. **Compaction invisibility:** compacting at random points (clock advanced past SETTLE) never changes the read results of a replica that saw every op. **Retraction determinism:** applying a removal before, during or after the removed origin's ops gives equal results (within SETTLE). |
+| Property (`proptest`) | **Convergence:** N ∈ 2..5 replicas, random writers/keys/orders/tombstones/set-adds; deliver to each replica in a random permutation with random duplicates and random partial catch-ups via `diff_since`; after a final full exchange all replicas give equal `get` / `list_keys` / `set_members` results. **Compaction invisibility:** compacting at random points (clock advanced past SETTLE) never changes the read results of a replica that saw every op. **Retraction determinism:** applying a removal before, during or after the removed origin's ops gives equal results (within SETTLE). **GC invisibility:** random `gc()` calls after the TTL, with late tombstones and later writes, never change the live reads of non-stale replicas after a final exchange. |
 | Crash safety | a child process does writes in a loop and is killed; on reopen there are no half-applied ops, and `vv` matches `ops` |
 | Bench (informational) | 100 k ops apply throughput and `get` latency on desktop; recorded, not gated |
 

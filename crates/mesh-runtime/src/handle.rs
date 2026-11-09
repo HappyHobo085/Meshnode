@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use http::{Request, Response, StatusCode, header};
@@ -37,6 +37,7 @@ pub(crate) async fn serve(
     req: Request<Bytes>,
     ctx: RequestCtx,
 ) -> Response<Bytes> {
+    let start = Instant::now();
     let limits = ctx.limits;
     let body_len = req.body().len() as u64;
     if body_len > limits.max_body_bytes {
@@ -50,8 +51,13 @@ pub(crate) async fn serve(
     let timeout = Duration::from_millis(limits.request_timeout_ms);
     let service = ctx.service.clone();
     // On timeout `run` is dropped, which aborts the guest task (`AbortOnDrop`); a guest
-    // busy in wasm is stopped by its epoch deadline, which expires at the same time.
-    match tokio::time::timeout(timeout, run(pre, shared, req, ctx)).await {
+    // busy in wasm is stopped by its epoch deadline, set to expire at the same time.
+    // Limits from a validated manifest are at most 300 s; cap absurd values instead of
+    // overflowing `Instant`.
+    let deadline = start
+        .checked_add(timeout)
+        .unwrap_or_else(|| start + Duration::from_secs(86_400));
+    match tokio::time::timeout_at(deadline.into(), run(pre, shared, req, ctx, deadline)).await {
         Ok(resp) => resp,
         Err(_) => {
             tracing::warn!(service, "request timed out after {timeout:?}");
@@ -60,14 +66,15 @@ pub(crate) async fn serve(
     }
 }
 
-/// Waits for an in-flight slot, instantiates `pre` in a new store, calls
-/// `wasi:http/incoming-handler.handle` and collects the response. Every failure becomes
-/// an error status.
+/// Waits for an in-flight slot, instantiates `pre` in a new store whose epoch deadline is
+/// the time left until `deadline`, calls `wasi:http/incoming-handler.handle` and collects
+/// the response. Every failure becomes an error status.
 async fn run(
     pre: &ProxyPre<State>,
     shared: &Shared,
     req: Request<Bytes>,
     ctx: RequestCtx,
+    deadline: Instant,
 ) -> Response<Bytes> {
     let RequestCtx {
         service,
@@ -87,7 +94,9 @@ async fn run(
     let state = State::new(&service, kv, node_id, kv_status.clone(), limits.memory_mb);
     let mut store = Store::new(pre.engine(), state);
     store.limiter(State::limiter);
-    store.set_epoch_deadline(deadline_ticks(limits.request_timeout_ms));
+    // The wait for a slot has used up part of the timeout; only the rest is left.
+    let left = deadline.saturating_duration_since(Instant::now());
+    store.set_epoch_deadline(deadline_ticks(left));
 
     let scheme = match req.uri().scheme_str() {
         Some("https") => Scheme::Https,

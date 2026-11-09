@@ -366,3 +366,63 @@ async fn in_flight_cap_queues_then_times_out() {
     .await;
     assert_eq!(status, http::StatusCode::OK);
 }
+
+/// The epoch deadline counts the time spent waiting for a slot: a spinning guest that
+/// got its slot late is stopped when its request times out, not a full timeout later.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_spin_frees_slot_within_one_timeout() {
+    let rt = Arc::new(runtime(1));
+    let counter = load(&rt, "counter", 1).await;
+    let spin = load(&rt, "spin", 2).await;
+    let echo = load(&rt, "echo", 3).await;
+    let before = rt.instantiations();
+
+    // Hold the only slot for 1.2 s with a guest parked in a host call.
+    let holder = tokio::spawn({
+        let rt = rt.clone();
+        async move {
+            serve_within(
+                &rt,
+                &counter,
+                get("/"),
+                ctx_with_kv(timeout_ms(1_200), Arc::new(StalledKv)),
+                Duration::from_secs(20),
+            )
+            .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.instantiations() == before {
+        assert!(Instant::now() < deadline, "holder was never instantiated");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Queue a spin with 1.5 s: it gets the slot after ~1.2 s, leaving ~0.3 s to run.
+    let start = Instant::now();
+    let (status, _) = serve_within(
+        &rt,
+        &spin,
+        get("/"),
+        ctx(timeout_ms(1_500)),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(holder.await.unwrap().0, http::StatusCode::GATEWAY_TIMEOUT);
+
+    // The slot is free once the spin's 1.5 s are up, not 1.2 s + a fresh 1.5 s later.
+    let (status, _) = serve_within(
+        &rt,
+        &echo,
+        get("/?size=3"),
+        ctx(timeout_ms(5_000)),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let took = start.elapsed();
+    assert!(
+        took < Duration::from_millis(2_250),
+        "slot freed after {took:?}"
+    );
+}

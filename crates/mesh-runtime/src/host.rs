@@ -43,7 +43,7 @@ pub(crate) struct State {
     kv: Arc<dyn KvBackend>,
     node_id: NodeId,
     kv_status: KvStatus,
-    limits: StoreLimits,
+    limiter: Limiter,
 }
 
 /// The HTTP status of a backend error that trapped the guest; 0 while there was none.
@@ -59,7 +59,7 @@ impl KvStatus {
 
 impl State {
     /// No preopens, no environment, no arguments, stdin closed, stdout and stderr to
-    /// [`guest_output`]; resources capped by [`store_limits`].
+    /// [`guest_output`]; resources capped by a [`Limiter`].
     pub(crate) fn new(
         service: &str,
         kv: Arc<dyn KvBackend>,
@@ -78,13 +78,13 @@ impl State {
             kv,
             node_id,
             kv_status,
-            limits: store_limits(memory_mb),
+            limiter: Limiter::new(memory_mb),
         }
     }
 
     /// For [`wasmtime::Store::limiter`].
     pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
-        &mut self.limits
+        &mut self.limiter
     }
 }
 
@@ -95,20 +95,89 @@ const MAX_INSTANCES: usize = 32;
 /// memory), which wasmtime does not count against `memory_mb`.
 const MAX_TABLES: usize = 16;
 const MAX_TABLE_ELEMENTS: usize = 100_000;
-/// One linear memory, so `memory_mb` caps the request's whole linear memory, not each of
-/// several memories (wasmtime's `memory_size` limit applies per memory).
-const MAX_MEMORIES: usize = 1;
+/// Linear memories one request may create; their combined size is capped by `memory_mb`.
+const MAX_MEMORIES: usize = 16;
 
-/// Caps a request's linear memory at `memory_mb` MiB (failing growth makes the guest's
-/// allocator fail, which traps) and bounds the instances and tables it can create.
-fn store_limits(memory_mb: u32) -> StoreLimits {
-    StoreLimitsBuilder::new()
-        .memory_size((memory_mb as usize).saturating_mul(1 << 20))
-        .memories(MAX_MEMORIES)
-        .instances(MAX_INSTANCES)
-        .tables(MAX_TABLES)
-        .table_elements(MAX_TABLE_ELEMENTS)
-        .build()
+/// A request's resource limits: the combined size of all its linear memories is capped
+/// at `memory_mb` MiB (a refused growth makes `memory.grow` return -1, so the guest's
+/// allocator fails and it traps), and instances, tables and table elements are bounded.
+///
+/// Wasmtime's own `StoreLimits::memory_size` applies to each memory separately, so the
+/// memory total is tracked here; everything else is delegated to a `StoreLimits`.
+pub(crate) struct Limiter {
+    memory_cap: usize,
+    /// Bytes of linear memory granted so far, across all memories of the store.
+    memory_total: usize,
+    /// The growth last granted, taken back if wasmtime then fails to perform it.
+    memory_pending: usize,
+    others: StoreLimits,
+}
+
+impl Limiter {
+    pub(crate) fn new(memory_mb: u32) -> Self {
+        Limiter {
+            memory_cap: (memory_mb as usize).saturating_mul(1 << 20),
+            memory_total: 0,
+            memory_pending: 0,
+            others: StoreLimitsBuilder::new()
+                .memories(MAX_MEMORIES)
+                .instances(MAX_INSTANCES)
+                .tables(MAX_TABLES)
+                .table_elements(MAX_TABLE_ELEMENTS)
+                .build(),
+        }
+    }
+}
+
+impl ResourceLimiter for Limiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let growth = desired.saturating_sub(current);
+        let fits = self
+            .memory_total
+            .checked_add(growth)
+            .is_some_and(|total| total <= self.memory_cap);
+        if !fits || !self.others.memory_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        self.memory_total += growth;
+        self.memory_pending = growth;
+        Ok(true)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_total -= std::mem::take(&mut self.memory_pending);
+        self.others.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.others.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.others.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.others.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.others.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.others.memories()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -262,5 +331,58 @@ impl store::Host for State {
     }
     async fn node_id(&mut self) -> wasmtime::Result<Vec<u8>> {
         Ok(self.node_id.0.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasmtime::{Memory, MemoryType, Store};
+
+    use super::*;
+
+    /// 64 KiB wasm pages per MiB.
+    const PAGES_PER_MIB: u32 = 16;
+
+    fn store(memory_mb: u32) -> Store<Limiter> {
+        let mut store = Store::new(&Engine::default(), Limiter::new(memory_mb));
+        store.limiter(|l| l);
+        store
+    }
+
+    fn memory(store: &mut Store<Limiter>, mib: u32) -> wasmtime::Result<Memory> {
+        Memory::new(store, MemoryType::new(mib * PAGES_PER_MIB, None))
+    }
+
+    #[test]
+    fn memory_cap_sums_all_memories() {
+        let mut store = store(16);
+        let a = memory(&mut store, 9).expect("9 MiB fits under 16");
+        let b = memory(&mut store, 1).expect("10 MiB in total fits under 16");
+        // Each memory alone would stay under the cap; together they would not.
+        assert!(b.grow(&mut store, u64::from(8 * PAGES_PER_MIB)).is_err());
+        assert!(a.grow(&mut store, u64::from(8 * PAGES_PER_MIB)).is_err());
+        assert!(memory(&mut store, 7).is_err());
+        // Growth that keeps the total within the cap is granted, up to exactly 16 MiB.
+        b.grow(&mut store, u64::from(6 * PAGES_PER_MIB)).unwrap();
+        assert_eq!(
+            a.size(&store) + b.size(&store),
+            u64::from(16 * PAGES_PER_MIB)
+        );
+        assert!(b.grow(&mut store, 1).is_err());
+    }
+
+    #[test]
+    fn instance_and_table_bounds_still_apply() {
+        let limiter = Limiter::new(16);
+        assert_eq!(limiter.instances(), MAX_INSTANCES);
+        assert_eq!(limiter.tables(), MAX_TABLES);
+        assert_eq!(limiter.memories(), MAX_MEMORIES);
+        let mut limiter = limiter;
+        assert!(
+            !limiter
+                .table_growing(0, MAX_TABLE_ELEMENTS + 1, None)
+                .unwrap()
+        );
+        assert!(limiter.table_growing(0, MAX_TABLE_ELEMENTS, None).unwrap());
     }
 }

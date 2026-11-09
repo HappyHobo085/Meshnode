@@ -11,10 +11,12 @@ use crate::RuntimeError;
 /// How often the engine's epoch advances; request deadlines are counted in these ticks.
 pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
 
-/// The epoch deadline, in ticks from now, for a request allowed `timeout_ms`: at least
-/// one tick.
-pub(crate) fn deadline_ticks(timeout_ms: u64) -> u64 {
-    (timeout_ms / EPOCH_TICK.as_millis() as u64).max(1)
+/// The epoch deadline, in ticks from now, for a request with `left` to run: at least one
+/// tick.
+pub(crate) fn deadline_ticks(left: Duration) -> u64 {
+    u64::try_from(left.as_nanos() / EPOCH_TICK.as_nanos())
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 /// One engine per node: Cranelift, epoch interruption for deadlines. Async host calls and

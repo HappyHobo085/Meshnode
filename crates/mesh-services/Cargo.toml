@@ -1,0 +1,25 @@
+[package]
+name = "mesh-services"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-proto = { path = "../mesh-proto" }
+mesh-runtime = { path = "../mesh-runtime" }
+async-trait.workspace = true
+mesh-store = { path = "../mesh-store" }
+blake3.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
+mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
+mesh-hlc = { path = "../mesh-hlc" }
+tempfile.workspace = true
+wat.workspace = true

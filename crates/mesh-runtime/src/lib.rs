@@ -9,6 +9,8 @@ mod host;
 mod kv;
 mod outbound;
 mod stdio;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_fixtures;
 
 use std::fmt;
 use std::path::PathBuf;

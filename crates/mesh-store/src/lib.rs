@@ -10,6 +10,7 @@ mod local;
 mod maint;
 pub mod merge;
 mod read;
+mod removal;
 mod sync;
 mod tables;
 
@@ -20,6 +21,7 @@ pub use apply::{
 pub use error::StoreError;
 pub use maint::{SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
+pub use removal::RemovalReport;
 pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;

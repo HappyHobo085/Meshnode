@@ -66,7 +66,6 @@ pub(crate) fn reg_key(ns: &str, key: &str, origin: &NodeId) -> Vec<u8> {
 /// A decoded `reg` key, borrowing from the raw bytes.
 pub(crate) struct RegKey<'a> {
     pub ns: &'a [u8],
-    #[allow(dead_code)] // used by removal retraction (change events)
     pub key: &'a [u8],
     /// `ns ‖ 0 ‖ key ‖ 0`: identical for all rows of one key.
     pub group: &'a [u8],
@@ -112,7 +111,6 @@ pub(crate) struct SetKey<'a> {
     /// `ns ‖ 0 ‖ set ‖ 0`: identical for all rows of one set.
     pub group: &'a [u8],
     pub member: &'a [u8],
-    #[allow(dead_code)] // used by removal retraction
     pub origin: NodeId,
 }
 

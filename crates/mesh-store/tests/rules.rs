@@ -1367,3 +1367,207 @@ fn gc_never_runs_on_own_ops_of_a_never_synced_store() {
     a.mark_full_sync().unwrap();
     assert_eq!(a.gc().unwrap(), 1);
 }
+
+// ---- Task 7: removal retraction ----
+
+use mesh_store::RemovalReport;
+
+fn no_change() -> RemovalReport {
+    RemovalReport {
+        retracted_ops: 0,
+        restored_keys: 0,
+        unrestorable_keys: Vec::new(),
+    }
+}
+
+#[test]
+fn removal_retracts_and_restores_older_value() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    b.apply(x.set("s", "k", b"1").unwrap(), &AcceptAll).unwrap();
+    b.apply(x.set("s", "k", b"2").unwrap(), &AcceptAll).unwrap();
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    let mut rx = b.subscribe();
+    let r = b.on_removal(node(1), 1).unwrap();
+    assert_eq!(r.retracted_ops, 1);
+    assert_eq!(r.restored_keys, 1);
+    assert!(r.unrestorable_keys.is_empty());
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(b.get_entry("s", "k").unwrap().unwrap().seq, 1);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Change {
+            ns: "s".into(),
+            kind: ChangeKind::Key("k".into()),
+            local: false
+        }
+    );
+    // Retracted ops still count as covered.
+    assert_eq!(b.vv_of(node(1)).unwrap(), 2);
+    // The restored winner survives compaction; the retracted op is compacted later.
+    clock.advance(SETTLE_MS + 1);
+    b.compact().unwrap();
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"1".to_vec()));
+}
+
+#[test]
+fn ops_above_cutoff_arriving_later_are_ignored_but_covered() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let op1 = x.set("s", "k", b"1").unwrap();
+    let op2 = x.set("s", "k", b"2").unwrap();
+    assert_eq!(b.on_removal(node(1), 1).unwrap(), no_change());
+    assert_eq!(b.apply(op1, &AcceptAll).unwrap(), Outcome::Applied);
+    assert_eq!(b.apply(op2, &AcceptAll).unwrap(), Outcome::Ignored);
+    assert_eq!(b.vv_of(node(1)).unwrap(), 2);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"1".to_vec()));
+}
+
+#[test]
+fn removal_before_or_after_ops_gives_same_result() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let y = store(dir.path(), 4, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let c = store(dir.path(), 3, &clock);
+    let mut ops = vec![
+        y.set("s", "k", b"y").unwrap(),
+        y.set_add("s", "m", b"shared").unwrap(),
+    ];
+    clock.advance(10);
+    ops.extend([
+        x.set("s", "k", b"x1").unwrap(),         // seq 1: wins over y
+        x.set("s", "only-x", b"a").unwrap(),     // seq 2
+        x.set_add("s", "m", b"early").unwrap(),  // seq 3
+        x.set("s", "k", b"x2").unwrap(),         // seq 4: retracted
+        x.set("s", "late", b"z").unwrap(),       // seq 5: retracted
+        x.set_add("s", "m", b"late").unwrap(),   // seq 6: retracted
+        x.set_add("s", "m", b"shared").unwrap(), // seq 7: retracted, y keeps it
+        x.delete("s", "only-x").unwrap(),        // seq 8: retracted
+    ]);
+    for op in ops.clone() {
+        b.apply(op, &AcceptAll).unwrap();
+    }
+    let r = b.on_removal(node(1), 3).unwrap();
+    assert_eq!(r.retracted_ops, 5);
+    assert_eq!(r.restored_keys, 2);
+    assert!(r.unrestorable_keys.is_empty(), "plain delete of `late`");
+
+    assert_eq!(c.on_removal(node(1), 3).unwrap(), no_change());
+    for op in ops {
+        c.apply(op, &AcceptAll).unwrap();
+    }
+    for k in ["k", "only-x", "late"] {
+        assert_eq!(
+            b.get_entry("s", k).unwrap(),
+            c.get_entry("s", k).unwrap(),
+            "{k}"
+        );
+    }
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"x1".to_vec()));
+    assert_eq!(b.get("s", "only-x").unwrap(), Some(b"a".to_vec()));
+    assert_eq!(b.get("s", "late").unwrap(), None);
+    assert_eq!(
+        b.list_keys("s", "", None, 100).unwrap(),
+        c.list_keys("s", "", None, 100).unwrap()
+    );
+    let members = b.set_members("s", "m", None, 100).unwrap();
+    assert_eq!(members, c.set_members("s", "m", None, 100).unwrap());
+    assert_eq!(members, vec![b"early".to_vec(), b"shared".to_vec()]);
+    assert_eq!(b.version_vector().unwrap(), c.version_vector().unwrap());
+}
+
+#[test]
+fn max_cutoff_wins_across_removals() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    b.apply(x.set("s", "k", b"1").unwrap(), &AcceptAll).unwrap();
+    b.apply(x.set("s", "k", b"2").unwrap(), &AcceptAll).unwrap();
+    b.apply(x.set_add("s", "m", b"a").unwrap(), &AcceptAll)
+        .unwrap();
+    b.apply(x.set("s", "k", b"4").unwrap(), &AcceptAll).unwrap();
+    b.on_removal(node(1), 1).unwrap();
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"1".to_vec()));
+    assert!(!b.set_contains("s", "m", b"a").unwrap());
+
+    // Raise: seqs 2 and 3 are valid again and re-merged; seq 4 stays retracted.
+    let mut rx = b.subscribe();
+    let r = b.on_removal(node(1), 3).unwrap();
+    assert_eq!(r.retracted_ops, 0);
+    assert_eq!(r.restored_keys, 1);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"2".to_vec()));
+    assert!(b.set_contains("s", "m", b"a").unwrap());
+    let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|c| c.kind)
+        .collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.contains(&ChangeKind::Key("k".into())));
+    assert!(got.contains(&ChangeKind::Set("m".into())));
+
+    // Equal or lower: no change.
+    assert_eq!(b.on_removal(node(1), 1).unwrap(), no_change());
+    assert_eq!(b.on_removal(node(1), 3).unwrap(), no_change());
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"2".to_vec()));
+
+    // Raising past everything brings back the latest value.
+    b.on_removal(node(1), 10).unwrap();
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"4".to_vec()));
+
+    // Re-merged losers are superseded again and compact; the winner stays.
+    clock.advance(SETTLE_MS + 1);
+    assert_eq!(b.compact().unwrap(), 2);
+    assert_eq!(b.get("s", "k").unwrap(), Some(b"4".to_vec()));
+    assert!(b.set_contains("s", "m", b"a").unwrap());
+}
+
+#[test]
+fn set_adds_above_cutoff_are_retracted() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let y = store(dir.path(), 4, &clock);
+    let b = store(dir.path(), 2, &clock);
+    b.apply(x.set_add("s", "m", b"keep").unwrap(), &AcceptAll)
+        .unwrap();
+    b.apply(x.set_add("s", "m", b"m").unwrap(), &AcceptAll)
+        .unwrap();
+    b.apply(x.set_add("s", "m", b"both").unwrap(), &AcceptAll)
+        .unwrap();
+    b.apply(y.set_add("s", "m", b"both").unwrap(), &AcceptAll)
+        .unwrap();
+    let mut rx = b.subscribe();
+    let r = b.on_removal(node(1), 1).unwrap();
+    assert_eq!(r.retracted_ops, 2);
+    assert!(b.set_contains("s", "m", b"keep").unwrap());
+    assert!(!b.set_contains("s", "m", b"m").unwrap());
+    assert!(b.set_contains("s", "m", b"both").unwrap());
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Change {
+            ns: "s".into(),
+            kind: ChangeKind::Set("m".into()),
+            local: false
+        }
+    );
+}
+
+#[test]
+fn removal_after_settle_cannot_restore_and_warns() {
+    let (dir, clock) = setup();
+    let x = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    b.apply(x.set("s", "k", b"1").unwrap(), &AcceptAll).unwrap();
+    b.apply(x.set("s", "k", b"2").unwrap(), &AcceptAll).unwrap();
+    clock.advance(7 * DAY_MS + 1);
+    assert_eq!(b.compact().unwrap(), 1);
+    let r = b.on_removal(node(1), 1).unwrap();
+    assert_eq!(b.get("s", "k").unwrap(), None);
+    assert!(b.get_entry("s", "k").unwrap().is_none());
+    assert_eq!(r.restored_keys, 0);
+    assert_eq!(
+        r.unrestorable_keys,
+        vec![("s".to_string(), "k".to_string())]
+    );
+}

@@ -1,10 +1,13 @@
 //! Minimal content-addressed blobs (spec §8): an iroh-blobs `FsStore` at `<data>/blobs/`,
 //! served behind the membership gate, fetched from online members in RTT order and
-//! protected from GC by a named pin tag. iroh-blobs' own GC is never switched on.
+//! protected from GC by a named pin tag. iroh-blobs' GC loop is on but gated: its protect
+//! callback aborts every run unless `Blobs::remove` armed one, so nothing is ever collected
+//! on its own. Fetches hold a temp tag so an armed sweep cannot take their data.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,8 +24,8 @@ use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use mesh_proto::NodeId;
 use n0_future::StreamExt;
 use tokio::sync::watch;
-use tokio::time::timeout;
-use tracing::{debug, warn};
+use tokio::time::{Instant, timeout};
+use tracing::{debug, error, warn};
 
 use crate::error::NodeError;
 use crate::membership::MembershipSnapshot;
@@ -37,10 +40,9 @@ const DIR: &str = "blobs";
 const MAX_COLLECTION_ROOT: u64 = 16 << 20;
 
 const PIN_PREFIX: &str = "meshnode/pin/";
-/// How often iroh-blobs' GC loop wakes (it only marks, and aborts unless `remove` armed it).
-const GC_TICK: Duration = Duration::from_secs(1);
-/// How long `remove` waits for its sweep (a few ticks plus the sweep itself).
-const SWEEP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Slack added to three GC ticks before the GC loop counts as dead (a long mark phase on a
+/// big store delays a tick).
+const LOOP_GRACE: Duration = Duration::from_secs(5);
 
 /// What a pin protects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,18 +57,24 @@ fn pin_tag(hash: &Hash) -> String {
     format!("{PIN_PREFIX}{hash}")
 }
 
+fn err(e: impl std::fmt::Display) -> NodeError {
+    NodeError::Iroh(e.to_string())
+}
+
 /// Coordinates `remove` with iroh-blobs' GC loop, which is the only public way to delete
-/// data. The loop wakes every [`GC_TICK`]; its protect callback (run after the mark phase,
+/// data. The loop wakes every `tick`; its protect callback (run after the mark phase,
 /// before the sweep) aborts the run unless a `remove` armed it, so nothing untagged is
-/// ever deleted otherwise.
-#[derive(Default)]
+/// ever deleted otherwise. A `remove` takes about three ticks.
 struct Sweep {
     /// Serialises `remove` calls.
     lock: tokio::sync::Mutex<()>,
     state: watch::Sender<SweepState>,
+    tick: Duration,
+    /// Set once the dead loop has been logged.
+    reported_dead: AtomicBool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct SweepState {
     /// 0 idle; 1 armed, but a run already past its mark phase may still call back (it may
     /// have read the tags before the pin was deleted); 2 the next run's mark began after
@@ -76,14 +84,37 @@ struct SweepState {
     ticks: u64,
     /// The tick that let a sweep proceed.
     swept_at: u64,
+    /// When the loop last called back (or was started).
+    last_tick: Instant,
 }
 
 impl Sweep {
+    fn new(tick: Duration) -> Sweep {
+        Sweep {
+            lock: tokio::sync::Mutex::new(()),
+            state: watch::channel(SweepState {
+                phase: 0,
+                ticks: 0,
+                swept_at: 0,
+                last_tick: Instant::now(),
+            })
+            .0,
+            tick,
+            reported_dead: AtomicBool::new(false),
+        }
+    }
+
+    /// No callback for this long means iroh's GC loop ended (it stops for good on a GC error).
+    fn dead_after(&self) -> Duration {
+        self.tick * 3 + LOOP_GRACE
+    }
+
     /// The GC loop's protect callback.
     fn on_run(&self) -> ProtectOutcome {
         let mut out = ProtectOutcome::Abort;
         self.state.send_modify(|s| {
             s.ticks += 1;
+            s.last_tick = Instant::now();
             match s.phase {
                 1 => s.phase = 2,
                 2 => {
@@ -97,35 +128,53 @@ impl Sweep {
         out
     }
 
+    fn dead(&self) -> NodeError {
+        if !self.reported_dead.swap(true, Ordering::SeqCst) {
+            error!("blob GC loop has stopped; blobs can no longer be removed until restart");
+        }
+        err("blob GC loop has stopped; blobs cannot be removed until the node restarts")
+    }
+
+    /// Waits until `done` holds, failing if the loop goes quiet for `dead_after`.
+    async fn wait(
+        &self,
+        rx: &mut watch::Receiver<SweepState>,
+        done: impl Fn(&SweepState) -> bool,
+    ) -> Result<SweepState, NodeError> {
+        loop {
+            let s = *rx.borrow_and_update();
+            if done(&s) {
+                return Ok(s);
+            }
+            if s.last_tick.elapsed() > self.dead_after() {
+                return Err(self.dead());
+            }
+            // Wake to re-check the loop's age even if no tick arrives.
+            let _ = timeout(self.dead_after(), rx.changed()).await;
+        }
+    }
+
     /// Waits until a full GC run that started after this call has swept.
     async fn run_sweep(&self) -> Result<(), NodeError> {
         let _g = self.lock.lock().await;
+        if self.state.borrow().last_tick.elapsed() > self.dead_after() {
+            return Err(self.dead());
+        }
         let mut rx = self.state.subscribe();
         let before = self.state.borrow().swept_at;
         self.state.send_modify(|s| s.phase = 1);
-        let wait = async {
-            let at = rx
-                .wait_for(|s| s.swept_at > before)
-                .await
-                .map_err(err)?
-                .swept_at;
+        let r = async {
+            let at = self.wait(&mut rx, |s| s.swept_at > before).await?.swept_at;
             // The run that swept ends before the next one calls back.
-            rx.wait_for(|s| s.ticks > at).await.map_err(err)?;
+            self.wait(&mut rx, |s| s.ticks > at).await?;
             Ok(())
         };
-        let r = match timeout(SWEEP_TIMEOUT, wait).await {
-            Ok(r) => r,
-            Err(_) => Err(err("blob sweep timed out")),
-        };
+        let r = r.await;
         if r.is_err() {
             self.state.send_modify(|s| s.phase = 0);
         }
         r
     }
-}
-
-fn err(e: impl std::fmt::Display) -> NodeError {
-    NodeError::Iroh(e.to_string())
 }
 
 /// Where `fetch` learns its peers from.
@@ -168,15 +217,16 @@ impl Blobs {
         data_dir: &Path,
         endpoint: &Endpoint,
         source: PeerSource,
+        gc_tick: Duration,
     ) -> Result<Blobs, NodeError> {
         let root = data_dir.join(DIR);
         let mut opts = Options::new(&root);
         // spec §8: iroh-blobs never collects on its own. Its loop only wakes to let
         // `remove` run a sweep (see `Sweep`); every other run aborts.
-        let sweep = Arc::new(Sweep::default());
+        let sweep = Arc::new(Sweep::new(gc_tick));
         let cb = sweep.clone();
         opts.gc = Some(GcConfig {
-            interval: GC_TICK,
+            interval: gc_tick,
             add_protected: Some(Arc::new(move |_live| {
                 let out = cb.on_run();
                 Box::pin(async move { out })
@@ -252,8 +302,9 @@ impl Blobs {
     /// iroh-blobs 0.104 has no public delete: blobs are deleted only by its GC, which
     /// deletes everything untagged. So this deletes the pin tag, then lets one GC run
     /// (started after the tag is gone) sweep; anything still tagged survives, including a
-    /// collection's children shared with another pin. It takes a few seconds. Data that is
-    /// untagged at that moment (an unfinished fetch) goes too and is fetched again later.
+    /// collection's children shared with another pin, and data an in-flight fetch holds a
+    /// temp tag on. It takes about three `Timings::blob_gc_tick`s. Fails fast if the GC loop
+    /// has stopped.
     pub async fn remove(&self, hash: Hash) -> Result<(), NodeError> {
         let deleted = self
             .api()
@@ -358,6 +409,8 @@ impl Blobs {
     /// A no-op if it is already here. A call has no deadline of its own; wrap it in a
     /// timeout. For a collection use [`Blobs::fetch_collection`].
     pub async fn fetch(&self, hash: Hash) -> Result<(), NodeError> {
+        // Held until the pin exists, so an armed sweep cannot take the data meanwhile.
+        let _tt = self.temp_tag(HashAndFormat::raw(hash)).await?;
         if self.root_complete(hash).await? {
             if self.pinned_format(hash).await?.is_none() {
                 self.pin(hash, BlobFormat::Raw).await?;
@@ -369,10 +422,15 @@ impl Blobs {
 
     /// Like [`Blobs::fetch`] for a collection: the root and all its children.
     pub async fn fetch_collection(&self, hash: Hash) -> Result<(), NodeError> {
+        let _tt = self.temp_tag(HashAndFormat::hash_seq(hash)).await?;
         if self.has_collection(hash).await? {
             return self.pin(hash, BlobFormat::HashSeq).await;
         }
         self.fetch_with(HashAndFormat::hash_seq(hash)).await
+    }
+
+    async fn temp_tag(&self, req: HashAndFormat) -> Result<iroh_blobs::api::TempTag, NodeError> {
+        self.api().tags().temp_tag(req).await.map_err(err)
     }
 
     async fn fetch_with(&self, req: HashAndFormat) -> Result<(), NodeError> {

@@ -416,6 +416,7 @@ pub(crate) async fn start(
             peers: peers.clone(),
             me,
         },
+        cfg.timings.blob_gc_tick,
     )
     .await?;
     let router = Router::builder(endpoint.clone())

@@ -288,3 +288,40 @@ async fn remove_collection_keeps_shared_child() {
     );
     a.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_during_fetch_collection_keeps_fetched_data() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = pair(da.path(), db.path()).await;
+    let entries: Vec<(String, Bytes)> = (0..40u8)
+        .map(|i| {
+            let mut v = data(1 << 20).to_vec();
+            v[0] = i; // distinct children
+            (format!("f{i}.bin"), Bytes::from(v))
+        })
+        .collect();
+    let coll = a.blobs().add_named_for_test(entries).await.unwrap();
+    // Keep B's blob store busy with sweeps while the fetch runs.
+    let fetch = {
+        let b = b.handle();
+        tokio::spawn(async move { b.blobs().fetch_collection(coll).await })
+    };
+    let mut n = 0u32;
+    while !fetch.is_finished() {
+        n += 1;
+        let h = b
+            .blobs()
+            .add_bytes(Bytes::from(n.to_be_bytes().to_vec()))
+            .await
+            .unwrap();
+        timeout(T, b.blobs().remove(h))
+            .await
+            .expect("remove timed out")
+            .unwrap();
+    }
+    timeout(T, fetch).await.unwrap().unwrap().unwrap();
+    assert!(n >= 1, "at least one sweep overlapped");
+    assert!(b.blobs().has_collection(coll).await.unwrap());
+    a.shutdown().await;
+    b.shutdown().await;
+}

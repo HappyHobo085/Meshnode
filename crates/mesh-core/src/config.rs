@@ -27,6 +27,9 @@ pub struct Timings {
     pub compact: Duration,
     pub gc: Duration,
     pub invite_prune: Duration,
+    /// How often the blob store's GC loop wakes (it only marks, unless a `Blobs::remove`
+    /// armed it). `remove` can take about 3 ticks.
+    pub blob_gc_tick: Duration,
 }
 
 impl Default for Timings {
@@ -40,6 +43,7 @@ impl Default for Timings {
             compact: Duration::from_secs(3600),
             gc: Duration::from_secs(24 * 3600),
             invite_prune: Duration::from_secs(3600),
+            blob_gc_tick: Duration::from_secs(30),
         }
     }
 }
@@ -57,6 +61,7 @@ impl Timings {
             compact: hour,
             gc: hour,
             invite_prune: hour,
+            blob_gc_tick: Duration::from_millis(200),
         }
     }
 }

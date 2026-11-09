@@ -41,6 +41,22 @@ pub fn member_bytes(id: &NodeId, role: Role) -> [u8; MEMBER_LEN] {
     b
 }
 
+/// `_mesh` register value of `info/<hex>`: raw postcard, no version byte.
+pub fn encode_info(info: &MemberInfo) -> Vec<u8> {
+    // Serializing into a Vec cannot fail for this type.
+    postcard::to_allocvec(info).unwrap_or_default()
+}
+
+/// `_mesh` register value of `addr/<hex>`: the address bytes as they are.
+pub fn encode_addr(addr: &NodeAddrBytes) -> Vec<u8> {
+    addr.0.clone()
+}
+
+/// `_mesh` set `removed` element: raw postcard, no version byte.
+pub fn encode_removal(rec: &RemovalRecord) -> Vec<u8> {
+    postcard::to_allocvec(rec).unwrap_or_default()
+}
+
 /// Judges membership only; the removal cutoff is enforced inside the store.
 pub struct MeshAcceptor {
     genesis: MeshGenesis,
@@ -207,6 +223,16 @@ impl MembershipSnapshot {
             .filter(|id| !self.removed.contains_key(id))
             .copied()
             .collect()
+    }
+
+    /// Every member (effective or not), in `NodeId` order.
+    pub fn members(&self) -> impl Iterator<Item = (&NodeId, &MemberEntry)> {
+        self.members.iter()
+    }
+
+    /// Every node with at least one removal record, with its effective removal.
+    pub fn removals(&self) -> impl Iterator<Item = (&NodeId, &Removal)> {
+        self.removed.iter()
     }
 
     pub fn info(&self, id: &NodeId) -> Option<&MemberInfo> {

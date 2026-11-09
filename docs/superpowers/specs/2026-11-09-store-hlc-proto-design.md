@@ -136,7 +136,7 @@ All of these steps run in one write transaction:
 1. Check `op.body.mesh` matches and the signature verifies. Otherwise `Rejected(BadSig)`. The op isn't stored and doesn't count toward the vv.
 2. If `(origin, seq)` already exists: an identical op gives `Duplicate`. **A different op with the same seq is equivocation:** keep the first, log `error`, and return `Rejected(Equivocation)`.
 3. `Clock::observe(hlc)`. If that fails with `Skew`, put the op in `pending` (reason `Skew`) and return `Deferred`. **Exemption:** an own-origin op with `hlc ≤ clock.last()` skips the skew check, so a re-bootstrap after the wall clock moved back does not block local writes until the clock catches up *(back-ported from sub-spec 2)*.
-4. If the origin is in `removed` and `seq > cutoff_seq`: store it in `ops` **marked invalid** (so it counts as covered and isn't fetched again), don't merge, and return `Ignored`. Otherwise `judge`:
+4. If the origin is in `removed` and `seq > cutoff_seq` (removal records are exempt: see §5.6 exemption, back-ported from sub-spec 2): store it in `ops` **marked invalid** (so it counts as covered and isn't fetched again), don't merge, and return `Ignored`. Otherwise `judge`:
    - `UnknownOrigin` → put it in `pending` and return `Deferred`.
    - `Valid` → continue.
 5. If `seq > vv[origin] + 1` and the range in between isn't covered, put it in `pending` (reason `Gap`) and return `Deferred`.
@@ -165,9 +165,9 @@ All of these steps run in one write transaction:
 
 ### 5.6 Retracting a removed origin (`on_removal(origin, cutoff_seq)`)
 
-`mesh-core` calls this when a `_mesh/removed` record is merged or its effective cutoff changes. In one transaction:
 **Exemption *(back-ported from sub-spec 2)*:** adds to the set `CUTOFF_EXEMPT_SET` (`_mesh`/`removed`, the removal records) are exempt from steps 1 and 3 here, and from the "ignored above the cutoff" rule in §5.3 step 4: a removal record whose origin is later removed stays valid and stays in the set. Other ops are unaffected.
 
+`mesh-core` calls this when a `_mesh/removed` record is merged or its effective cutoff changes. In one transaction:
 1. For every `ops` row of `origin` with `seq > cutoff_seq`: mark it invalid.
 2. For every `reg` row of `origin` whose `seq > cutoff_seq`: replace it with that origin's best remaining op for the key with `seq ≤ cutoff_seq` (found in `ops`, which still holds it unless it was superseded more than `SETTLE` ago), or delete the row if there is none. A restored op is removed from `superseded`, so compaction can't delete the new winner.
 3. For every `set` row of `origin` with `seq > cutoff_seq`: delete it.

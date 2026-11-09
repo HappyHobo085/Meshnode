@@ -158,14 +158,11 @@ async fn command(node: &Node, line: &str, w: &[&str]) -> Result<(), String> {
             }
             Ok(())
         }
-        ["put", ns, key, _, ..] => {
-            // The value is the rest of the line after "put <ns> <key> ", whitespace intact.
-            let value = line
-                .trim_start()
-                .splitn(4, char::is_whitespace)
-                .nth(3)
-                .unwrap_or("")
-                .trim_start();
+        ["put", ..] => {
+            let Some((ns, key, value)) = parse_put(line) else {
+                println!("{USAGE}");
+                return Ok(());
+            };
             node.store()
                 .set(ns, key, value.as_bytes().to_vec())
                 .await
@@ -234,6 +231,29 @@ async fn command(node: &Node, line: &str, w: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Splits `put <ns> <key> <value...>`: ns and key are the first two words after `put`; the
+/// value is the rest of the line after the key, minus its leading whitespace.
+fn parse_put(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.trim_start().strip_prefix("put")?;
+    let (ns, rest) = next_word(rest)?;
+    let (key, rest) = next_word(rest)?;
+    let value = rest.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+    Some((ns, key, value))
+}
+
+/// The first whitespace-delimited word of `s` and the text after it.
+fn next_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    Some((&s[..end], &s[end..]))
+}
+
 async fn with_timeout(
     f: impl std::future::Future<Output = Result<(), NodeError>>,
 ) -> Result<(), String> {
@@ -262,4 +282,32 @@ async fn ls(node: &Node, ns: &str, prefix: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_put;
+
+    #[test]
+    fn put_ignores_extra_whitespace_before_value() {
+        assert_eq!(parse_put("put n k v"), Some(("n", "k", "v")));
+        assert_eq!(parse_put("put  n   k    v"), Some(("n", "k", "v")));
+        assert_eq!(parse_put("  put	n	k	v"), Some(("n", "k", "v")));
+    }
+
+    #[test]
+    fn put_keeps_internal_value_whitespace() {
+        assert_eq!(
+            parse_put("put n k hello  big	world "),
+            Some(("n", "k", "hello  big	world "))
+        );
+    }
+
+    #[test]
+    fn put_with_missing_parts_is_none() {
+        assert_eq!(parse_put("put"), None);
+        assert_eq!(parse_put("put n"), None);
+        assert_eq!(parse_put("put n k"), None);
+        assert_eq!(parse_put("put n k   "), None);
+    }
 }

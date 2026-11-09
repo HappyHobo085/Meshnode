@@ -20,7 +20,8 @@ impl Outbound {
     }
 
     /// Whether `uri`'s `host:port` equals an allowlist entry, ignoring case. The port
-    /// defaults to 443 for `https` and 80 for `http`; a URI without a host is never allowed.
+    /// defaults to 443 for `https` and 80 for `http`; a URI without a host, or with userinfo
+    /// in its authority, is never allowed.
     fn allows(&self, uri: &Uri) -> bool {
         let Some(dest) = destination(uri) else {
             return false;
@@ -30,6 +31,11 @@ impl Outbound {
 }
 
 fn destination(uri: &Uri) -> Option<String> {
+    // Userinfo (`user@host`) is never part of a destination: refuse rather than guess
+    // which host a client would connect to.
+    if uri.authority()?.as_str().contains('@') {
+        return None;
+    }
     let host = uri.host().filter(|h| !h.is_empty())?;
     let default_port = if uri.scheme() == Some(&Scheme::HTTP) {
         80
@@ -102,5 +108,34 @@ mod tests {
     #[test]
     fn no_host_is_denied() {
         assert!(!allows(&[":443", ":80", ""], "/just/a/path"));
+    }
+
+    #[test]
+    fn userinfo_is_denied() {
+        assert!(!allows(&["example.com:443"], "https://user@example.com/"));
+        assert!(!allows(
+            &["example.com:443"],
+            "https://user:pw@example.com:443/"
+        ));
+        assert!(!allows(&["evil.com:443"], "https://example.com@evil.com/"));
+        assert!(!allows(
+            &["example.com:443", "evil.com:443"],
+            "https://a@evil.com/"
+        ));
+    }
+
+    #[test]
+    fn trailing_dot_is_a_different_host() {
+        assert!(!allows(&["example.com:443"], "https://example.com.:443/"));
+        assert!(allows(&["example.com.:443"], "https://example.com./"));
+    }
+
+    #[test]
+    fn bracketed_ipv6_matches_only_exactly() {
+        assert!(allows(&["[::1]:443"], "https://[::1]/"));
+        assert!(allows(&["[::1]:8080"], "http://[::1]:8080/"));
+        assert!(!allows(&["[::1]:443"], "https://[::2]/"));
+        assert!(!allows(&["::1:443"], "https://[::1]/"));
+        assert!(!allows(&["[::1]:80"], "https://[::1]/"));
     }
 }

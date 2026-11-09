@@ -106,6 +106,7 @@ async fn timeout_gives_504_and_node_survives() {
 #[test]
 fn epoch_deadline_interrupts_spin_on_one_thread() {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -113,15 +114,19 @@ fn epoch_deadline_interrupts_spin_on_one_thread() {
             .unwrap();
         let status = tokio.block_on(async {
             let rt = runtime(4);
+            // Building and compiling the fixture is not what is being timed.
             let spin = load(&rt, "spin", 1).await;
+            let _ = loaded_tx.send(());
             rt.handle(&spin, get("/"), ctx(timeout_ms(200)))
                 .await
                 .status()
         });
         let _ = tx.send(status);
     });
+    loaded_rx.recv().expect("fixture failed to load");
+    // The request has a 200 ms timeout; only a guest that is never interrupted overruns this.
     let status = rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(30))
         .expect("spinning guest was not interrupted");
     assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT);
 }

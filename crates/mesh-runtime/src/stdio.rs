@@ -2,6 +2,8 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -11,6 +13,8 @@ use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 
 /// The longest line logged; the rest of a longer line is dropped.
 const MAX_LINE: usize = 4096;
+/// Lines logged per stream and request; a guest printing in a loop cannot flood the log.
+const MAX_LINES: usize = 1000;
 /// Bytes one write may carry, as reported by `check-write`.
 const WRITE_CHUNK: usize = 64 * 1024;
 
@@ -25,6 +29,8 @@ pub(crate) enum Stream {
 pub(crate) struct GuestOutput {
     service: String,
     stream: Stream,
+    /// Lines seen so far, shared by every sink of this stream.
+    lines: Arc<AtomicUsize>,
 }
 
 impl GuestOutput {
@@ -32,6 +38,7 @@ impl GuestOutput {
         GuestOutput {
             service: service.to_owned(),
             stream,
+            lines: Arc::default(),
         }
     }
 
@@ -39,6 +46,7 @@ impl GuestOutput {
         LineSink {
             service: self.service.clone(),
             stream: self.stream,
+            lines: self.lines.clone(),
             line: Vec::new(),
         }
     }
@@ -65,6 +73,7 @@ impl StdoutStream for GuestOutput {
 struct LineSink {
     service: String,
     stream: Stream,
+    lines: Arc<AtomicUsize>,
     /// The current line, at most [`MAX_LINE`] bytes; the rest of a longer line is dropped.
     line: Vec<u8>,
 }
@@ -89,6 +98,21 @@ impl LineSink {
         let line = line.strip_suffix(b"\r").unwrap_or(&line);
         if line.is_empty() {
             return;
+        }
+        match self.lines.fetch_add(1, Ordering::Relaxed) {
+            n if n > MAX_LINES => return,
+            MAX_LINES => {
+                let limit = MAX_LINES;
+                return match self.stream {
+                    Stream::Stdout => {
+                        tracing::warn!(service = %self.service, stream = "stdout", limit, "output truncated")
+                    }
+                    Stream::Stderr => {
+                        tracing::warn!(service = %self.service, stream = "stderr", limit, "output truncated")
+                    }
+                };
+            }
+            _ => {}
         }
         let line = String::from_utf8_lossy(line);
         match self.stream {
@@ -157,5 +181,17 @@ mod tests {
         assert_eq!(sink.line.len(), MAX_LINE);
         sink.push(b"\nnext");
         assert_eq!(sink.line, b"next");
+    }
+
+    #[test]
+    fn lines_past_the_cap_are_counted_not_logged() {
+        let mut sink = GuestOutput::new("t", Stream::Stderr).sink();
+        for _ in 0..MAX_LINES + 50 {
+            sink.push(
+                b"x
+",
+            );
+        }
+        assert_eq!(sink.lines.load(Ordering::Relaxed), MAX_LINES + 50);
     }
 }

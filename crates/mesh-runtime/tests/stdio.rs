@@ -92,3 +92,25 @@ async fn long_lines_are_truncated() {
     // Exactly the first 4096 bytes of the line are kept.
     assert_eq!(out.matches('x').count(), 4096 - prefix.len(), "{out:.200}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_last_line_is_flushed_when_the_instance_ends() {
+    let log = run_echo("http://echo.mesh.localhost/?partial=no-newline-at-end").await;
+    let line = line(&log, "no-newline-at-end");
+    assert!(line.contains("INFO"), "{line}");
+    assert!(line.contains("service=echo"), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_past_the_line_cap_is_dropped_with_one_warning() {
+    let log = run_echo("http://echo.mesh.localhost/?lines=3000&cap=1").await;
+    let logged = log.lines().filter(|l| l.contains("loop line")).count();
+    // The request's own "echo: GET" line counts toward the same 1000.
+    assert_eq!(logged, 999);
+    let warnings: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("output truncated") && l.contains("stdout"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("WARN"), "{}", warnings[0]);
+}

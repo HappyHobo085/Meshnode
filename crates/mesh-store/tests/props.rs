@@ -689,15 +689,27 @@ fn gc_schedules(
         })
 }
 
+/// Script A ends with 1..=3 plain deletes by writer 1 (after a clock tick, so they tend to
+/// win), then writer 0's late-candidate tail: every case has old plain tombstones, so
+/// GC fires in most cases.
 fn gc_strategy() -> impl Strategy<Value = GcCase> {
+    let deletes = prop::collection::vec((0..NSS.len(), 0..KEYS.len()), 1..=3);
     (
         script_strategy(2..=4),
+        deletes,
         prop::collection::vec(late_action_strategy(), 0..=3),
         2usize..=3,
     )
-        .prop_flat_map(|((offsets, mut script), tail, m)| {
+        .prop_flat_map(|((offsets, mut script), deletes, tail, m)| {
             let n_writers = offsets.len();
             let tail_len = tail.len();
+            script.extend(deletes.into_iter().map(|(ns, key)| Action {
+                writer: 1,
+                ns,
+                key,
+                write: Write::Delete,
+                tick: 1,
+            }));
             script.extend(tail);
             let modes = prop::collection::vec(
                 prop_oneof![
@@ -742,7 +754,7 @@ fn live(mut d: Dump) -> Dump {
 /// pulls) and then do a full exchange, so every reader holds every on-time op (this
 /// models "every non-stale replica full-synced after the op arrived"; without it a
 /// replica can keep a value whose tombstone only reached replicas that GC'd it, the
-/// accepted limit in the spec). All clocks then jump by `TOMBSTONE_TTL_MS + 1`; readers
+/// accepted limit in the spec). All clocks then jump by `TOMBSTONE_TTL_MS + 10 s`; readers
 /// record full syncs per their `SyncMode`. Phase 2 delivers the late ops and script B (new
 /// writes) in random parts, with partial pulls and `gc()` calls interleaved; a final full
 /// exchange follows.
@@ -769,7 +781,9 @@ fn gc_case(case: GcCase) -> Result<usize, TestCaseError> {
         }
     }
 
-    let jump = TOMBSTONE_TTL_MS + 1;
+    // Past the TTL for every op of A by HLC (writer clocks run up to ~1 s ahead of `T0`)
+    // and by arrival (readers received them at `T0`).
+    let jump = TOMBSTONE_TTL_MS + 10_000;
     for c in rs.iter().map(|r| &r.clock).chain(&writers.clocks) {
         c.advance(jump);
     }

@@ -13,3 +13,4 @@ ed25519-dalek.workspace = true
 thiserror.workspace = true
 data-encoding.workspace = true
 crc32fast.workspace = true
+blake3.workspace = true

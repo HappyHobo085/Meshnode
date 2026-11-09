@@ -1,11 +1,13 @@
 //! Wire/data types for the Meshnode mesh: ids, signed ops, sync messages, invite tickets.
 
 mod ids;
+mod join;
 mod op;
 mod sync;
 mod ticket;
 
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
+pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};
 pub use sync::{SyncMsg, VersionVector, batch_ops};
 pub use ticket::InviteTicket;

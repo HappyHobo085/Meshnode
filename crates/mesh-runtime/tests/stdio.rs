@@ -95,15 +95,15 @@ async fn long_lines_are_truncated() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_last_line_is_flushed_when_the_instance_ends() {
-    let log = run_echo("http://echo.mesh.localhost/?partial=no-newline-at-end").await;
-    let line = line(&log, "no-newline-at-end");
+    let log = run_echo("http://echo.mesh.localhost/?partial").await;
+    let line = line(&log, "PARTIAL-MARK-7f3a");
     assert!(line.contains("INFO"), "{line}");
     assert!(line.contains("service=echo"), "{line}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn output_past_the_line_cap_is_dropped_with_one_warning() {
-    let log = run_echo("http://echo.mesh.localhost/?lines=3000&cap=1").await;
+    let log = run_echo("http://echo.mesh.localhost/?lines=3000").await;
     let logged = log.lines().filter(|l| l.contains("loop line")).count();
     // The request's own "echo: GET" line counts toward the same 1000.
     assert_eq!(logged, 999);

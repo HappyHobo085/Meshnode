@@ -1,0 +1,27 @@
+[package]
+name = "mesh-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-hlc = { path = "../mesh-hlc" }
+mesh-proto = { path = "../mesh-proto" }
+redb.workspace = true
+serde.workspace = true
+postcard.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[features]
+# Test-only helpers (`vv_of`, `pending_len`, `__test_drop_op`). Never enable in
+# production builds; the crate's own tests enable it through the dev-dependency below.
+test-hooks = []
+
+[dev-dependencies]
+mesh-store = { path = ".", features = ["test-hooks"] }
+tempfile.workspace = true
+proptest.workspace = true

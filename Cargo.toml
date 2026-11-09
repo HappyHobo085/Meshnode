@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["spikes"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc", "use-std"] }
+ed25519-dalek = "3"
+redb = "4"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+data-encoding = "2"
+crc32fast = "1"
+tracing = "0.1"
+proptest = "1"
+tempfile = "3"

@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod local;
+pub mod membership;
 
 pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
 pub use db::{CoreStore, StoreHandle};

@@ -155,6 +155,37 @@ where
     Ok(false)
 }
 
+/// Origins that added `member` to `ns/set` in `table`, ascending.
+pub(crate) fn set_member_origins_in<T>(
+    table: &T,
+    ns: &str,
+    set: &str,
+    member: &[u8],
+) -> Result<Vec<NodeId>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let mut out = Vec::new();
+    if has_nul(ns) || has_nul(set) {
+        return Ok(out);
+    }
+    let mut p = keys::item_prefix(ns, set);
+    p.extend_from_slice(member);
+    for item in table.range::<&[u8]>(p.as_slice()..)? {
+        let (k, _) = item?;
+        let k = k.value();
+        if !k.starts_with(&p) {
+            break;
+        }
+        // Longer members extending `member` share the prefix; only an exact-length row matches.
+        if k.len() == p.len() + ORIGIN_LEN {
+            out.push(keys::split_set_key(k)?.origin);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Live keys of `ns` starting with `prefix` in `reg` (read or write table), sorted,
 /// strictly after `start_after` (which need not exist), at most `limit`.
 pub(crate) fn list_keys_in<T>(
@@ -283,6 +314,17 @@ impl<W: WallClock> Store<W> {
         set_members_in(&table, ns, set, start_after, limit)
     }
 
+    /// Origins that added `member` to the add-only set `ns/set`, ascending by id.
+    pub fn set_member_origins(
+        &self,
+        ns: &str,
+        set: &str,
+        member: &[u8],
+    ) -> Result<Vec<NodeId>, StoreError> {
+        let table = self.db.begin_read()?.open_table(SET)?;
+        set_member_origins_in(&table, ns, set, member)
+    }
+
     /// Per namespace: total bytes of live register values plus distinct set members.
     pub fn namespace_sizes(&self) -> Result<BTreeMap<String, u64>, StoreError> {
         let tx = self.db.begin_read()?;
@@ -311,5 +353,53 @@ impl<W: WallClock> Store<W> {
             }
         }
         Ok(sizes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Acceptor;
+    use crate::apply::{ReadView, Verdict};
+    use ed25519_dalek::SigningKey;
+    use mesh_hlc::ManualClock;
+    use mesh_proto::{MeshId, OpBody};
+
+    struct All;
+    impl Acceptor for All {
+        fn judge(&self, _: &OpBody, _: &ReadView<'_>) -> Verdict {
+            Verdict::Valid
+        }
+    }
+
+    fn open(dir: &std::path::Path, n: u8) -> Store<ManualClock> {
+        Store::open(
+            &dir.join(format!("{n}.redb")),
+            MeshId([7; 32]),
+            SigningKey::from_bytes(&[n; 32]),
+            ManualClock::new(10_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn set_member_origins_lists_every_adder_of_that_member_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (open(dir.path(), 1), open(dir.path(), 2));
+        a.set_add("n", "s", b"m").unwrap();
+        a.set_add("n", "s", b"mm").unwrap(); // longer member sharing the prefix
+        a.set_add("n", "other", b"m").unwrap();
+        let op = b.set_add("n", "s", b"m").unwrap();
+        a.apply(op, &All).unwrap();
+
+        let mut want = vec![a.node_id(), b.node_id()];
+        want.sort();
+        assert_eq!(a.set_member_origins("n", "s", b"m").unwrap(), want);
+        assert_eq!(
+            a.set_member_origins("n", "s", b"mm").unwrap(),
+            vec![a.node_id()]
+        );
+        assert!(a.set_member_origins("n", "s", b"x").unwrap().is_empty());
+        assert!(a.set_member_origins("n\0", "s", b"m").unwrap().is_empty());
     }
 }

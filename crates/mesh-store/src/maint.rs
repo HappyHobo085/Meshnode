@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 /// How long an op must have been superseded (or invalid) before compaction may delete
 /// it (§5.5). Retraction of a removed origin can restore ops younger than this.
 pub const SETTLE_MS: u64 = 7 * 86_400_000;
-/// Age (by the winner's HLC wall time) after which a winning tombstone is GC'd (§5.7).
+/// Age after which a winning tombstone with the empty order is GC'd (§5.7). The age is
+/// measured both by the tombstone's HLC wall time and by when this store received it
+/// (Ruling R14), so a tombstone arriving late from an offline device is kept here for
+/// this long after its arrival.
 pub const TOMBSTONE_TTL_MS: u64 = 90 * 86_400_000;
 /// A store whose last full sync is older than this must re-bootstrap (§5.7).
 pub const STALE_MS: u64 = 80 * 86_400_000;
@@ -83,6 +86,8 @@ struct Doomed {
     order: Vec<u8>,
     hlc: Hlc,
     origin: NodeId,
+    /// Seq of the winning tombstone's op.
+    seq: u64,
     change: Change,
     ops: Vec<[u8; OP_KEY_LEN]>,
     /// Deleting would drop one of this node's own ops not yet covered by a full sync.
@@ -124,8 +129,10 @@ impl<W: WallClock> Store<W> {
     }
 
     /// Tombstone GC (§5.7), in one write transaction. Does nothing while the store is
-    /// stale. For every key whose winner (over all origins) is a tombstone with
-    /// `hlc.ms() < now - TOMBSTONE_TTL_MS`, deletes **all** of the key's `reg` rows
+    /// stale. For every key whose winner (over all origins) is a tombstone with the empty
+    /// order that is older than [`TOMBSTONE_TTL_MS`] both by `hlc.ms()` and by its local
+    /// `received_ms` (Ruling R14; ordered tombstones are never GC'd), deletes **all** of
+    /// the key's `reg` rows
     /// (deleting only the tombstone would bring back an older value of another origin),
     /// every valid `ops` row of the key (including superseded ops compaction has not
     /// removed yet, so a fresh peer catching up from this store can't resurrect an old
@@ -150,7 +157,9 @@ impl<W: WallClock> Store<W> {
         {
             let reg = tx.open_table(REG)?;
             scan_reg_winners(&reg, &[], &[], |ns, key, origin, row| {
-                if row.value.is_none() && row.hlc.ms() < cutoff {
+                // Ordered tombstones are never GC'd (R14): a later write that loses to
+                // their order would win on a replica that GC'd and lose on one that did not.
+                if row.value.is_none() && row.order.is_empty() && row.hlc.ms() < cutoff {
                     let mut g = Vec::with_capacity(ns.len() + key.len() + 2);
                     g.extend_from_slice(ns);
                     g.push(keys::SEP);
@@ -167,6 +176,7 @@ impl<W: WallClock> Store<W> {
                             order: row.order,
                             hlc: row.hlc,
                             origin,
+                            seq: row.seq,
                             change,
                             ops: Vec::new(),
                             unsafe_own: false,
@@ -175,6 +185,25 @@ impl<W: WallClock> Store<W> {
                 }
                 Ok(true)
             })?;
+        }
+        // Old by arrival too (R14): a tombstone received less than the TTL ago may not
+        // have reached the other replicas yet. A winner without an op row (never expected)
+        // is kept.
+        {
+            let ops = tx.open_table(OPS)?;
+            let mut young = Vec::new();
+            for (g, d) in &doomed {
+                let received = match ops.get(keys::op_key(&d.origin, d.seq).as_slice())? {
+                    Some(v) => Some(tables::decode::<OpRow>("ops", v.value())?.received_ms),
+                    None => None,
+                };
+                if received.is_none_or(|r| r >= cutoff) {
+                    young.push(g.clone());
+                }
+            }
+            for g in young {
+                doomed.remove(&g);
+            }
         }
         if doomed.is_empty() {
             tx.abort()?;
@@ -582,7 +611,10 @@ mod tests {
                 .unwrap(),
             Outcome::Ignored
         );
+        // Received at 10_000: exactly TTL old by arrival is not yet old enough.
         clock.advance(TOMBSTONE_TTL_MS);
+        assert_eq!(s.gc().unwrap(), 0);
+        clock.advance(1);
         assert_eq!(s.gc().unwrap(), 1);
         assert!(s.get_entry("s", "k").unwrap().is_none());
         assert!(!has_op(&s, &yid, 1));

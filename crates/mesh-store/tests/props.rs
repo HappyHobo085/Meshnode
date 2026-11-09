@@ -1,5 +1,6 @@
 //! Property tests (spec §6): replicas converge regardless of delivery order, duplicates,
-//! partial catch-ups, compaction and removal retraction (within the settle period).
+//! partial catch-ups, compaction, removal retraction (within the settle period) and
+//! tombstone GC (live reads only, see `gc_invisible_to_live_reads`).
 //!
 //! Writers are stores that only perform local writes (to produce signed ops); readers only
 //! receive ops. The reference "union view" is a reader that applied every op in
@@ -10,10 +11,12 @@ mod common;
 use common::{AcceptAll, node, store};
 use mesh_hlc::ManualClock;
 use mesh_proto::{NodeId, SignedOp, VersionVector};
-use mesh_store::{RegEntry, SETTLE_MS, Store, SyncItem};
+use mesh_store::{RegEntry, SETTLE_MS, Store, SyncItem, TOMBSTONE_TTL_MS};
 use proptest::prelude::*;
 use proptest::sample::Index;
+use proptest::test_runner::TestRunner;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: u64 = 1_700_000_000_000;
 /// "ab" extends "a": catches a namespace scan bleeding into another namespace.
@@ -113,34 +116,52 @@ fn script_strategy(
     })
 }
 
+/// Writer stores (node ids `1..=n`), each with its own clock.
+struct Writers {
+    stores: Vec<S>,
+    clocks: Vec<ManualClock>,
+}
+
+impl Writers {
+    /// Fresh writers, writer `i` with its clock at `T0 + offsets[i]`.
+    fn new(dir: &Path, offsets: &[u64]) -> Self {
+        let clocks: Vec<ManualClock> = offsets.iter().map(|o| ManualClock::new(T0 + o)).collect();
+        let stores = clocks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| store(dir, i as u8 + 1, c))
+            .collect();
+        Writers { stores, clocks }
+    }
+
+    /// Runs `script` and returns the ops in script order. `first` numbers the values.
+    fn run(&self, script: &[Action], first: usize) -> Vec<SignedOp> {
+        script
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                self.clocks[a.writer].advance(a.tick);
+                let w = &self.stores[a.writer];
+                let (ns, key) = (NSS[a.ns], KEYS[a.key]);
+                let value = format!("w{}#{}", a.writer + 1, first + i).into_bytes();
+                match a.write {
+                    Write::Set => w.set(ns, key, &value),
+                    Write::Delete => w.delete(ns, key),
+                    Write::Ordered { order, tomb } => {
+                        w.set_ordered(ns, key, &[order], (!tomb).then_some(value.as_slice()))
+                    }
+                    Write::Add { set, member } => w.set_add(ns, SETS[set], MEMBERS[member]),
+                }
+                .expect("local write")
+            })
+            .collect()
+    }
+}
+
 /// Runs `script` on fresh writer stores (node ids `1..=offsets.len()`, each with its own
 /// clock at `T0 + offset`) and returns the ops in script order.
 fn run_writers(dir: &Path, offsets: &[u64], script: &[Action]) -> Vec<SignedOp> {
-    let clocks: Vec<ManualClock> = offsets.iter().map(|o| ManualClock::new(T0 + o)).collect();
-    let writers: Vec<S> = clocks
-        .iter()
-        .enumerate()
-        .map(|(i, c)| store(dir, i as u8 + 1, c))
-        .collect();
-    script
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            clocks[a.writer].advance(a.tick);
-            let w = &writers[a.writer];
-            let (ns, key) = (NSS[a.ns], KEYS[a.key]);
-            let value = format!("w{}#{i}", a.writer + 1).into_bytes();
-            match a.write {
-                Write::Set => w.set(ns, key, &value),
-                Write::Delete => w.delete(ns, key),
-                Write::Ordered { order, tomb } => {
-                    w.set_ordered(ns, key, &[order], (!tomb).then_some(value.as_slice()))
-                }
-                Write::Add { set, member } => w.set_add(ns, SETS[set], MEMBERS[member]),
-            }
-            .expect("local write")
-        })
-        .collect()
+    Writers::new(dir, offsets).run(script, 0)
 }
 
 /// `ops` sorted by `(origin, seq)`.
@@ -164,6 +185,8 @@ enum Step {
     Compact,
     /// Apply removal number `i` of the property.
     Remove(usize),
+    /// `gc()` (clocks are advanced by the property, not here).
+    Gc,
 }
 
 struct ScheduleSpec {
@@ -172,11 +195,12 @@ struct ScheduleSpec {
     pulls: std::ops::RangeInclusive<usize>,
     compacts: std::ops::RangeInclusive<usize>,
     removals: usize,
+    gcs: std::ops::RangeInclusive<usize>,
 }
 
 /// A reader's delivery sequence: a random permutation of `0..n_ops` (or a prefix of one)
-/// with up to 20 % duplicates, interleaved with pulls, compactions and removals at random
-/// positions.
+/// with up to 20 % duplicates, interleaved with pulls, compactions, removals and GCs at
+/// random positions.
 fn schedule_strategy(n_ops: usize, spec: ScheduleSpec) -> impl Strategy<Value = Vec<Step>> {
     let perm = Just((0..n_ops).collect::<Vec<_>>()).prop_shuffle();
     let keep = any::<Index>();
@@ -184,9 +208,10 @@ fn schedule_strategy(n_ops: usize, spec: ScheduleSpec) -> impl Strategy<Value = 
     let pulls = prop::collection::vec((0usize..3, 1usize..8, any::<Index>()), spec.pulls);
     let compacts = prop::collection::vec(any::<Index>(), spec.compacts);
     let removals = prop::collection::vec(any::<Index>(), spec.removals);
+    let gcs = prop::collection::vec(any::<Index>(), spec.gcs);
     let subset = spec.subset;
-    (perm, keep, dups, pulls, compacts, removals).prop_map(
-        move |(perm, keep, dups, pulls, compacts, removals)| {
+    (perm, keep, dups, pulls, compacts, removals, gcs).prop_map(
+        move |(perm, keep, dups, pulls, compacts, removals, gcs)| {
             let mut perm = perm;
             if subset {
                 perm.truncate(keep.index(n_ops + 1));
@@ -207,6 +232,10 @@ fn schedule_strategy(n_ops: usize, spec: ScheduleSpec) -> impl Strategy<Value = 
             for (i, at) in removals.into_iter().enumerate() {
                 let at = at.index(steps.len() + 1);
                 steps.insert(at, Step::Remove(i));
+            }
+            for at in gcs {
+                let at = at.index(steps.len() + 1);
+                steps.insert(at, Step::Gc);
             }
             steps
         },
@@ -285,14 +314,15 @@ fn full_exchange(rs: &[&S]) -> bool {
 }
 
 /// Runs the readers' schedules interleaved (step `i` of every reader, then step `i + 1`).
-/// `remove(r, i)` performs removal `i` on reader `r`.
+/// `remove(r, i)` performs removal `i` on reader `r`. Returns the number of keys GC'd.
 fn run_schedules(
     rs: &[Reader],
     schedules: &[Vec<Step>],
     ops: &[SignedOp],
     pull_from: &dyn Fn(usize, usize) -> usize,
     remove: &dyn Fn(&S, usize),
-) {
+) -> usize {
+    let mut gcd = 0;
     let longest = schedules.iter().map(Vec::len).max().unwrap_or(0);
     for i in 0..longest {
         for (r, sched) in schedules.iter().enumerate() {
@@ -311,9 +341,11 @@ fn run_schedules(
                     me.store.compact().expect("compact");
                 }
                 Step::Remove(k) => remove(&me.store, k),
+                Step::Gc => gcd += me.store.gc().expect("gc"),
             }
         }
     }
+    gcd
 }
 
 /// Everything a client can read for the generated namespaces, keys, sets and members,
@@ -372,7 +404,12 @@ fn dump(s: &S) -> Dump {
 /// The reference union view: a fresh reader applying `ops` in `(origin, seq)` order, then
 /// `finish` (e.g. a removal).
 fn reference(dir: &Path, ops: &[SignedOp], finish: impl FnOnce(&S)) -> Dump {
-    let clock = ManualClock::new(T0);
+    reference_at(dir, T0, ops, finish)
+}
+
+/// [`reference`] with the reference store's clock at `now`.
+fn reference_at(dir: &Path, now: u64, ops: &[SignedOp], finish: impl FnOnce(&S)) -> Dump {
+    let clock = ManualClock::new(now);
     let s = store(dir, READER_BASE - 1, &clock);
     for op in in_order(ops) {
         s.apply(op, &AcceptAll).expect("apply");
@@ -398,6 +435,7 @@ fn convergence_strategy() -> impl Strategy<Value = ConvergenceCase> {
                     pulls: 0..=4,
                     compacts: 0..=0,
                     removals: 0,
+                    gcs: 0..=0,
                 },
             )
         };
@@ -426,6 +464,7 @@ fn compaction_strategy() -> impl Strategy<Value = CompactionCase> {
                 pulls: 0..=0,
                 compacts: 1..=4,
                 removals: 0,
+                gcs: 0..=0,
             },
         );
         let catching_up = schedule_strategy(
@@ -435,6 +474,7 @@ fn compaction_strategy() -> impl Strategy<Value = CompactionCase> {
                 pulls: 0..=4,
                 compacts: 0..=0,
                 removals: 0,
+                gcs: 0..=0,
             },
         );
         (Just(offsets), Just(script), compacting, catching_up)
@@ -458,6 +498,7 @@ fn retraction_strategy() -> impl Strategy<Value = RetractionCase> {
                     pulls: 0..=3,
                     compacts: 0..=0,
                     removals: 2,
+                    gcs: 0..=0,
                 },
             )
         };
@@ -481,7 +522,7 @@ proptest! {
         let want = reference(dir.path(), &ops, |_| {});
         let rs = readers(dir.path(), schedules.len());
         let m = rs.len();
-        run_schedules(&rs, &schedules, &ops, &|r, p| peer_of(r, p, m), &|_, _| {});
+        let _ = run_schedules(&rs, &schedules, &ops, &|r, p| peer_of(r, p, m), &|_, _| {});
         let stores: Vec<&S> = rs.iter().map(|r| &r.store).collect();
         prop_assert!(full_exchange(&stores), "full exchange did not settle");
         for (i, r) in rs.iter().enumerate() {
@@ -498,7 +539,7 @@ proptest! {
         let want = reference(dir.path(), &ops, |_| {});
         let rs = readers(dir.path(), 2);
         // Reader 1 only ever pulls from reader 0; reader 0 never pulls.
-        run_schedules(&rs, &[compacting, catching_up], &ops, &|_, _| 0, &|_, _| {});
+        let _ = run_schedules(&rs, &[compacting, catching_up], &ops, &|_, _| 0, &|_, _| {});
         prop_assert_eq!(&dump(&rs[0].store), &want, "compacting reader");
         // Catch reader 1 up from reader 0 only.
         let mut settled = false;
@@ -535,11 +576,227 @@ proptest! {
                 s.on_removal(x, cutoff).expect("on_removal");
             }
         };
-        run_schedules(&rs, &schedules, &ops, &|r, p| peer_of(r, p, 2), &remove);
+        let _ = run_schedules(&rs, &schedules, &ops, &|r, p| peer_of(r, p, 2), &remove);
         let stores: Vec<&S> = rs.iter().map(|r| &r.store).collect();
         prop_assert!(full_exchange(&stores), "full exchange did not settle");
         for (i, r) in rs.iter().enumerate() {
             prop_assert_eq!(&dump(&r.store), &want, "reader {}", i);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Tombstone GC
+// ---------------------------------------------------------------------------------------
+
+/// How a reader of the GC property records full syncs.
+#[derive(Clone, Copy, Debug)]
+enum SyncMode {
+    /// Never calls `mark_full_sync` (never stale; it has no own ops, so GC is not blocked).
+    Never,
+    /// Marks right after the phase-1 exchange: stale after the clock jump, so its GCs are
+    /// no-ops, and it is excluded from the comparison (a stale store must re-bootstrap).
+    Early,
+    /// Marks after the clock jump, as if a periodic full sync had just completed.
+    Fresh,
+}
+
+/// Script A (old ops, at `T0`), the number of A's trailing ops that arrive late, script B
+/// (new ops, after the clock jump), one sync mode per reader, phase-1 schedules over the
+/// on-time ops of A, and phase-2 schedules over `late ++ B` (with GCs).
+type GcCase = (
+    Vec<u64>,
+    Vec<Action>,
+    usize,
+    Vec<Action>,
+    Vec<SyncMode>,
+    Vec<Vec<Step>>,
+    Vec<Vec<Step>>,
+);
+
+/// A tombstone (plain or ordered) or a set add by writer 0: what an offline device
+/// delivers late. Late *values* are left out on purpose: a value older than the TTL that
+/// arrives after a replica GC'd the key's (newer) tombstone wins there and loses where the
+/// tombstone is still held, a limit of HLC-ordered GC that R14 does not address (see the
+/// final-fix report).
+fn late_action_strategy() -> impl Strategy<Value = Action> {
+    let write = prop_oneof![
+        1 => Just(Write::Delete),
+        1 => (0u8..4).prop_map(|order| Write::Ordered { order, tomb: true }),
+        1 => (0..SETS.len(), 0..MEMBERS.len()).prop_map(|(set, member)| Write::Add { set, member }),
+    ];
+    (0..NSS.len(), 0..KEYS.len(), write, 0u64..3).prop_map(|(ns, key, write, tick)| Action {
+        writer: 0,
+        ns,
+        key,
+        write,
+        tick,
+    })
+}
+
+fn gc_schedule(
+    n: usize,
+    subset: bool,
+    gcs: std::ops::RangeInclusive<usize>,
+) -> impl Strategy<Value = Vec<Step>> {
+    schedule_strategy(
+        n,
+        ScheduleSpec {
+            subset,
+            pulls: 0..=3,
+            compacts: 0..=0,
+            removals: 0,
+            gcs,
+        },
+    )
+}
+
+/// Phase schedules for `m` readers over `n` ops: reader 0 gets every op, so nothing is
+/// lost for good; the others a random part.
+fn gc_schedules(
+    m: usize,
+    n: usize,
+    gcs: std::ops::RangeInclusive<usize>,
+) -> impl Strategy<Value = Vec<Vec<Step>>> {
+    (
+        gc_schedule(n, false, gcs.clone()),
+        prop::collection::vec(gc_schedule(n, true, gcs), m - 1),
+    )
+        .prop_map(|(first, mut rest)| {
+            rest.insert(0, first);
+            rest
+        })
+}
+
+fn gc_strategy() -> impl Strategy<Value = GcCase> {
+    (
+        script_strategy(2..=4),
+        prop::collection::vec(late_action_strategy(), 0..=3),
+        2usize..=3,
+    )
+        .prop_flat_map(|((offsets, mut script), tail, m)| {
+            let n_writers = offsets.len();
+            let tail_len = tail.len();
+            script.extend(tail);
+            let modes = prop::collection::vec(
+                prop_oneof![
+                    1 => Just(SyncMode::Never),
+                    1 => Just(SyncMode::Early),
+                    2 => Just(SyncMode::Fresh),
+                ],
+                m,
+            );
+            let b = prop::collection::vec(action_strategy(n_writers), 1..=8);
+            (Just(offsets), Just(script), 0..=tail_len, b, modes)
+        })
+        .prop_flat_map(|(offsets, script, late, b, modes)| {
+            let m = modes.len();
+            let p1 = gc_schedules(m, script.len() - late, 0..=0);
+            let p2 = gc_schedules(m, late + b.len(), 1..=3);
+            (
+                Just(offsets),
+                Just(script),
+                Just(late),
+                Just(b),
+                Just(modes),
+                p1,
+                p2,
+            )
+        })
+}
+
+/// `d` reduced to what a client sees through live reads: a tombstoned key and a GC'd key
+/// both read as absent, so `get_entry` results without a value are dropped.
+fn live(mut d: Dump) -> Dump {
+    for e in &mut d.entries {
+        e.entry = e.entry.take().filter(|x| x.value.is_some());
+    }
+    d
+}
+
+/// Runs one GC case; returns the number of keys GC'd by all readers.
+///
+/// Timeline: script A is written at `T0`. Its trailing `late` ops (an offline writer's
+/// tombstones and set adds) are held back; readers get the rest (random parts, partial
+/// pulls) and then do a full exchange, so every reader holds every on-time op (this
+/// models "every non-stale replica full-synced after the op arrived"; without it a
+/// replica can keep a value whose tombstone only reached replicas that GC'd it, the
+/// accepted limit in the spec). All clocks then jump by `TOMBSTONE_TTL_MS + 1`; readers
+/// record full syncs per their `SyncMode`. Phase 2 delivers the late ops and script B (new
+/// writes) in random parts, with partial pulls and `gc()` calls interleaved; a final full
+/// exchange follows.
+///
+/// Compared: each non-stale reader's live reads (`get`, `get_entry` of live keys,
+/// `list_keys`, `set_members`, `set_contains`), version vector and pending count against
+/// a reference that applied every op of A and B in `(origin, seq)` order and never GC'd.
+/// Tombstone entries are not compared: GC removes them by design.
+fn gc_case(case: GcCase) -> Result<usize, TestCaseError> {
+    let (offsets, script, late, b_script, modes, p1, p2) = case;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writers = Writers::new(dir.path(), &offsets);
+    let a_ops = writers.run(&script, 0);
+    let rs = readers(dir.path(), modes.len());
+    let m = rs.len();
+    let (on_time, late_ops) = a_ops.split_at(a_ops.len() - late);
+
+    let mut gcd = run_schedules(&rs, &p1, on_time, &|r, p| peer_of(r, p, m), &|_, _| {});
+    let stores: Vec<&S> = rs.iter().map(|r| &r.store).collect();
+    prop_assert!(full_exchange(&stores), "phase-1 exchange did not settle");
+    for (r, mode) in rs.iter().zip(&modes) {
+        if matches!(mode, SyncMode::Early) {
+            mark_synced(&r.store);
+        }
+    }
+
+    let jump = TOMBSTONE_TTL_MS + 1;
+    for c in rs.iter().map(|r| &r.clock).chain(&writers.clocks) {
+        c.advance(jump);
+    }
+    for (r, mode) in rs.iter().zip(&modes) {
+        if matches!(mode, SyncMode::Fresh) {
+            mark_synced(&r.store);
+        }
+    }
+    let b_ops = writers.run(&b_script, a_ops.len());
+    let phase2: Vec<SignedOp> = late_ops.iter().chain(&b_ops).cloned().collect();
+    gcd += run_schedules(&rs, &p2, &phase2, &|r, p| peer_of(r, p, m), &|_, _| {});
+    prop_assert!(full_exchange(&stores), "final exchange did not settle");
+
+    let all: Vec<SignedOp> = a_ops.iter().chain(&b_ops).cloned().collect();
+    let want = live(reference_at(dir.path(), T0 + jump, &all, |_| {}));
+    for (i, (r, mode)) in rs.iter().zip(&modes).enumerate() {
+        if r.store.is_stale().expect("is_stale") {
+            prop_assert!(matches!(mode, SyncMode::Early));
+            continue;
+        }
+        prop_assert_eq!(&live(dump(&r.store)), &want, "reader {} ({:?})", i, mode);
+    }
+    Ok(gcd)
+}
+
+/// Records a completed full sync on a reader (readers write nothing of their own).
+fn mark_synced(s: &S) {
+    s.mark_full_sync().expect("mark_full_sync");
+}
+
+/// Random `gc()` calls (after the clocks passed the TTL) are invisible to the live reads
+/// of non-stale readers after a final exchange (see `gc_case`). Run with an explicit
+/// runner so the test can also check that GC deleted keys across the cases (non-vacuity).
+#[test]
+fn gc_invisible_to_live_reads() {
+    let gcd = AtomicUsize::new(0);
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(cases()));
+    let result = runner.run(&gc_strategy(), |case| {
+        gcd.fetch_add(gc_case(case)?, Ordering::Relaxed);
+        Ok(())
+    });
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+    let total = gcd.load(Ordering::Relaxed);
+    println!(
+        "gc_invisible_to_live_reads: {total} keys GC'd over {} cases",
+        cases()
+    );
+    assert!(total > 0, "no case GC'd anything");
 }

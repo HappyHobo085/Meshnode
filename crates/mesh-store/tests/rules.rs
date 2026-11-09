@@ -1336,23 +1336,16 @@ fn gc_keeps_keys_with_own_unsynced_ops() {
     // Never synced: A's own tombstone may not have reached anyone.
     a.set("s", "own", b"v").unwrap();
     a.delete("s", "own").unwrap();
-    // B's ordered tombstone of `k`; later A writes k with a losing (empty) order.
-    a.apply(b.set_ordered("s", "k", &[9], None).unwrap(), &AcceptAll)
-        .unwrap();
-    clock.advance(TOMBSTONE_TTL_MS - 5 * DAY_MS);
-    assert_eq!(a.gc().unwrap(), 0);
-    a.mark_full_sync().unwrap();
-    clock.advance(6 * DAY_MS);
-    // A's losing write of k comes after the last full sync.
-    a.set("s", "k", b"late").unwrap();
-    assert_eq!(a.get("s", "k").unwrap(), None);
-    // `own` is synced now; `k` holds an unsynced own op.
-    assert_eq!(a.gc().unwrap(), 1);
-    assert!(a.get_entry("s", "own").unwrap().is_none());
-    assert!(a.get_entry("s", "k").unwrap().is_some());
-    a.mark_full_sync().unwrap();
+    // B's old tombstone of `k`, with no op of A under it.
+    a.apply(b.delete("s", "k").unwrap(), &AcceptAll).unwrap();
+    clock.advance(TOMBSTONE_TTL_MS + 1);
+    // `k` goes; `own` holds unsynced own ops.
     assert_eq!(a.gc().unwrap(), 1);
     assert!(a.get_entry("s", "k").unwrap().is_none());
+    assert!(a.get_entry("s", "own").unwrap().is_some());
+    a.mark_full_sync().unwrap();
+    assert_eq!(a.gc().unwrap(), 1);
+    assert!(a.get_entry("s", "own").unwrap().is_none());
 }
 
 #[test]
@@ -1366,6 +1359,67 @@ fn gc_never_runs_on_own_ops_of_a_never_synced_store() {
     assert_eq!(a.gc().unwrap(), 0);
     a.mark_full_sync().unwrap();
     assert_eq!(a.gc().unwrap(), 1);
+}
+
+#[test]
+fn late_arriving_old_tombstone_is_kept_for_ttl_after_arrival() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    // X is an offline device with its own clock.
+    let x_clock = ManualClock::new(T0);
+    let x = store(dir.path(), 3, &x_clock);
+    let v = x.set("s", "k", b"v").unwrap();
+    a.apply(v.clone(), &AcceptAll).unwrap();
+    b.apply(v, &AcceptAll).unwrap();
+    // X deletes k, then stays offline for 100 days.
+    x_clock.advance(1);
+    let tomb = x.delete("s", "k").unwrap();
+    clock.advance(100 * DAY_MS);
+    // A receives the tombstone (old by its HLC, new by arrival); B has not yet.
+    assert_eq!(a.apply(tomb, &AcceptAll).unwrap(), Outcome::Applied);
+    assert_eq!(
+        a.gc().unwrap(),
+        0,
+        "a tombstone that just arrived is not GC'd"
+    );
+    // B catches up from A and must learn the deletion.
+    feed(&b, a.diff_since(&b.version_vector().unwrap(), 100).unwrap());
+    assert_eq!(b.get("s", "k").unwrap(), None);
+    assert!(b.get_entry("s", "k").unwrap().is_some());
+    // 90 days after its arrival, it goes.
+    clock.advance(TOMBSTONE_TTL_MS);
+    assert_eq!(a.gc().unwrap(), 0);
+    clock.advance(1);
+    assert_eq!(a.gc().unwrap(), 1);
+    assert!(a.get_entry("s", "k").unwrap().is_none());
+}
+
+#[test]
+fn ordered_tombstone_is_never_gcd() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    let b = store(dir.path(), 2, &clock);
+    let w = store(dir.path(), 3, &clock);
+    let c = store(dir.path(), 4, &clock);
+    let t = w.set_ordered("s", "k", &[5], None).unwrap();
+    a.apply(t.clone(), &AcceptAll).unwrap();
+    b.apply(t, &AcceptAll).unwrap();
+    clock.advance(TOMBSTONE_TTL_MS + 1);
+    assert_eq!(a.gc().unwrap(), 0);
+    assert_eq!(
+        a.get_entry("s", "k").unwrap().map(|e| e.order),
+        Some(vec![5])
+    );
+    // A later plain write loses to the ordered tombstone on every replica alike.
+    let late = c.set("s", "k", b"late").unwrap();
+    a.apply(late.clone(), &AcceptAll).unwrap();
+    b.apply(late, &AcceptAll).unwrap();
+    assert_eq!(a.get("s", "k").unwrap(), None);
+    assert_eq!(
+        a.get_entry("s", "k").unwrap(),
+        b.get_entry("s", "k").unwrap()
+    );
 }
 
 // ---- Task 7: removal retraction ----

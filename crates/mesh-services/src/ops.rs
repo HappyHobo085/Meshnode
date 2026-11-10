@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::deployer::{DeployerTask, DeployerTimings, Shared};
 use crate::error::ServicesError;
-use crate::gc::{GC_EVERY, GcTask};
+use crate::gc::{GC_EVERY, GcTask, mark_owned};
 use crate::manifest::{current_generation, data_ns, gen_key, manifest_key, read_manifest};
 
 /// Settings for [`Services::start`].
@@ -180,6 +180,7 @@ impl Services {
             })?;
         let _deploying = self.shared.gc_lock.read().await;
         let stored = self.node().blobs().add_bytes(wasm).await?;
+        mark_owned(&self.shared, stored)?;
         let kind = ServiceKind::Wasm {
             module: *stored.as_bytes(),
         };
@@ -201,6 +202,7 @@ impl Services {
         }
         let _deploying = self.shared.gc_lock.read().await;
         let root = self.node().blobs().add_path(dir).await?;
+        mark_owned(&self.shared, root)?;
         let kind = ServiceKind::Static {
             root: *root.as_bytes(),
         };

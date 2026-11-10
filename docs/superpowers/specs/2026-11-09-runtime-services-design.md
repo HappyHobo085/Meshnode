@@ -187,9 +187,9 @@ One task, supervised and stopped by the node's cancel token.
 
 ### 5.5 Blob GC (hourly)
 
-- GC considers every pinned blob on a node running `Services`. It holds the GC lock's exclusive side while deciding and removing, recomputes the referenced set right before removing, and skips while the node is not `Running` *(amended during implementation)*.
+- GC considers only **service-owned** blobs: the module or root of every `deploy_wasm`/`deploy_static` on this node and every module or root the deployer fetched, recorded in `<data>/services/owned.json` (atomic write; a static root's children are covered by its collection). Other pinned blobs, such as ones the app added itself, are never collected; an owned hash that is removed leaves the set *(amended in final review)*. It holds the GC lock's exclusive side while deciding and removing, recomputes the referenced set right before removing, and skips while the node is not `Running` *(amended during implementation)*.
 - **Referenced** = the module or root of every live manifest, a collection root's children (known from `kind`), and everything in the active table. Placement does not matter: a node that deployed a service it does not run keeps the blob so others can fetch it.
-- A pinned hash that is not referenced gets its first-unreferenced time recorded in `<data>/services/gc.json` (atomic write); after 24 h unreferenced it is removed (unpinned and deleted). Becoming referenced again clears the entry.
+- An owned, pinned hash that is not referenced gets its first-unreferenced time recorded in `<data>/services/gc.json` (atomic write); after 24 h unreferenced it is removed (unpinned and deleted). Becoming referenced again clears the entry.
 - `mesh-core` additions: `Blobs::pins() -> Vec<(Hash, BlobKind)>`, `Blobs::remove(hash)` (unpin and delete the data; the implementation picks the iroh-blobs mechanism) and `Blobs::remove_many(&[Hash])`, which drops every pin first and then runs one sweep. A pass removes all its doomed hashes with a single `remove_many`, so it holds the GC lock for about one removal, not one per blob *(amended in final review)*.
 
 ## 6. Static sites

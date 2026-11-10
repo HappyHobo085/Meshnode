@@ -348,3 +348,37 @@ async fn gc_removes_many_blobs_in_one_sweep() {
     );
     t.shutdown().await;
 }
+
+/// Only service blobs are collected: a blob the app added to the node's blob store itself
+/// survives, while an unreferenced service module is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_leaves_blobs_services_do_not_own() {
+    let t = one(None).await;
+    let app = t
+        .node
+        .blobs()
+        .add_bytes(Bytes::from_static(b"an app's own blob"))
+        .await
+        .unwrap();
+    let v1 = t.deploy("web", "counter", 1).await;
+    t.deploy("web", "echo", 2).await;
+    t.svc.gc_now().await.unwrap();
+
+    t.clock.advance(25 * HOUR_MS);
+    t.svc.gc_now().await.unwrap();
+    assert!(
+        !t.pinned(v1).await,
+        "the unreferenced service module is removed"
+    );
+    assert!(
+        t.pinned(app).await,
+        "the app's blob is not the GC's to remove"
+    );
+    assert!(t.node.blobs().has(app).await.unwrap());
+    let owned = std::fs::read_to_string(t.dir.path().join("services/owned.json")).unwrap();
+    assert!(
+        !owned.contains(&v1.to_hex().to_string()),
+        "a removed hash leaves the owned set: {owned}"
+    );
+    t.shutdown().await;
+}

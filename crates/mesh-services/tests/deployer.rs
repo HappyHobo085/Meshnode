@@ -222,11 +222,15 @@ async fn heal(n: &Net) {
 async fn deploy_wasm_on_a_served_on_b() {
     let n = net(&[], &[(Role::Host, &[])]).await;
     let (a, b) = (&n.svcs[0], &n.svcs[1]);
-    a.deploy_wasm("counter", wasm("counter"), DeployOpts::default())
+    let m = a
+        .deploy_wasm("counter", wasm("counter"), DeployOpts::default())
         .await
         .unwrap();
     wait_ready(a, "counter", 1).await;
     wait_ready(b, "counter", 1).await;
+    // The module B fetched is service-owned there, so B's blob GC may collect it later.
+    let owned = std::fs::read_to_string(n.dirs[1].path().join("services/owned.json")).unwrap();
+    assert!(owned.contains(&hex::encode(module_of(&m))), "{owned}");
 
     assert_eq!(call(a, "counter", "/").await, (200, "1".into()));
     wait_kv(&n.nodes[1], "counter", "n", "1").await;

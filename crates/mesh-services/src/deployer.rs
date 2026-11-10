@@ -23,6 +23,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep, sleep_until, tim
 use tracing::{error, info, warn};
 
 use crate::error::ServicesError;
+use crate::gc::mark_owned;
 use crate::manifest::{current_generation, data_ns, read_manifest};
 use crate::placement::placed_among;
 use crate::static_site::StaticSite;
@@ -90,6 +91,8 @@ pub(crate) struct Shared {
     /// side from storing a blob until its manifest is written, so GC never removes a blob
     /// a deploy is about to reference (this also serializes GC passes).
     pub gc_lock: tokio::sync::RwLock<()>,
+    /// Serializes read-modify-write cycles of `owned.json` (see `gc`).
+    pub owned_file: Mutex<()>,
     /// Test hook: while true, a GC pass that has chosen blobs to remove waits (holding the
     /// lock) before re-checking and removing them.
     pub gc_hold: watch::Sender<bool>,
@@ -106,6 +109,7 @@ impl Shared {
             known: Mutex::default(),
             paused: watch::Sender::new(false),
             gc_lock: tokio::sync::RwLock::new(()),
+            owned_file: Mutex::new(()),
             gc_hold: watch::Sender::new(false),
             gc_reached: tokio::sync::Notify::new(),
         }
@@ -566,6 +570,7 @@ async fn load(shared: &Shared, kind: &ServiceKind) -> Result<Payload, String> {
         ServiceKind::Wasm { module } => {
             let hash = BlobHash::from(*module);
             fetched(blobs.fetch(hash)).await?;
+            owned(shared, hash);
             let bytes = blobs.read(hash).await.map_err(|e| e.to_string())?;
             let loaded = shared
                 .runtime
@@ -575,12 +580,22 @@ async fn load(shared: &Shared, kind: &ServiceKind) -> Result<Payload, String> {
             Ok(Payload::Wasm(loaded))
         }
         ServiceKind::Static { root } => {
-            fetched(blobs.fetch_collection(BlobHash::from(*root))).await?;
+            let hash = BlobHash::from(*root);
+            fetched(blobs.fetch_collection(hash)).await?;
+            owned(shared, hash);
             let site = StaticSite::load(blobs, *root)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Payload::Static(Arc::new(site)))
         }
+    }
+}
+
+/// Records a fetched module or root as service-owned (blob GC may then remove it once it
+/// is unreferenced). A failure only means the blob is never collected.
+fn owned(shared: &Shared, hash: BlobHash) {
+    if let Err(e) = mark_owned(shared, hash) {
+        warn!(hash = %hash.to_hex(), error = %e, "cannot record a service blob as owned");
     }
 }
 

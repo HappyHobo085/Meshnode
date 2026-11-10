@@ -5,8 +5,11 @@
 //! node's wall clock. A pass never removes anything unless the node is `Running`: while it
 //! re-bootstraps or is removed, the manifests in `_mesh` may be incomplete.
 //!
-//! The GC considers every pinned blob on the node, not only service blobs: spec §5.5 says
-//! "a pinned hash". Anything pinned that no service references ages out after 24 hours.
+//! The GC only considers blobs services own: the modules and static roots this node
+//! deployed or fetched for a service, recorded in `<data>/services/owned.json` (a static
+//! root's children are covered by its collection). Anything else pinned on the node, such
+//! as a blob the app added itself, is never collected here. An owned hash is dropped from
+//! the set once it is removed.
 //!
 //! A pass holds the write side of `Shared::gc_lock`, which deploys hold (read side) from
 //! storing a blob until its manifest is written. Just before removing, it recomputes the
@@ -14,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use mesh_core::local::atomic_write;
@@ -45,25 +48,68 @@ struct GcState {
     first_unreferenced_ms: BTreeMap<String, u64>,
 }
 
+/// `owned.json`: the lower-case hex hashes of the blobs services own.
+#[derive(Default, Serialize, Deserialize)]
+struct Owned {
+    owned: BTreeSet<String>,
+}
+
+fn owned_path(shared: &Shared) -> PathBuf {
+    shared.node.data_dir().join("services").join("owned.json")
+}
+
+/// Loads `owned.json`, lets `f` change it and saves it if `f` returns true, all under
+/// `Shared::owned_file`.
+fn update_owned(
+    shared: &Shared,
+    f: impl FnOnce(&mut BTreeSet<String>) -> bool,
+) -> Result<(), ServicesError> {
+    let _file = shared
+        .owned_file
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let path = owned_path(shared);
+    let mut owned: Owned = load_json(&path, "owned.json");
+    if f(&mut owned.owned) {
+        save_json(&path, &owned)?;
+    }
+    Ok(())
+}
+
+/// Records `hash` (a module or a static root, pinned on this node) as service-owned, so
+/// the GC may remove it once nothing references it.
+pub(crate) fn mark_owned(shared: &Shared, hash: BlobHash) -> Result<(), ServicesError> {
+    update_owned(shared, |owned| owned.insert(hash.to_hex().to_string()))
+}
+
+/// The hashes services own, as lower-case hex.
+fn owned(shared: &Shared) -> BTreeSet<String> {
+    let _file = shared
+        .owned_file
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    load_json::<Owned>(&owned_path(shared), "owned.json").owned
+}
+
 fn state_path(shared: &Shared) -> PathBuf {
     shared.node.data_dir().join("services").join("gc.json")
 }
 
-fn load_state(path: &std::path::Path) -> GcState {
+fn load_json<S: Default + for<'de> Deserialize<'de>>(path: &std::path::Path, what: &str) -> S {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            warn!(error = %e, "unreadable gc.json; starting fresh");
-            GcState::default()
+            warn!(error = %e, "unreadable {what}; starting fresh");
+            S::default()
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => GcState::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => S::default(),
         Err(e) => {
-            warn!(error = %e, "cannot read gc.json; starting fresh");
-            GcState::default()
+            warn!(error = %e, "cannot read {what}; starting fresh");
+            S::default()
         }
     }
 }
 
-fn save_state(path: &std::path::Path, state: &GcState) -> Result<(), ServicesError> {
+fn save_json(path: &std::path::Path, state: &impl Serialize) -> Result<(), ServicesError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -138,14 +184,15 @@ pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
     };
     let now = shared.node.now_ms();
     let path = state_path(shared);
-    let old = load_state(&path);
+    let old: GcState = load_json(&path, "gc.json");
+    let owned = owned(shared);
     let mut next = GcState::default();
     let mut doomed = Vec::new();
     for (hash, _kind) in shared.node.blobs().pins().await? {
-        if keep.contains(&hash) {
+        let key = hash.to_hex().to_string();
+        if keep.contains(&hash) || !owned.contains(&key) {
             continue;
         }
-        let key = hash.to_hex().to_string();
         // A first sighting in the future (the clock moved back) restarts the grace period.
         let first = old
             .first_unreferenced_ms
@@ -168,20 +215,30 @@ pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
         };
         doomed.retain(|h| !keep.contains(h));
     }
-    save_state(&path, &next)?;
+    save_json(&path, &next)?;
     if doomed.is_empty() {
         return Ok(());
     }
     // One sweep for all of them (a few blob-GC ticks), so the lock is held about as long
     // as a single removal.
-    match shared.node.blobs().remove_many(&doomed).await {
-        Ok(()) => {
-            for hash in &doomed {
-                info!(hash = %hash.to_hex(), "removed unreferenced service blob");
-            }
-        }
-        Err(e) => warn!(count = doomed.len(), error = %e, "blob removal failed"),
+    let blobs = shared.node.blobs();
+    if let Err(e) = blobs.remove_many(&doomed).await {
+        warn!(count = doomed.len(), error = %e, "blob removal failed");
+        return Ok(());
     }
+    let mut removed = BTreeSet::new();
+    for hash in &doomed {
+        // A fetch may have pinned it again meanwhile; then it stays owned.
+        if !blobs.is_pinned(*hash).await? {
+            info!(hash = %hash.to_hex(), "removed unreferenced service blob");
+            removed.insert(hash.to_hex().to_string());
+        }
+    }
+    update_owned(shared, |owned| {
+        let before = owned.len();
+        owned.retain(|h| !removed.contains(h));
+        owned.len() != before
+    })?;
     Ok(())
 }
 

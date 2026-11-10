@@ -14,7 +14,9 @@ use tokio::sync::Mutex;
 use crate::deployer::{DeployerTask, DeployerTimings, Shared};
 use crate::error::ServicesError;
 use crate::gc::{GC_EVERY, GcTask, mark_owned};
-use crate::manifest::{current_generation, data_ns, gen_key, manifest_key, read_manifest};
+use crate::manifest::{
+    current_generation, data_ns, gen_key, manifest_key, module_too_large, read_manifest,
+};
 
 /// Settings for [`Services::start`].
 #[derive(Clone, Debug)]
@@ -174,6 +176,9 @@ impl Services {
     ) -> Result<ServiceManifest, ServicesError> {
         check_name(name)?;
         validate(&draft(name, ServiceKind::Wasm { module: [0; 32] }, &opts))?;
+        if let Some(e) = module_too_large(wasm.len() as u64) {
+            return Err(ServicesError::InvalidComponent(e));
+        }
         // An invalid component fails here, before anything is stored.
         let hash = *blake3::hash(&wasm).as_bytes();
         self.shared

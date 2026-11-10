@@ -29,7 +29,7 @@ use tracing::{error, info, warn};
 
 use crate::error::ServicesError;
 use crate::gc::mark_owned;
-use crate::manifest::{current_generation, data_ns, read_manifest};
+use crate::manifest::{current_generation, data_ns, module_too_large, read_manifest};
 use crate::placement::placed_among;
 use crate::static_site::StaticSite;
 use crate::status::LocalStatus;
@@ -626,6 +626,14 @@ async fn load(shared: &Shared, kind: &ServiceKind) -> Result<Payload, String> {
             let hash = BlobHash::from(*module);
             fetched(blobs.fetch(hash)).await?;
             owned(shared, hash);
+            match blobs.size(hash).await.map_err(|e| e.to_string())? {
+                Some(len) => {
+                    if let Some(e) = module_too_large(len) {
+                        return Err(e);
+                    }
+                }
+                None => return Err("module not stored after fetch".into()),
+            }
             let bytes = blobs.read(hash).await.map_err(|e| e.to_string())?;
             let loaded = shared
                 .runtime

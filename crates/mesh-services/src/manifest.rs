@@ -8,6 +8,20 @@ use crate::error::ServicesError;
 
 const PAGE: u32 = 256;
 
+/// The largest WASM module a service may have (64 MiB): bigger ones are refused at deploy
+/// and never read into memory by the deployer.
+pub(crate) const MAX_MODULE_BYTES: u64 = 64 << 20;
+
+/// Why a module of `len` bytes is refused, if it is.
+pub(crate) fn module_too_large(len: u64) -> Option<String> {
+    (len > MAX_MODULE_BYTES).then(|| {
+        format!(
+            "module of {len} bytes exceeds the {} MiB limit",
+            MAX_MODULE_BYTES >> 20
+        )
+    })
+}
+
 /// `_mesh` register holding the manifest of `name`.
 pub fn manifest_key(name: &str) -> String {
     format!("service/{name}")

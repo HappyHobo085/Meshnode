@@ -142,7 +142,7 @@ Validation on decode and before every write: name pattern; `memory_mb` 1..=1024;
 
 All writes go through the gated `StoreHandle`.
 
-- **`deploy_wasm(name, bytes, opts)`**: `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, so a rejected deploy pins nothing) → `blobs.add_bytes(bytes)` → write the manifest *(amended during implementation)*. A deploy holds the GC lock's shared side from adding the blob until the manifest is written (§5.5) with `version = previous + 1` (1 if none).
+- **`deploy_wasm(name, bytes, opts)`**: a module over 64 MiB is refused with `InvalidComponent` *(amended in final review)*; `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, so a rejected deploy pins nothing) → `blobs.add_bytes(bytes)` → write the manifest *(amended during implementation)*. A deploy holds the GC lock's shared side from adding the blob until the manifest is written (§5.5) with `version = previous + 1` (1 if none).
 - **`deploy_static(name, dir, opts)`**: `blobs.add_path(dir)` (a collection) → write the manifest.
 - **`set_placement`, `set_outbound`, `set_limits`**: rewrite the manifest with `version + 1`. `NotFound` if undeployed.
 - **`undeploy(name)`**: delete the manifest. The data stays.
@@ -166,7 +166,7 @@ One task, supervised and stopped by the node's cancel token.
 - **Target** per service: the manifest if placed here, else none.
 - **Active table**: `RwLock<HashMap<String, Arc<Active>>>`, `Active { manifest, generation, payload: Wasm(Loaded) | Static(StaticSite) }`. Requests clone the `Arc`, so in-flight requests finish on the version they started with.
 - **Transitions**:
-  - Module/root changed: fetch (`blobs.fetch` for WASM, `blobs.fetch_collection` for static; skipped when present locally) → `runtime.load` (WASM) or load the collection index (static) → swap. The previous version serves until the swap.
+  - Module/root changed: fetch (`blobs.fetch` for WASM, `blobs.fetch_collection` for static; skipped when present locally) → a module over 64 MiB fails here (`blobs.size`, before it is read; *amended in final review*) → `runtime.load` (WASM) or load the collection index (static) → swap. The previous version serves until the swap.
   - Only limits, outbound, placement or generation changed: swap immediately.
   - A newer manifest arrives during a fetch: the stale fetch is abandoned.
   - Failure: keep the previous version; retry with backoff 5 s → 5 min; status `Failed { error, retry_at }`.

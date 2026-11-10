@@ -12,8 +12,8 @@ use mesh_core::{Node, NodeStatus};
 use mesh_proto::{Limits, Placement, Role, ServiceKind, ServiceManifest, decode_raw};
 use mesh_runtime::{KvBackend, KvError};
 use mesh_services::{
-    DeployOpts, ServiceKv, Services, ServicesConfig, ServicesError, current_generation, data_ns,
-    manifest_key,
+    DeployOpts, LocalStatus, ServiceKv, Services, ServicesConfig, ServicesError,
+    current_generation, data_ns, manifest_key,
 };
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -89,10 +89,12 @@ async fn deploy_static_writes_collection_manifest() {
 async fn garbage_bytes_rejected() {
     let (node, svc, _d) = solo().await;
     let core_module = wat::parse_str("(module)").unwrap();
-    let cases: [Vec<u8>; 3] = [
+    let cases: [Vec<u8>; 4] = [
         Vec::new(),
         vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
         core_module,
+        // A valid component that imports outside the world.
+        fixture("bad"),
     ];
     let pins = node.blobs().pins().await.unwrap();
     for bytes in cases {
@@ -106,6 +108,55 @@ async fn garbage_bytes_rejected() {
         assert_eq!(manifest(&node, "junk").await, None);
         assert_eq!(node.blobs().pins().await.unwrap(), pins);
     }
+    svc.shutdown().await;
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_module_rejected() {
+    let (node, svc, _d) = solo().await;
+    let pins = node.blobs().pins().await.unwrap();
+    let r = svc
+        .deploy_wasm(
+            "big",
+            Bytes::from(vec![0u8; (64 << 20) + 1]),
+            DeployOpts::default(),
+        )
+        .await;
+    match r {
+        Err(ServicesError::InvalidComponent(e)) => assert!(e.contains("64 MiB"), "{e}"),
+        r => panic!("{r:?}"),
+    }
+    assert_eq!(manifest(&node, "big").await, None);
+    assert_eq!(node.blobs().pins().await.unwrap(), pins);
+
+    // A manifest naming an oversized module (from elsewhere) fails there without loading it.
+    let big = node
+        .blobs()
+        .add_bytes(Bytes::from(vec![0u8; (64 << 20) + 1]))
+        .await
+        .unwrap();
+    let m = ServiceManifest {
+        name: "big".into(),
+        kind: ServiceKind::Wasm {
+            module: *big.as_bytes(),
+        },
+        version: 1,
+        limits: Limits::default(),
+        placement: Placement::AllHosts,
+        outbound: vec![],
+    };
+    node.store()
+        .set(MESH_NS, &manifest_key("big"), mesh_proto::encode_raw(&m))
+        .await
+        .unwrap();
+    wait_until("the oversized module fails", T, || {
+        svc.services().iter().any(|s| {
+            s.manifest.name == "big"
+                && matches!(&s.local, LocalStatus::Failed { error, .. } if error.contains("64 MiB"))
+        })
+    })
+    .await;
     svc.shutdown().await;
     node.shutdown().await;
 }

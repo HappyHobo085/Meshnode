@@ -11,8 +11,8 @@ use mesh_admin::{
     LocalStateView, StatusInfo,
 };
 use mesh_proto::{Limits, Placement, Role};
-use meshd::config::GatewaySection;
-use meshd::{Daemon, MeshdConfig, TestOptions};
+use mesh_host::config::GatewaySection;
+use mesh_host::{Daemon, MeshdConfig, TestOptions};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -99,7 +99,7 @@ async fn start_in(dir: TempDir, mut cfg: MeshdConfig) -> D {
         .expect("daemon start timed out");
         match r {
             Ok(d) => break d,
-            Err(meshd::DaemonError::Gateway(e)) if attempt < 3 => {
+            Err(mesh_host::DaemonError::Gateway(e)) if attempt < 3 => {
                 eprintln!("gateway bind failed ({e}); retrying on a fresh port");
                 attempt += 1;
                 cfg.gateway.listen = SocketAddr::from(([127, 0, 0, 1], free_port()));

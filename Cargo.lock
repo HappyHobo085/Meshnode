@@ -2422,6 +2422,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "hex",
+ "libc",
+ "mesh-admin",
+ "mesh-core",
+ "mesh-gateway",
+ "mesh-host",
+ "mesh-proto",
+ "mesh-runtime",
+ "mesh-services",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mesh-proto"
 version = "0.1.0"
 dependencies = [
@@ -2515,6 +2543,7 @@ dependencies = [
  "mesh-admin",
  "mesh-core",
  "mesh-gateway",
+ "mesh-host",
  "mesh-proto",
  "mesh-runtime",
  "mesh-services",

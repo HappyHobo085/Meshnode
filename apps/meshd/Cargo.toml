@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 mesh-admin = { path = "../../crates/mesh-admin" }
 mesh-core = { path = "../../crates/mesh-core" }
+mesh-host = { path = "../../crates/mesh-host" }
 mesh-gateway = { path = "../../crates/mesh-gateway" }
 mesh-proto = { path = "../../crates/mesh-proto" }
 mesh-services = { path = "../../crates/mesh-services" }
@@ -54,7 +55,7 @@ windows-sys = { workspace = true, features = [
 [features]
 # Test-only helpers: `Daemon::start_with` (fast node timings, loopback binding, quick
 # deployer rescans).
-test-hooks = ["mesh-core/test-hooks", "mesh-services/test-hooks"]
+test-hooks = ["mesh-host/test-hooks"]
 
 [dev-dependencies]
 meshd = { path = ".", features = ["test-hooks"] }

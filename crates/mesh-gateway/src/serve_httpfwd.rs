@@ -3,7 +3,7 @@
 //! forwarded request is never forwarded again.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -54,6 +54,8 @@ struct SlotInner {
     /// Weak: the handler lives in the node's router, and `Services` hold the node's
     /// handle; a strong reference would keep both alive forever.
     services: OnceLock<Weak<Services>>,
+    /// Set by [`HttpFwdSlot::detach`]: new requests no longer reach the services.
+    detached: AtomicBool,
     /// Requests answered (test hook).
     served: AtomicU64,
 }
@@ -74,6 +76,13 @@ impl HttpFwdSlot {
         if self.slot.services.set(Arc::downgrade(services)).is_err() {
             warn!("httpfwd handler already attached; ignoring");
         }
+    }
+
+    /// Stops handing new requests to the services: they are answered `503 Service not yet
+    /// replicated` (which the forwarder retries elsewhere), so that only requests already
+    /// in flight still hold the services.
+    pub fn detach(&self) {
+        self.slot.detached.store(true, Ordering::SeqCst);
     }
 
     /// Requests this handler has answered, including the `503`s before attach.
@@ -149,7 +158,12 @@ async fn serve_stream(slot: &SlotInner, mut send: SendStream, mut recv: RecvStre
         }
     };
     let service = req.service.clone();
-    let resp = match slot.services.get().and_then(Weak::upgrade) {
+    let services = if slot.detached.load(Ordering::SeqCst) {
+        None
+    } else {
+        slot.services.get().and_then(Weak::upgrade)
+    };
+    let resp = match services {
         None => not_replicated(),
         Some(services) => match to_request(req) {
             Ok(r) => services.handle(&service, r).await,

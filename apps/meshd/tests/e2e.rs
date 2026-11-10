@@ -99,6 +99,18 @@ fn free_port() -> u16 {
 /// Starts an uninitialised daemon (offline, gateway on a free loopback port) and waits for
 /// its admin endpoint.
 fn start() -> Node {
+    // `free_port` races with parallel tests: a daemon that exits during start-up (its port
+    // was taken) is started again on a fresh port, up to 3 attempts in all.
+    for _ in 0..2 {
+        if let Some(node) = try_start() {
+            return node;
+        }
+        eprintln!("daemon exited during start-up; retrying on a fresh port");
+    }
+    try_start().expect("daemon exited during start-up")
+}
+
+fn try_start() -> Option<Node> {
     let dir = TempDir::new().unwrap();
     let port = free_port();
     std::fs::write(
@@ -118,16 +130,19 @@ fn start() -> Node {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn meshd run");
-    let daemon = Running(child);
+    let mut daemon = Running(child);
     let deadline = Instant::now() + T;
     loop {
         if meshd(dir.path(), &["status", "--json"]).status.success() {
             break;
         }
+        if daemon.0.try_wait().ok().flatten().is_some() {
+            return None;
+        }
         assert!(Instant::now() < deadline, "daemon did not come up");
         std::thread::sleep(Duration::from_millis(200));
     }
-    Node { dir, port, daemon }
+    Some(Node { dir, port, daemon })
 }
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {

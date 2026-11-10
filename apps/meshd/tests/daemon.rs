@@ -86,14 +86,27 @@ impl D {
     }
 }
 
-async fn start_in(dir: TempDir, cfg: MeshdConfig) -> D {
-    let daemon = timeout(
-        T,
-        Daemon::start_with(dir.path().to_path_buf(), cfg, TestOptions::fast()),
-    )
-    .await
-    .expect("daemon start timed out")
-    .expect("daemon start");
+async fn start_in(dir: TempDir, mut cfg: MeshdConfig) -> D {
+    // `free_port` races with parallel tests: when the gateway cannot bind, try a fresh port
+    // (up to 3 attempts in all).
+    let mut attempt = 1;
+    let daemon = loop {
+        let r = timeout(
+            T,
+            Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()),
+        )
+        .await
+        .expect("daemon start timed out");
+        match r {
+            Ok(d) => break d,
+            Err(meshd::DaemonError::Gateway(e)) if attempt < 3 => {
+                eprintln!("gateway bind failed ({e}); retrying on a fresh port");
+                attempt += 1;
+                cfg.gateway.listen = SocketAddr::from(([127, 0, 0, 1], free_port()));
+            }
+            Err(e) => panic!("daemon start: {e}"),
+        }
+    };
     D { daemon, dir }
 }
 
@@ -723,5 +736,17 @@ async fn gateway_port_in_use_fails_start_then_restarts() {
     let d = start_in(dir, cfg).await;
     assert_eq!(d.status().await.state, DaemonState::Running);
     assert_eq!(d.gateway(), addr);
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_creates_meshd_toml_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("meshd.toml");
+    assert!(!file.exists());
+    let d = start_in(dir, test_config()).await;
+    assert!(file.exists(), "meshd.toml was not created");
+    let loaded = MeshdConfig::load_or_default(d.data()).unwrap();
+    assert_eq!(loaded.relay, "disabled");
     d.stop().await;
 }

@@ -195,8 +195,10 @@ fn pipe_sddl(own_sid: &str, access: &Access) -> Result<String, AdminError> {
     match access {
         Access::CurrentUserOnly => {}
         Access::WindowsUser { sid } => {
-            if !valid_sid(sid) {
-                return Err(AdminError::InvalidAccess(format!("{sid:?} is not a SID")));
+            if !valid_account_sid(sid) {
+                return Err(AdminError::InvalidAccess(format!(
+                    "{sid:?} is not a user account SID"
+                )));
             }
             sddl.push_str(&format!("(A;;GA;;;{sid})"));
         }
@@ -210,6 +212,13 @@ fn valid_sid(s: &str) -> bool {
         rest.split('-')
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     })
+}
+
+/// A SID of an individual account: `S-1-5-21-…` (local or domain user) or `S-1-12-1-…`
+/// (Entra ID user). Groups and well-known SIDs (Everyone, Users, …) are refused: the extra
+/// pipe user must be one person.
+fn valid_account_sid(s: &str) -> bool {
+    valid_sid(s) && (s.starts_with("S-1-5-21-") || s.starts_with("S-1-12-1-")) && s.len() > 9
 }
 
 /// A self-relative security descriptor allocated by
@@ -361,12 +370,12 @@ mod tests {
     async fn pipe_dacl_grants_daemon_admins_and_recorded_user_only() {
         let own = current_user_sid().unwrap();
         assert!(valid_sid(&own), "{own}");
-        // BU (Users) stands in for the recorded user.
+        // A made-up account SID stands in for the recorded user.
         let name = pipe_name("dacl");
         let mut l = Listener::bind(
             &name,
             &Access::WindowsUser {
-                sid: "S-1-5-32-545".into(),
+                sid: "S-1-5-21-1-2-3-1001".into(),
             },
         )
         .unwrap();
@@ -375,7 +384,7 @@ mod tests {
         assert!(dacl.starts_with("D:P"), "{dacl}");
         assert!(dacl.contains(&format!(";;;{own})")), "{dacl}");
         assert!(dacl.contains(";;;BA)"), "{dacl}");
-        assert!(dacl.contains(";;;BU)"), "{dacl}");
+        assert!(dacl.contains(";;;S-1-5-21-1-2-3-1001)"), "{dacl}");
         assert_eq!(dacl.matches("(A;").count(), 3, "{dacl}");
         assert!(
             !dacl.contains(";;;WD)") && !dacl.contains(";;;AN)"),
@@ -452,5 +461,24 @@ mod tests {
             ),
             Err(AdminError::InvalidAccess(_))
         ));
+    }
+
+    #[test]
+    fn only_account_sids_reach_the_pipe() {
+        assert!(valid_account_sid("S-1-5-21-1-2-3-1001"));
+        assert!(valid_account_sid("S-1-12-1-1-2-3-4"));
+        for group in [
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-5-32-545",
+            "S-1-5-21-",
+            "S-1-5-21",
+        ] {
+            assert!(!valid_account_sid(group), "{group}");
+            assert!(matches!(
+                pipe_sddl("S-1-5-19", &Access::WindowsUser { sid: group.into() }),
+                Err(AdminError::InvalidAccess(_))
+            ));
+        }
     }
 }

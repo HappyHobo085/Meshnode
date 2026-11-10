@@ -15,7 +15,7 @@ use mesh_admin::{
 };
 use mesh_core::local::read_genesis;
 use mesh_core::{Node, NodeConfig, NodeError, NodeHandle, NodeStatus, Timings};
-use mesh_gateway::{Forwarder, Gateway, GatewayConfig, GatewayError, HttpFwdHandler};
+use mesh_gateway::{Forwarder, Gateway, GatewayConfig, GatewayError, HttpFwdHandler, HttpFwdSlot};
 use mesh_proto::{ALPN_HTTPFWD, InviteTicket};
 use mesh_services::{Services, ServicesConfig, ServicesError};
 use tokio::sync::{RwLock, RwLockReadGuard};
@@ -121,6 +121,7 @@ struct Running {
     node: Node,
     services: Arc<Services>,
     gateway: Option<Gateway>,
+    slot: HttpFwdSlot,
 }
 
 /// How the node comes up.
@@ -176,6 +177,10 @@ impl Daemon {
             return Err(DaemonError::AlreadyRunning(data_dir));
         }
         prepare_dirs(&data_dir).map_err(|e| dir_error(&data_dir, e))?;
+        // Spec §6.3 step 1: `meshd.toml` is created with the defaults when it is missing.
+        if !data_dir.join(CONFIG_FILE).exists() {
+            cfg.save(&data_dir)?;
+        }
         let access = access_for(&cfg);
         let initialised = read_genesis(&data_dir)?.is_some();
         let inner = Arc::new(Inner {
@@ -245,7 +250,14 @@ impl Daemon {
             warn!("the admin server did not stop in time");
         }
         // Any Init or Join in progress was a request, cancelled with the admin server.
-        let _t = inner.transition.lock().await;
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _t = match timeout(left, inner.transition.lock()).await {
+            Ok(t) => Some(t),
+            Err(_) => {
+                warn!("an Init or Join did not end in time; stopping anyway");
+                None
+            }
+        };
         inner.stop_node(deadline).await;
         info!("meshd stopped");
     }
@@ -393,6 +405,7 @@ impl Inner {
             node,
             services,
             gateway,
+            slot,
         });
         *lock(&self.gateway_addrs) = addrs.unwrap_or_default();
         *lock(&self.handle) = Some(handle);
@@ -418,12 +431,15 @@ impl Inner {
     /// Stops the gateway, the services and the node, if running, by `deadline`. False when
     /// the services were still in use and the node was stopped without them.
     async fn stop_node(&self, deadline: Instant) -> bool {
-        let running = {
-            let mut run = self.run.write().await;
-            lock(&self.handle).take();
-            lock(&self.gateway_addrs).clear();
-            run.take()
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(mut run) = timeout(left, self.run.write()).await else {
+            error!("the node is still in use; it cannot be stopped in time");
+            return false;
         };
+        lock(&self.handle).take();
+        lock(&self.gateway_addrs).clear();
+        let running = run.take();
+        drop(run);
         let Some(running) = running else {
             return true;
         };
@@ -431,12 +447,16 @@ impl Inner {
             node,
             services,
             gateway,
+            slot,
         } = running;
         if let Some(g) = gateway
             && timeout(GATEWAY_STOP, g.shutdown()).await.is_err()
         {
             warn!("the gateway did not stop in time");
         }
+        // Peers' new httpfwd requests are refused from here on, so only those already in
+        // flight can still hold the services.
+        slot.detach();
         // The gateway dropped the forwarder; the httpfwd slot holds only a weak reference.
         let released = match release(services, Instant::now() + SERVICES_RELEASE).await {
             Some(s) => {

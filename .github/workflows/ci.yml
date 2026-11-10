@@ -58,3 +58,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p meshd
+      - run: cargo test -p mesh-admin

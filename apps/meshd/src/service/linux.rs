@@ -28,6 +28,8 @@ pub fn unit_file(binary: &Path, data: &Path) -> String {
          User=meshnode\n\
          Group=meshnode\n\
          StateDirectory=meshnode\n\
+         StateDirectoryMode=0750\n\
+         UMask=0027\n\
          ExecStart={exec}\n\
          Restart=always\n\
          \n\
@@ -164,6 +166,8 @@ mod installer {
                 .map_err(io_err(format!("creating {}", data.display())))?;
             let owner = format!("{SERVICE_NAME}:{SERVICE_NAME}");
             run("chown", &["-R", "--", &owner, &data.display().to_string()])?;
+            // Private to the service account and its group, like StateDirectoryMode in the unit.
+            run("chmod", &["0750", "--", &data.display().to_string()])?;
         }
         write_file(
             Path::new(UNIT_PATH),

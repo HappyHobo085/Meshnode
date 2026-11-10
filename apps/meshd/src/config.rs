@@ -318,14 +318,19 @@ impl MeshdConfig {
             "admin.windows_user_sid" => {
                 self.admin.windows_user_sid = if value.is_empty() {
                     None
-                } else if value.starts_with("S-1-")
-                    && value[4..]
+                } else if ["S-1-5-21-", "S-1-12-1-"]
+                    .iter()
+                    .any(|p| value.starts_with(p))
+                    && value[9..]
                         .split('-')
                         .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
                 {
                     Some(value.to_string())
                 } else {
-                    return Err(invalid(key, "expected a SID such as S-1-5-21-…"));
+                    return Err(invalid(
+                        key,
+                        "expected a user account SID such as S-1-5-21-… (not a group or well-known SID)",
+                    ));
                 };
                 Ok(true)
             }
@@ -446,6 +451,10 @@ windows_user_sid = "S-1-5-21-1-2-3-1001"
         for (k, v) in [
             ("services.max_memory_mb", "63"),
             ("admin.windows_user_sid", "S-1-x"),
+            ("admin.windows_user_sid", "S-1-1-0"),
+            ("admin.windows_user_sid", "S-1-5-11"),
+            ("admin.windows_user_sid", "S-1-5-32-545"),
+            ("admin.windows_user_sid", "S-1-5-21-"),
             ("gateway.ports", "9000"),
             ("gateway.ports", "8000=sync"),
             ("gateway.listen", "127.0.0.1:9000"),

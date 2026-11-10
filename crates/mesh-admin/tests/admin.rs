@@ -416,7 +416,7 @@ async fn request_round_trip_every_variant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn uninitialised_accepts_only_init_join() {
+async fn uninitialised_accepts_only_bootstrap_requests() {
     let d = daemon().await;
     *d.fake.state.lock().unwrap() = DaemonState::Uninitialised;
     let mut c = d.client().await;

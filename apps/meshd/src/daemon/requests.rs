@@ -207,9 +207,13 @@ impl Daemon {
             Err(e) => return AdminResponse::error(ErrorCode::InvalidArgument, e.to_string()),
         };
         if !restart_required && let Some(run) = run.as_ref() {
-            let name = (key == "name").then(|| new.name.clone());
-            let tags = (key == "tags").then(|| new.tags.clone());
-            if let Err(e) = run.node.set_info(name, tags).await {
+            // Both fields, from `meshd.toml`: a lagging membership snapshot must not
+            // write back an older name or tags.
+            if let Err(e) = run
+                .node
+                .set_info(Some(new.name.clone()), Some(new.tags.clone()))
+                .await
+            {
                 return node_error(e).into();
             }
         }
@@ -270,19 +274,32 @@ impl Daemon {
                 AdminResponse::Ok
             }
             R::SetInfo { name, tags } => {
-                node.set_info(name.clone(), tags.clone())
-                    .await
-                    .map_err(node_error)?;
+                // Both fields, the unchanged one from `meshd.toml`, so that a lagging
+                // membership snapshot cannot write back an older value.
+                let (cur_name, cur_tags) = {
+                    let cfg = self.inner.cfg.lock().await;
+                    (cfg.name.clone(), cfg.tags.clone())
+                };
+                node.set_info(
+                    Some(name.clone().unwrap_or(cur_name)),
+                    Some(tags.clone().unwrap_or(cur_tags)),
+                )
+                .await
+                .map_err(node_error)?;
                 self.remember_info(name, tags).await?;
                 AdminResponse::Ok
             }
             R::SetTagsOf { id, tags } => {
                 is_member(node, id)?;
-                node.set_tags_of(id, tags.clone())
-                    .await
-                    .map_err(node_error)?;
                 if id == node.node_id() {
+                    // Through `set_info` with both fields (see `SetInfo`).
+                    let name = self.inner.cfg.lock().await.name.clone();
+                    node.set_info(Some(name), Some(tags.clone()))
+                        .await
+                        .map_err(node_error)?;
                     self.remember_info(None, Some(tags)).await?;
+                } else {
+                    node.set_tags_of(id, tags).await.map_err(node_error)?;
                 }
                 AdminResponse::Ok
             }

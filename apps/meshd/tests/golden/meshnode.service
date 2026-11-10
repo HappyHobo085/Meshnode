@@ -7,6 +7,8 @@ Wants=network-online.target
 User=meshnode
 Group=meshnode
 StateDirectory=meshnode
+StateDirectoryMode=0750
+UMask=0027
 ExecStart=/usr/local/bin/meshd run --data /var/lib/meshnode
 Restart=always
 

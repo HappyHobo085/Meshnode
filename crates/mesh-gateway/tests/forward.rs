@@ -262,6 +262,22 @@ async fn unattached_handler_answers_retryable_503() {
     mesh.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_handler_answers_retryable_503() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let before = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
+    assert_ne!(before.body, b"Service not yet replicated");
+    mesh.m[0].slot.as_ref().unwrap().detach();
+    let resp = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.body, b"Service not yet replicated");
+    mesh.shutdown().await;
+}
+
 // ------------------------------------------------------------------- raw test handlers
 
 /// What a [`Raw`] handler answers to every request.

@@ -368,3 +368,175 @@ async fn shutdown_releases_services() {
     assert_eq!(Arc::strong_count(&mesh.m[0].svcs), before);
     mesh.shutdown().await;
 }
+
+// ---- fix round 1 ----
+
+async fn start_short(mesh: &Mesh, header_read: Duration, body_read: Duration) -> Gateway {
+    Gateway::start_with_timeouts(
+        cfg(&[(0, COUNTER)]),
+        mesh.fwd(0).clone(),
+        mesh.m[0].node.handle(),
+        mesh.m[0].svcs.clone(),
+        header_read,
+        body_read,
+    )
+    .await
+    .unwrap()
+}
+
+/// Reads one response (head plus `Content-Length` body) without waiting for the close.
+async fn read_one(s: &mut TcpStream) -> Resp {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..i]).into_owned();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if buf.len() >= i + 4 + len {
+                let body = String::from_utf8_lossy(&buf[i + 4..i + 4 + len]).into_owned();
+                let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+                return Resp { status, head, body };
+            }
+        }
+        let n = timeout(T, s.read(&mut tmp))
+            .await
+            .expect("response timed out")
+            .unwrap();
+        assert!(n > 0, "connection closed early");
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+#[tokio::test]
+async fn keep_alive_requests_are_each_routed() {
+    let mesh = with_counter("n0").await;
+    let g = start(&mesh, cfg(&[])).await;
+    let mut s = TcpStream::connect(main_addr(&g)).await.unwrap();
+    for (host, want) in [
+        ("counter.mesh.localhost", 200),
+        ("example.com", 404),
+        ("counter.mesh.localhost", 200),
+        ("mesh.localhost", 200),
+    ] {
+        let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let r = read_one(&mut s).await;
+        assert_eq!(r.status, want, "{host}");
+        if host == "counter.mesh.localhost" {
+            assert!(r.body.parse::<u32>().is_ok());
+        }
+    }
+    drop(s);
+    finish(g, mesh).await;
+}
+
+#[tokio::test]
+async fn header_timeout_applies_to_later_requests() {
+    let mesh = with_counter("n0").await;
+    let g = start_short(&mesh, Duration::from_secs(1), Duration::from_secs(60)).await;
+    let mut s = TcpStream::connect(main_addr(&g)).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: mesh.localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_one(&mut s).await.status, 200);
+    // The second request drips its headers past the limit.
+    s.write_all(b"GET / HTTP/1.1\r\nHost: mesh.loc")
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let mut rest = Vec::new();
+    let _ = timeout(Duration::from_secs(10), s.read_to_end(&mut rest))
+        .await
+        .expect("the server must close the connection");
+    assert!(start.elapsed() < Duration::from_secs(8));
+    // An idle connection is closed too.
+    let mut idle = TcpStream::connect(main_addr(&g)).await.unwrap();
+    let mut buf = Vec::new();
+    timeout(Duration::from_secs(10), idle.read_to_end(&mut buf))
+        .await
+        .expect("idle connection closed")
+        .ok();
+    finish(g, mesh).await;
+}
+
+#[tokio::test]
+async fn stalled_body_408() {
+    let mesh = with_counter("n0").await;
+    let g = start_short(&mesh, Duration::from_secs(30), Duration::from_secs(1)).await;
+    let mut s = TcpStream::connect(main_addr(&g)).await.unwrap();
+    s.write_all(
+        b"POST / HTTP/1.1\r\nHost: counter.mesh.localhost\r\nContent-Length: 1000\r\n\r\nx",
+    )
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let r = read_resp(&mut s).await;
+    assert_eq!(r.status, 408);
+    assert!(r.head.to_lowercase().contains("connection: close"));
+    assert!(start.elapsed() < Duration::from_secs(8));
+    finish(g, mesh).await;
+}
+
+#[tokio::test]
+async fn host_header_edge_cases() {
+    let mesh = with_counter("n0").await;
+    let g = start(&mesh, cfg(&[(0, COUNTER)])).await;
+    let (a, m) = (main_addr(&g), mapped_addr(&g));
+    // Absolute-form target whose authority differs from Host.
+    let r = raw(
+        a,
+        "GET http://other.example/ HTTP/1.1\r\nHost: counter.mesh.localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    // ... and one that agrees (case and port aside) is routed.
+    let r = raw(
+        a,
+        "GET http://MESH.localhost:80/ HTTP/1.1\r\nHost: mesh.localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    // Duplicate Host headers.
+    let r = raw(
+        a,
+        "GET / HTTP/1.1\r\nHost: mesh.localhost\r\nHost: counter.mesh.localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    // Trailing dot: unknown on the main port, misdirected on a mapped one.
+    assert_eq!(request(a, "GET", "localhost.", "/").await.status, 404);
+    assert_eq!(
+        request(a, "GET", "counter.mesh.localhost.", "/")
+            .await
+            .status,
+        404
+    );
+    assert_eq!(request(m, "GET", "localhost.", "/").await.status, 421);
+    // Malformed bracketed host.
+    assert_eq!(request(m, "GET", "[::1]x", "/").await.status, 421);
+    assert_eq!(request(a, "GET", "[::1]x", "/").await.status, 404);
+    finish(g, mesh).await;
+}
+
+#[tokio::test]
+async fn status_responses_are_nosniff() {
+    let mesh = with_counter("n0").await;
+    let g = start(&mesh, cfg(&[])).await;
+    for path in ["/", "/status.json"] {
+        let r = request(main_addr(&g), "GET", "mesh.localhost", path).await;
+        assert!(
+            r.head
+                .to_lowercase()
+                .contains("x-content-type-options: nosniff"),
+            "{path}"
+        );
+    }
+    finish(g, mesh).await;
+}

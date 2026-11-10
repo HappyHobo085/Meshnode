@@ -56,9 +56,9 @@ impl Snapshot {
         addrs: &[(SocketAddr, Option<String>)],
     ) -> Snapshot {
         let me = node.node_id();
-        let members: Vec<MemberRow> = node
-            .members()
-            .into_iter()
+        let statuses = node.members();
+        let members: Vec<MemberRow> = statuses
+            .iter()
             .map(|m| {
                 let info = m.info.as_ref();
                 MemberRow {
@@ -74,8 +74,7 @@ impl Snapshot {
                 }
             })
             .collect();
-        let name = node
-            .members()
+        let name = statuses
             .iter()
             .find(|m| m.id == me)
             .and_then(|m| m.info.as_ref().map(|i| i.name.clone()))

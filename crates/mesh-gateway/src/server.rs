@@ -3,7 +3,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,23 +24,36 @@ use tracing::{error, warn};
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
 use crate::forward::Forwarder;
-use crate::routing::{Target, route_main, route_mapped};
+use crate::routing::{Target, normalize_host, route_main, route_mapped};
 use crate::status_page::Snapshot;
 
-/// Open connections across all listeners. Past this, `accept` is not called: further
-/// connections wait in the kernel backlog until one closes.
+/// Open connections across all listeners. Past this, accepted connections wait (unserved)
+/// for a free slot.
 const MAX_CONNECTIONS: usize = 256;
-/// Time for a new connection to send its first request's headers.
-const FIRST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
-/// Keep-alive idle time. hyper's header-read timer also runs while a connection waits for
-/// its next request, so it is the idle timeout.
-const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(60);
+/// Time to receive a request's headers, counted from the end of the previous response (or
+/// the connection's start), so it is also the keep-alive idle timeout.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time to receive a request's body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Request body cap (spec §4.1): 64 MiB.
 const MAX_BODY: u64 = 64 * 1024 * 1024;
 /// How long shutdown waits for in-flight connections before cutting them off.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// The server's time limits; tests shorten them.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    header_read: Duration,
+    body_read: Duration,
+}
+
+const TIMEOUTS: Timeouts = Timeouts {
+    header_read: HEADER_READ_TIMEOUT,
+    body_read: BODY_READ_TIMEOUT,
+};
+
 struct Shared {
+    timeouts: Timeouts,
     forwarder: Forwarder,
     node: NodeHandle,
     services: Arc<Services>,
@@ -63,6 +75,34 @@ impl Gateway {
         forwarder: Forwarder,
         node: NodeHandle,
         services: Arc<Services>,
+    ) -> Result<Gateway, GatewayError> {
+        Self::start_inner(cfg, forwarder, node, services, TIMEOUTS).await
+    }
+
+    /// [`Gateway::start`] with custom header-read (also keep-alive idle) and body-read
+    /// timeouts.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn start_with_timeouts(
+        cfg: GatewayConfig,
+        forwarder: Forwarder,
+        node: NodeHandle,
+        services: Arc<Services>,
+        header_read: Duration,
+        body_read: Duration,
+    ) -> Result<Gateway, GatewayError> {
+        let t = Timeouts {
+            header_read,
+            body_read,
+        };
+        Self::start_inner(cfg, forwarder, node, services, t).await
+    }
+
+    async fn start_inner(
+        cfg: GatewayConfig,
+        forwarder: Forwarder,
+        node: NodeHandle,
+        services: Arc<Services>,
+        timeouts: Timeouts,
     ) -> Result<Gateway, GatewayError> {
         cfg.validate()?;
         let main = TcpListener::bind(cfg.listen)
@@ -88,6 +128,7 @@ impl Gateway {
             addrs.push((addr, svc.clone()));
         }
         let shared = Arc::new(Shared {
+            timeouts,
             forwarder,
             node,
             services,
@@ -146,13 +187,6 @@ async fn accept_loop(
     let mapped = Arc::new(mapped);
     let mut conns = JoinSet::new();
     loop {
-        let permit = tokio::select! {
-            _ = cancel.cancelled() => break,
-            p = permits.clone().acquire_owned() => match p {
-                Ok(p) => p,
-                Err(_) => break,
-            },
-        };
         let stream = tokio::select! {
             _ = cancel.cancelled() => break,
             r = listener.accept() => match r {
@@ -165,6 +199,14 @@ async fn accept_loop(
             },
         };
         while conns.try_join_next().is_some() {}
+        // Past the cap the accepted connection waits here for a free slot.
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => break,
+            p = permits.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+        };
         conns.spawn(serve_conn(
             stream,
             shared.clone(),
@@ -191,35 +233,18 @@ async fn serve_conn(
     _permit: OwnedSemaphorePermit,
 ) {
     let _ = stream.set_nodelay(true);
-    let seen = Arc::new(AtomicBool::new(false));
-    let svc = {
-        let seen = seen.clone();
-        service_fn(move |req| {
-            seen.store(true, Ordering::Relaxed);
-            handle(shared.clone(), mapped.clone(), req)
-        })
-    };
+    let timeouts = shared.timeouts;
+    let svc = service_fn(move |req| handle(shared.clone(), mapped.clone(), req));
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(KEEP_ALIVE_IDLE)
+        .header_read_timeout(timeouts.header_read)
         .keep_alive(true)
         .serve_connection(TokioIo::new(stream), svc);
     tokio::pin!(conn);
-    let first_deadline = sleep(FIRST_HEAD_TIMEOUT);
-    tokio::pin!(first_deadline);
-    let mut first_done = false;
     let mut closing = false;
     loop {
         tokio::select! {
             _ = &mut conn => break,
-            _ = &mut first_deadline, if !first_done => {
-                // No request head by now: drop the connection. Otherwise the first
-                // request arrived in time and only hyper's idle timer applies.
-                if !seen.load(Ordering::Relaxed) {
-                    break;
-                }
-                first_done = true;
-            }
             _ = cancel.cancelled(), if !closing => {
                 closing = true;
                 conn.as_mut().graceful_shutdown();
@@ -250,12 +275,26 @@ async fn handle(
     Ok(route(&shared, mapped.as_deref(), req).await)
 }
 
-async fn route(shared: &Shared, mapped: Option<&str>, req: Request<Incoming>) -> Resp {
-    let host = match req.headers().get(header::HOST) {
-        Some(v) => v.to_str().ok().map(str::to_owned),
-        None => req.uri().authority().map(|a| a.to_string()),
+/// The request's Host: the single Host header, or the authority of an absolute-form
+/// target. `None` (answered `400`) if there is neither, several Host headers, or an
+/// absolute-form authority that differs from the Host header.
+fn request_host(req: &Request<Incoming>) -> Option<String> {
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let header_host = match (hosts.next(), hosts.next()) {
+        (_, Some(_)) => return None,
+        (Some(v), None) => Some(v.to_str().ok()?.to_owned()),
+        (None, None) => None,
     };
-    let Some(host) = host else {
+    let authority = req.uri().authority().map(|a| a.to_string());
+    match (header_host, authority) {
+        (Some(h), Some(a)) if normalize_host(&h) != normalize_host(&a) => None,
+        (Some(h), _) => Some(h),
+        (None, a) => a,
+    }
+}
+
+async fn route(shared: &Shared, mapped: Option<&str>, req: Request<Incoming>) -> Resp {
+    let Some(host) = request_host(&req) else {
         return text(StatusCode::BAD_REQUEST, "Missing or invalid Host header");
     };
     let target = match mapped {
@@ -286,6 +325,10 @@ fn status(shared: &Shared, req: &Request<Incoming>) -> Resp {
         };
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        r.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
         r
     };
     match req.uri().path() {
@@ -306,10 +349,21 @@ async fn service(shared: &Shared, name: &str, req: Request<Incoming>) -> Resp {
         return too_large();
     }
     let (parts, body) = req.into_parts();
-    let body = match Limited::new(body, MAX_BODY as usize).collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => return too_large(),
-        Err(_) => return text(StatusCode::BAD_REQUEST, "Bad request body"),
+    let read = timeout(
+        shared.timeouts.body_read,
+        Limited::new(body, MAX_BODY as usize).collect(),
+    )
+    .await;
+    let body = match read {
+        Err(_) => {
+            let mut r = text(StatusCode::REQUEST_TIMEOUT, "Request body timed out");
+            r.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            return r;
+        }
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => return too_large(),
+        Ok(Err(_)) => return text(StatusCode::BAD_REQUEST, "Bad request body"),
     };
     let resp = shared
         .forwarder

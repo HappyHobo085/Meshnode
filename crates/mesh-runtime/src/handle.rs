@@ -10,14 +10,13 @@ use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use mesh_proto::Limits;
 use tokio::sync::Semaphore;
-use wasmtime::{Store, Trap};
+use wasmtime::{Store, Trap, UpdateDeadline};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
 use crate::RequestCtx;
-use crate::engine::deadline_ticks;
 use crate::host::{KvStatus, State};
 
 /// Node-wide state shared by every request a `Runtime` serves.
@@ -51,7 +50,8 @@ pub(crate) async fn serve(
     let timeout = Duration::from_millis(limits.request_timeout_ms);
     let service = ctx.service.clone();
     // On timeout `run` is dropped, which aborts the guest task (`AbortOnDrop`); a guest
-    // busy in wasm is stopped by its epoch deadline, set to expire at the same time.
+    // busy in wasm yields every epoch tick, so the abort takes effect at its next yield,
+    // and its epoch callback traps it once `deadline` has passed.
     // Limits from a validated manifest are at most 300 s; cap absurd values instead of
     // overflowing `Instant`.
     let deadline = start
@@ -66,8 +66,8 @@ pub(crate) async fn serve(
     }
 }
 
-/// Waits for an in-flight slot, instantiates `pre` in a new store whose epoch deadline is
-/// the time left until `deadline`, calls `wasi:http/incoming-handler.handle` and collects
+/// Waits for an in-flight slot, instantiates `pre` in a new store that yields every epoch
+/// tick and traps once `deadline` has passed, calls `wasi:http/incoming-handler.handle` and collects
 /// the response. Every failure becomes an error status.
 async fn run(
     pre: &ProxyPre<State>,
@@ -101,9 +101,17 @@ async fn run(
     );
     let mut store = Store::new(pre.engine(), state);
     store.limiter(State::limiter);
-    // The wait for a slot has used up part of the timeout; only the rest is left.
-    let left = deadline.saturating_duration_since(Instant::now());
-    store.set_epoch_deadline(deadline_ticks(left));
+    // Every epoch tick the guest yields to the executor, so a spinning guest never holds
+    // a worker thread; once `deadline` has passed (the wait for a slot included) it traps
+    // with `Trap::Interrupt` (`504`).
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(move |_| {
+        if Instant::now() >= deadline {
+            Ok(UpdateDeadline::Interrupt)
+        } else {
+            Ok(UpdateDeadline::Yield(1))
+        }
+    });
 
     let scheme = match req.uri().scheme_str() {
         Some("https") => Scheme::Https,

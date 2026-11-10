@@ -131,6 +131,55 @@ fn epoch_deadline_interrupts_spin_on_one_thread() {
     assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT);
 }
 
+/// Spinning guests yield to the executor: with more spinning requests than worker
+/// threads, other tasks on the runtime keep running long before the spins time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spinning_guests_do_not_starve_other_tasks() {
+    const SPINS: usize = 4;
+    let spin_timeout = Duration::from_secs(5);
+    let rt = Arc::new(runtime(64));
+    let spin = load(&rt, "spin", 1).await;
+    let before = rt.instantiations();
+
+    let started = Instant::now();
+    let spins: Vec<_> = (0..SPINS)
+        .map(|_| {
+            let rt = rt.clone();
+            let spin = spin.clone();
+            tokio::spawn(async move {
+                rt.handle(&spin, get("/"), ctx(timeout_ms(5_000)))
+                    .await
+                    .status()
+            })
+        })
+        .collect();
+    // Wait (on the test thread, which is not a worker) until both workers run a guest.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.instantiations() < before + 2 {
+        assert!(Instant::now() < deadline, "spins were never instantiated");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let probe = Instant::now();
+    tokio::spawn(tokio::time::sleep(Duration::from_millis(50)))
+        .await
+        .unwrap();
+    let took = probe.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "a 50 ms sleep took {took:?} next to {SPINS} spinning guests"
+    );
+
+    for handle in spins {
+        assert_eq!(handle.await.unwrap(), http::StatusCode::GATEWAY_TIMEOUT);
+    }
+    assert!(
+        started.elapsed() < spin_timeout * 3,
+        "spins took {:?}",
+        started.elapsed()
+    );
+}
+
 /// A backend whose every call never completes: the guest waits in a host call, where
 /// epoch interruption cannot reach it, so only the outer timeout ends the request.
 struct StalledKv;

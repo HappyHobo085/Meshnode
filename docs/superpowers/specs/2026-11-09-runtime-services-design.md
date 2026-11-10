@@ -85,7 +85,7 @@ The component targets world `meshnode:service/service`: it exports `wasi:http/in
 0. A request without a `Host` header gets `Host: <service>` before it reaches the guest *(amended during implementation)*.
 1. If the request body is larger than `max_body_bytes`: `413`, without instantiating.
 2. Acquire a slot from the in-flight semaphore (`max_in_flight` per node); waiting counts against the timeout.
-3. Create a fresh `Store` with a custom `ResourceLimiter`: `memory_mb` caps the **total** of all linear memories in the store (up to 16 memories; also 32 instances, 16 tables, 100 000 table elements), and the epoch deadline is the time remaining after the slot wait, in 10 ms ticks, so the CPU deadline and the wall timeout end together *(amended during implementation)*; instantiate from the cached `ProxyPre`; call the incoming handler.
+3. Create a fresh `Store` with a custom `ResourceLimiter`: `memory_mb` caps the **total** of all linear memories in the store (up to 16 memories; also 32 instances, 16 tables, 100 000 table elements), and the epoch deadline is one 10 ms tick with an epoch callback: on every tick the guest yields to the executor (`UpdateDeadline::Yield`), so a spinning guest never holds a worker thread, and once the request deadline (the slot wait included) has passed by wall clock the callback interrupts it (`Trap::Interrupt`, `504`), so the CPU deadline and the wall timeout end together *(amended during implementation; yield-per-tick amended in final review)*; instantiate from the cached `ProxyPre`; call the incoming handler.
 4. The whole call (including time awaiting host calls: KV, outbound HTTP) runs inside `tokio::time::timeout(request_timeout_ms)`.
 5. Collect the response body; if it exceeds `max_body_bytes`: `500`.
 

@@ -8,16 +8,9 @@ use wasmtime::{Config, Engine, Strategy};
 
 use crate::RuntimeError;
 
-/// How often the engine's epoch advances; request deadlines are counted in these ticks.
+/// How often the engine's epoch advances: a running guest yields and checks its request
+/// deadline once per tick.
 pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
-
-/// The epoch deadline, in ticks from now, for a request with `left` to run: at least one
-/// tick.
-pub(crate) fn deadline_ticks(left: Duration) -> u64 {
-    u64::try_from(left.as_nanos() / EPOCH_TICK.as_nanos())
-        .unwrap_or(u64::MAX)
-        .max(1)
-}
 
 /// One engine per node: Cranelift, epoch interruption for deadlines. Async host calls and
 /// async instantiation come with wasmtime's `async` feature (`Config::async_support` is a

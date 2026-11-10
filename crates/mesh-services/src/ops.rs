@@ -1,6 +1,7 @@
 //! Deploy, undeploy, purge and the `set_*` operations (spec §4.2, §7).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use mesh_core::membership::MESH_NS;
@@ -9,6 +10,7 @@ use mesh_proto::{Limits, Placement, ServiceKind, ServiceManifest, encode_raw, va
 use mesh_runtime::{CodeCache, Runtime, RuntimeConfig, RuntimeError};
 use tokio::sync::Mutex;
 
+use crate::deployer::{DeployerTask, DeployerTimings, Shared};
 use crate::error::ServicesError;
 use crate::manifest::{current_generation, data_ns, gen_key, manifest_key, read_manifest};
 
@@ -47,29 +49,76 @@ impl Default for DeployOpts {
     }
 }
 
+/// A node's services: deploy operations, the deployer, dispatch and status.
 pub struct Services {
-    node: NodeHandle,
-    runtime: Runtime,
+    pub(crate) shared: Arc<Shared>,
+    deployer: DeployerTask,
     /// Serializes this node's manifest read-modify-write cycles.
     write: Mutex<()>,
 }
 
 impl Services {
+    /// Starts the runtime and the deployer, which stops with the node (or with
+    /// [`Services::shutdown`]).
     pub async fn start(node: &Node, cfg: ServicesConfig) -> Result<Services, ServicesError> {
+        Self::start_inner(node, cfg, DeployerTimings::default())
+    }
+
+    /// [`Services::start`] with other deployer intervals.
+    #[cfg(feature = "test-hooks")]
+    pub async fn start_with_timings(
+        node: &Node,
+        cfg: ServicesConfig,
+        timings: DeployerTimings,
+    ) -> Result<Services, ServicesError> {
+        Self::start_inner(node, cfg, timings)
+    }
+
+    fn start_inner(
+        node: &Node,
+        cfg: ServicesConfig,
+        timings: DeployerTimings,
+    ) -> Result<Services, ServicesError> {
         let runtime = Runtime::new(RuntimeConfig {
             cache: cfg.cache,
             max_in_flight: cfg.max_in_flight,
         })
         .map_err(ServicesError::Runtime)?;
+        let shared = Arc::new(Shared::new(node.handle(), runtime));
+        let deployer = DeployerTask::spawn(shared.clone(), timings);
         Ok(Services {
-            node: node.handle(),
-            runtime,
+            shared,
+            deployer,
             write: Mutex::new(()),
         })
     }
 
-    /// Stops this node's service machinery (nothing to stop until the deployer exists).
-    pub async fn shutdown(self) {}
+    /// Stops the deployer and its fetches, then drops this node's handle, so the node's
+    /// store file is released once the node shuts down too.
+    pub async fn shutdown(self) {
+        let Services {
+            shared, deployer, ..
+        } = self;
+        deployer.stop().await;
+        drop(shared);
+    }
+
+    /// While `on`, the deployer leaves the active table as it is (it scans again once
+    /// resumed). Fetches already running still complete.
+    #[cfg(feature = "test-hooks")]
+    pub fn pause_deployer(&self, on: bool) {
+        self.shared.paused.send_replace(on);
+    }
+
+    /// The code cache's `(hits, misses)` since start.
+    #[cfg(feature = "test-hooks")]
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.shared.runtime.cache_stats()
+    }
+
+    fn node(&self) -> &NodeHandle {
+        &self.shared.node
+    }
 
     pub async fn deploy_wasm(
         &self,
@@ -81,13 +130,17 @@ impl Services {
         validate(&draft(name, ServiceKind::Wasm { module: [0; 32] }, &opts))?;
         // An invalid component fails here, before anything is stored.
         let hash = *blake3::hash(&wasm).as_bytes();
-        self.runtime.load(hash, &wasm).await.map_err(|e| match e {
-            RuntimeError::Invalid(m) | RuntimeError::Compile(m) => {
-                ServicesError::InvalidComponent(m)
-            }
-            e => ServicesError::Runtime(e),
-        })?;
-        let stored = self.node.blobs().add_bytes(wasm).await?;
+        self.shared
+            .runtime
+            .load(hash, &wasm)
+            .await
+            .map_err(|e| match e {
+                RuntimeError::Invalid(m) | RuntimeError::Compile(m) => {
+                    ServicesError::InvalidComponent(m)
+                }
+                e => ServicesError::Runtime(e),
+            })?;
+        let stored = self.node().blobs().add_bytes(wasm).await?;
         let kind = ServiceKind::Wasm {
             module: *stored.as_bytes(),
         };
@@ -107,7 +160,7 @@ impl Services {
                 "static site root is not a directory",
             )));
         }
-        let root = self.node.blobs().add_path(dir).await?;
+        let root = self.node().blobs().add_path(dir).await?;
         let kind = ServiceKind::Static {
             root: *root.as_bytes(),
         };
@@ -119,8 +172,8 @@ impl Services {
     pub async fn undeploy(&self, name: &str) -> Result<(), ServicesError> {
         check_name(name)?;
         let _w = self.write.lock().await;
-        if read_manifest(self.node.store(), name).await?.is_some() {
-            self.node
+        if read_manifest(self.node().store(), name).await?.is_some() {
+            self.node()
                 .store()
                 .delete(MESH_NS, &manifest_key(name))
                 .await?;
@@ -132,7 +185,7 @@ impl Services {
     /// Allowed whether or not the service is deployed.
     pub async fn purge(&self, name: &str) -> Result<(), ServicesError> {
         check_name(name)?;
-        let store = self.node.store();
+        let store = self.node().store();
         let old = current_generation(store, name).await?;
         let new = old.saturating_add(1);
         store
@@ -174,7 +227,7 @@ impl Services {
     ) -> Result<ServiceManifest, ServicesError> {
         check_name(name)?;
         let _w = self.write.lock().await;
-        let mut m = read_manifest(self.node.store(), name)
+        let mut m = read_manifest(self.node().store(), name)
             .await?
             .ok_or(ServicesError::NotFound)?;
         f(&mut m);
@@ -190,7 +243,7 @@ impl Services {
         opts: DeployOpts,
     ) -> Result<ServiceManifest, ServicesError> {
         let _w = self.write.lock().await;
-        let version = read_manifest(self.node.store(), name)
+        let version = read_manifest(self.node().store(), name)
             .await?
             .map_or(1, |m| m.version + 1);
         let mut m = draft(name, kind, &opts);
@@ -201,7 +254,7 @@ impl Services {
     /// Validates, then writes `m`.
     async fn put(&self, m: ServiceManifest) -> Result<ServiceManifest, ServicesError> {
         validate(&m)?;
-        self.node
+        self.node()
             .store()
             .set(MESH_NS, &manifest_key(&m.name), encode_raw(&m))
             .await?;

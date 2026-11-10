@@ -13,11 +13,17 @@ async-trait.workspace = true
 mesh-store = { path = "../mesh-store" }
 blake3.workspace = true
 bytes.workspace = true
+http.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[features]
+# Test-only helpers: injectable deployer timings, pausing the deployer, code cache stats.
+test-hooks = ["mesh-core/test-hooks", "mesh-runtime/test-hooks"]
+
 [dev-dependencies]
+mesh-services = { path = ".", features = ["test-hooks"] }
 mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
 mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
 mesh-hlc = { path = "../mesh-hlc" }

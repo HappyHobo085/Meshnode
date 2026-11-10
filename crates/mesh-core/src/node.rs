@@ -180,6 +180,12 @@ impl NodeHandle {
         self.inner.status()
     }
 
+    /// The node's events (see [`Node::subscribe`]); `MembersChanged` follows every change
+    /// to the membership snapshot that [`NodeHandle::members`] reads.
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
+        self.inner.events.subscribe()
+    }
+
     /// Resolves once the node is cancelled: shut down, or its owning `Node` dropped.
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
         self.inner.cancel.clone().cancelled_owned()

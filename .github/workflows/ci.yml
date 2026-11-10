@@ -49,3 +49,12 @@ jobs:
       - run: cargo install cargo-ndk --locked
       - run: cargo ndk -t arm64-v8a build -p mesh-store
       - run: cargo ndk -t arm64-v8a build -p mesh-services
+      - run: cargo ndk -t arm64-v8a build -p mesh-gateway -p mesh-admin
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p meshd

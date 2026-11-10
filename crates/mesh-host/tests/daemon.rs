@@ -789,7 +789,9 @@ async fn probe_reports_samples() {
     let prefix = id[..8].to_uppercase();
     let lines: Vec<Vec<String>> = timeout(
         T,
-        c.probe(prefix, 3, 100).map(|r| r.expect("probe")).collect(),
+        c.probe(prefix, 3, 100, 30_000)
+            .map(|r| r.expect("probe"))
+            .collect(),
     )
     .await
     .unwrap();
@@ -797,6 +799,7 @@ async fn probe_reports_samples() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     for (i, l) in lines.iter().enumerate() {
         assert!(l.starts_with(&format!("seq={} ms=", i + 1)), "{l}");
+        assert!(l.contains(" connect="), "{l}");
     }
     drop((a, b));
 }
@@ -810,12 +813,68 @@ async fn probe_unknown_node_errors() {
         ("ab", 0, ErrorCode::InvalidArgument),
     ] {
         let mut c = a.client().await;
-        let got: Vec<_> = timeout(T, c.probe(node.into(), count, 10).collect())
+        let got: Vec<_> = timeout(T, c.probe(node.into(), count, 10, 30_000).collect())
             .await
             .unwrap();
         match got.as_slice() {
             [Err(mesh_admin::AdminError::Daemon { code, .. })] => assert_eq!(*code, want, "{node}"),
             other => panic!("{node}: {other:?}"),
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_timeout_is_validated() {
+    let (a, _b) = pair().await;
+    for ms in [999, 120_001] {
+        let mut c = a.client().await;
+        let got: Vec<_> = timeout(T, c.probe("ab".into(), 1, 10, ms).collect())
+            .await
+            .unwrap();
+        match got.as_slice() {
+            [Err(mesh_admin::AdminError::Daemon { code, .. })] => {
+                assert_eq!(*code, ErrorCode::InvalidArgument, "{ms}")
+            }
+            other => panic!("{ms}: {other:?}"),
+        }
+    }
+}
+
+/// A client that leaves ends the probe: the daemon stops promptly and the probe does not
+/// keep it busy.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_stops_when_the_client_leaves() {
+    let (a, b) = pair().await;
+    let id = peer_hex(&a).await;
+    let mut c = a.client().await;
+    {
+        let mut s = Box::pin(c.probe(id[..8].to_string(), 1000, 1000, 30_000));
+        let first = timeout(T, s.next()).await.unwrap().unwrap().unwrap();
+        assert!(first[0].starts_with("seq=1 "), "{first:?}");
+    }
+    drop(c);
+    // The probe is gone: a shutdown is not held up by it.
+    timeout(Duration::from_secs(20), a.stop())
+        .await
+        .expect("shutdown after a probe");
+    drop(b);
+}
+
+/// `Probe` streams over the in-process transport like `LogsTail`.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_streams_in_process() {
+    let (a, _b) = pair().await;
+    let id = peer_hex(&a).await;
+    let admin = a.daemon.in_process_admin();
+    let req = AdminRequest::Probe {
+        node: id[..8].to_string(),
+        count: 2,
+        interval_ms: 50,
+        timeout_ms: 30_000,
+    };
+    let lines: Vec<_> = timeout(T, admin.logs_tail(req).collect()).await.unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for l in lines {
+        assert!(l.unwrap().contains(" ms="));
     }
 }

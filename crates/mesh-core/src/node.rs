@@ -215,6 +215,17 @@ impl NodeHandle {
         peer: NodeId,
         alpn: &[u8],
     ) -> Result<iroh::endpoint::Connection, NodeError> {
+        self.connect_within(peer, alpn, crate::peers::DIAL_TIMEOUT)
+            .await
+    }
+
+    /// [`NodeHandle::connect`] with its own dial timeout instead of the default 30 s.
+    pub async fn connect_within(
+        &self,
+        peer: NodeId,
+        alpn: &[u8],
+        limit: Duration,
+    ) -> Result<iroh::endpoint::Connection, NodeError> {
         if peer == self.inner.me {
             return Err(NodeError::ConnectToSelf);
         }
@@ -222,7 +233,7 @@ impl NodeHandle {
         if !snap.is_effective(&peer) {
             return Err(NodeError::NotEffective);
         }
-        let conn = self.inner.peers.connect(peer, alpn).await?;
+        let conn = self.inner.peers.connect_within(peer, alpn, limit).await?;
         // Closed with `REMOVED` if the peer stops being effective.
         self.inner.extra_conns.track(conn.clone());
         Ok(conn)

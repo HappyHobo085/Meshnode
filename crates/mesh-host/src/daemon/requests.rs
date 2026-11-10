@@ -10,7 +10,7 @@ use mesh_admin::{
     AdminBackend, AdminRequest, AdminResponse, DaemonState, ErrorCode, LocalStateView,
     MemberInfoView, RequestIo, ServiceInfoView, ServiceKindView, StatusInfo, UploadError,
 };
-use mesh_core::{MemberStatus, Node, NodeError};
+use mesh_core::{MemberStatus, Node, NodeError, NodeHandle};
 use mesh_proto::{InviteTicket, NodeId, RefuseReason, ServiceKind, ServiceManifest};
 use mesh_services::{LocalStatus, ServiceStatus, Services, ServicesError};
 use tokio::time::Instant;
@@ -21,9 +21,6 @@ use super::{
 };
 use crate::config::{ConfigError, HostConfig};
 use crate::paths::{logs_dir, tmp_dir};
-
-/// How long one probe sample may take.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 impl AdminBackend for Daemon {
@@ -65,6 +62,27 @@ impl AdminBackend for Daemon {
                 }
             }
             R::ConfigSet { key, value } => self.config_set(&key, &value).await,
+            R::Probe {
+                node,
+                count,
+                interval_ms,
+                timeout_ms,
+            } => {
+                // Only the node handle is kept: the run lock is not held for the probe.
+                let (handle, peer) = {
+                    let run = match inner.running_or(inner.run.read().await) {
+                        Ok(r) => r,
+                        Err(e) => return e.into(),
+                    };
+                    match resolve_member(&run.node, &node) {
+                        Ok(peer) => (run.node.handle(), peer),
+                        Err(e) => return e.into(),
+                    }
+                };
+                let limit = Duration::from_millis(timeout_ms.into());
+                let every = Duration::from_millis(interval_ms.into());
+                probe(&handle, peer, count, every, limit, io).await
+            }
             R::LogsTail { lines, follow } => {
                 crate::logging::tail(&logs_dir(&inner.data_dir), lines, follow, io).await
             }
@@ -298,14 +316,6 @@ impl Daemon {
                     .map_err(node_error)?;
                 AdminResponse::Ticket { text: t.to_text() }
             }
-            R::Probe {
-                node: prefix,
-                count,
-                interval_ms,
-            } => {
-                let peer = resolve_member(node, &prefix)?;
-                probe(node, peer, count, interval_ms, io).await
-            }
             R::Remove { id } => {
                 is_member(node, id)?;
                 node.remove(id).await.map_err(node_error)?;
@@ -372,6 +382,7 @@ impl Daemon {
             | R::ResetIdentity { .. }
             | R::ConfigGet { .. }
             | R::ConfigSet { .. }
+            | R::Probe { .. }
             | R::LogsTail { .. } => unreachable!("answered without the node"),
         })
     }
@@ -510,26 +521,31 @@ fn resolve_member(node: &Node, prefix: &str) -> Result<NodeId, Fail> {
 
 /// Answers `Probe`: `count` pings to `peer`, one line each, until the client leaves.
 async fn probe(
-    node: &Node,
+    node: &NodeHandle,
     peer: NodeId,
     count: u32,
-    interval_ms: u32,
+    every: Duration,
+    limit: Duration,
     io: &mut RequestIo<'_>,
 ) -> AdminResponse {
-    let handle = node.handle();
     for seq in 1..=count {
         if seq > 1 {
             tokio::select! {
                 _ = io.client_gone() => return AdminResponse::Ok,
-                _ = tokio::time::sleep(Duration::from_millis(interval_ms.into())) => {}
+                _ = tokio::time::sleep(every) => {}
             }
         }
         let sample = tokio::select! {
             _ = io.client_gone() => return AdminResponse::Ok,
-            r = mesh_gateway::ping(&handle, peer, PROBE_TIMEOUT) => r,
+            r = mesh_gateway::ping(node, peer, limit) => r,
         };
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let line = match sample {
-            Ok(rtt) => format!("seq={seq} ms={:.1}", rtt.as_secs_f64() * 1000.0),
+            Ok(t) => format!(
+                "seq={seq} ms={:.1} connect={:.1}",
+                ms(t.total),
+                ms(t.connect)
+            ),
             Err(e) => format!("seq={seq} error={e}"),
         };
         if io.send_lines(vec![line]).await.is_err() {

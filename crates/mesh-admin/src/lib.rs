@@ -20,9 +20,10 @@ pub use client::AdminClient;
 pub use in_process::InProcessAdmin;
 pub use proto::{
     AdminRequest, AdminResponse, DaemonState, DeployOpts, ErrorCode, FileData, FileMeta, Hello,
-    LocalStateView, MAX_FRAME, MAX_LOG_LINES, MAX_PROBE_COUNT, MAX_UPLOAD_FILE, MAX_UPLOAD_FILES,
-    MAX_UPLOAD_TOTAL, MemberInfoView, PROTOCOL_VERSION, ServiceInfoView, ServiceKindView,
-    StatusInfo, valid_upload_path, validate_upload,
+    LocalStateView, MAX_FRAME, MAX_LOG_LINES, MAX_PROBE_COUNT, MAX_PROBE_TIMEOUT_MS,
+    MAX_UPLOAD_FILE, MAX_UPLOAD_FILES, MAX_UPLOAD_TOTAL, MIN_PROBE_TIMEOUT_MS, MemberInfoView,
+    PROTOCOL_VERSION, ServiceInfoView, ServiceKindView, StatusInfo, valid_upload_path,
+    validate_upload,
 };
 pub use server::{
     AdminBackend, AdminServer, MAX_CONNECTIONS, RequestIo, ServerTimeouts, UploadError,

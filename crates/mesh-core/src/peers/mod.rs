@@ -44,7 +44,7 @@ use crate::sync::{PeerMetrics, SessionCmd};
 use crate::transport::{Provisional, SHUTDOWN, addr_from_bytes, endpoint_id_of, node_id_of};
 
 /// Upper bound on one dial attempt.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Two connections between a pair that start less than this apart are a simultaneous
 /// dial, settled by the lower-`NodeId` rule. A connection arriving later means the peer
 /// lost the current one (a restart or a crash), so the newer one wins (spec §6.1).
@@ -408,9 +408,14 @@ impl PeerManager {
         }
     }
 
-    /// Dials `id` on `alpn` with the address knowledge the slots use, within the dial
-    /// timeout. The connection is the caller's; it does not touch the `sync/1` slot.
-    pub(crate) async fn connect(&self, id: NodeId, alpn: &[u8]) -> Result<Connection, NodeError> {
+    /// Dials `id` on `alpn` with the address knowledge the slots use, within `limit`.
+    /// The connection is the caller's; it does not touch the `sync/1` slot.
+    pub(crate) async fn connect_within(
+        &self,
+        id: NodeId,
+        alpn: &[u8],
+        limit: Duration,
+    ) -> Result<Connection, NodeError> {
         let (addr, hint) = {
             let st = self.lock();
             if st.stopped || self.0.cancel.is_cancelled() {
@@ -429,7 +434,7 @@ impl PeerManager {
         };
         let target = dial_target(id, [addr, hint], self.0.env.discovery)
             .ok_or_else(|| NodeError::Iroh("no known address for peer".into()))?;
-        match timeout(DIAL_TIMEOUT, self.0.env.endpoint.connect(target, alpn)).await {
+        match timeout(limit, self.0.env.endpoint.connect(target, alpn)).await {
             Ok(Ok(c)) => Ok(c),
             Ok(Err(e)) => Err(NodeError::Iroh(e.to_string())),
             Err(_) => Err(NodeError::Iroh("dial timed out".into())),

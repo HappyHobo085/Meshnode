@@ -43,7 +43,7 @@ impl AdminClient {
     }
 
     /// Sends one request and returns the daemon's response (which may be
-    /// [`AdminResponse::Error`]). `DeployStatic` and `LogsTail` have their own methods.
+    /// [`AdminResponse::Error`]). `DeployStatic`, `LogsTail` and `Probe` have their own methods.
     pub async fn request(&mut self, req: AdminRequest) -> Result<AdminResponse, AdminError> {
         if crate::server::needs_own_method(&req) {
             return Err(AdminError::Protocol(
@@ -116,11 +116,13 @@ impl AdminClient {
         node: String,
         count: u32,
         interval_ms: u32,
+        timeout_ms: u32,
     ) -> impl Stream<Item = Result<Vec<String>, AdminError>> + '_ {
         self.stream_lines(AdminRequest::Probe {
             node,
             count,
             interval_ms,
+            timeout_ms,
         })
     }
 

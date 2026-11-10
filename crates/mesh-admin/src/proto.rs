@@ -18,6 +18,9 @@ pub const MAX_UPLOAD_TOTAL: u64 = 1024 * 1024 * 1024;
 pub const MAX_FRAME: usize = MAX_UPLOAD_FILE as usize + 1024;
 /// Most samples one `Probe` may ask for.
 pub const MAX_PROBE_COUNT: u32 = 1000;
+/// Shortest and longest sample timeout a `Probe` may ask for, in milliseconds.
+pub const MIN_PROBE_TIMEOUT_MS: u32 = 1_000;
+pub const MAX_PROBE_TIMEOUT_MS: u32 = 120_000;
 /// Most lines `LogsTail` may ask for.
 pub const MAX_LOG_LINES: u32 = 10_000;
 
@@ -141,12 +144,14 @@ pub enum AdminRequest {
         follow: bool,
     },
     /// Sends `count` `_ping` requests to the member whose id starts with `node`, one every
-    /// `interval_ms`. Answered by one `LogLines` frame per sample (`seq=<n> ms=<rtt>` or
-    /// `seq=<n> error=<reason>`), then `Ok` (or `Error`). Only while running.
+    /// `interval_ms`. Answered by one `LogLines` frame per sample (`seq=<n> ms=<total>
+    /// connect=<connect_ms>` or `seq=<n> error=<reason>`), then `Ok` (or `Error`). Only while running.
     Probe {
         node: String,
         count: u32,
         interval_ms: u32,
+        /// How long one sample may take, connecting included.
+        timeout_ms: u32,
     },
 }
 

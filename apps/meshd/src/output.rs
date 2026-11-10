@@ -294,7 +294,7 @@ mod tests {
             "p50=4.0 p95=4.0 max=4.0 failed=2/3"
         );
         assert_eq!(probe_summary(&[], 2), "p50=- p95=- max=- failed=2/2");
-        assert_eq!(probe_sample("seq=1 ms=12.5"), Some(12.5));
+        assert_eq!(probe_sample("seq=1 ms=12.5 connect=9.1"), Some(12.5));
         assert_eq!(probe_sample("seq=2 error=timed out after 30000 ms"), None);
     }
 

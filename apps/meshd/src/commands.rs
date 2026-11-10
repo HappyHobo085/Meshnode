@@ -109,7 +109,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             node,
             count,
             interval,
-        } => probe(&data, node, count, interval).await,
+            timeout,
+        } => probe(&data, node, count, interval, timeout).await,
         Command::Deploy(d) => deploy(&data, d).await,
         Command::SetPlacement { name, placement } => {
             let placement = placement_of(&data, &placement).await?;
@@ -571,9 +572,15 @@ async fn logs(data: &Path, lines: u32, follow: bool) -> Result<(), CliError> {
 
 // --- probe ---------------------------------------------------------------------------------
 
-async fn probe(data: &Path, node: String, count: u32, interval_ms: u32) -> Result<(), CliError> {
+async fn probe(
+    data: &Path,
+    node: String,
+    count: u32,
+    interval_ms: u32,
+    timeout_ms: u32,
+) -> Result<(), CliError> {
     let mut client = connect(data).await?;
-    let stream = client.probe(node, count, interval_ms);
+    let stream = client.probe(node, count, interval_ms, timeout_ms);
     tokio::pin!(stream);
     let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
     let (mut ms, mut seen) = (Vec::new(), 0usize);

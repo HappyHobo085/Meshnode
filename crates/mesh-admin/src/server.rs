@@ -22,7 +22,8 @@ use tracing::{debug, warn};
 use crate::AdminError;
 use crate::proto::{
     AdminRequest, AdminResponse, DaemonState, ErrorCode, FileData, FileMeta, Hello, MAX_FRAME,
-    MAX_LOG_LINES, MAX_PROBE_COUNT, PROTOCOL_VERSION, validate_upload,
+    MAX_LOG_LINES, MAX_PROBE_COUNT, MAX_PROBE_TIMEOUT_MS, MIN_PROBE_TIMEOUT_MS, PROTOCOL_VERSION,
+    validate_upload,
 };
 use crate::transport::{self, Access, AdminIo, AdminStream, Endpoint, Listener};
 
@@ -544,6 +545,13 @@ fn check(state: DaemonState, req: &AdminRequest) -> Result<(), (ErrorCode, Strin
         }
         R::Probe { count, .. } if !(1..=MAX_PROBE_COUNT).contains(count) => {
             return invalid(format!("count must be between 1 and {MAX_PROBE_COUNT}"));
+        }
+        R::Probe { timeout_ms, .. }
+            if !(MIN_PROBE_TIMEOUT_MS..=MAX_PROBE_TIMEOUT_MS).contains(timeout_ms) =>
+        {
+            return invalid(format!(
+                "the timeout must be between {MIN_PROBE_TIMEOUT_MS} and {MAX_PROBE_TIMEOUT_MS} ms"
+            ));
         }
         R::DeployStatic { files, .. } => validate_upload(files).or_else(invalid)?,
         _ => {}

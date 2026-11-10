@@ -367,3 +367,55 @@ fn local_join_success_and_failure_leave_a_reusable_dir() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     drop(host);
 }
+
+/// Probing a member that never answers fails every sample: the summary says so and the
+/// exit code is 2.
+#[test]
+fn probe_all_failed_exits_2() {
+    let host_dir = offline_dir();
+    let _host = start_daemon(host_dir.path());
+    let o = meshd(host_dir.path(), &["invite", "--ttl", "10m"]);
+    let ticket = stdout(&o).lines().next().unwrap().trim().to_string();
+    // The joiner never runs, so it cannot answer.
+    let joiner = offline_dir();
+    let o = meshd(joiner.path(), &["join", &ticket, "--name", "laptop"]);
+    assert_eq!(o.status.code(), Some(0), "{} {}", stdout(&o), stderr(&o));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let peer = loop {
+        let o = meshd(host_dir.path(), &["members", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        let id = v
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["is_self"] == false))
+            .map(|m| match &m["id"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(b) => b
+                    .iter()
+                    .map(|x| format!("{:02x}", x.as_u64().unwrap()))
+                    .collect(),
+                other => panic!("id: {other}"),
+            });
+        if let Some(id) = id {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "joiner never listed");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let o = meshd(
+        host_dir.path(),
+        &[
+            "probe",
+            &peer[..8],
+            "--count",
+            "2",
+            "--interval",
+            "100ms",
+            "--timeout",
+            "1s",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{} {}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert_eq!(out.matches("error=").count(), 2, "{out}");
+    assert!(out.contains("failed=2/2"), "{out}");
+}

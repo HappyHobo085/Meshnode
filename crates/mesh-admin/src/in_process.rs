@@ -50,8 +50,8 @@ impl InProcessAdmin {
         self.backend.state()
     }
 
-    /// Answers one request (which may be `AdminResponse::Error`). `DeployStatic` and
-    /// `LogsTail` have their own methods.
+    /// Answers one request (which may be `AdminResponse::Error`). `DeployStatic`,
+    /// `LogsTail` and `Probe` have their own methods.
     pub async fn request(&self, req: AdminRequest) -> AdminResponse {
         if needs_own_method(&req) {
             return AdminResponse::error(
@@ -79,8 +79,7 @@ impl InProcessAdmin {
         self.run(req, data).await
     }
 
-    /// Streams the lines of a line-streaming request (`LogsTail`, and later requests that
-    /// stream the same way) until the ending response: an `Ok` end yields nothing more,
+    /// Streams the lines of a line-streaming request (`LogsTail` and `Probe`) until the ending response: an `Ok` end yields nothing more,
     /// an error end yields `Err(resp)`. The backend starts on the first poll; dropping the
     /// stream ends the request: the backend sees its line sends fail (or `client_gone` resolve) and
     /// finishes by itself, as when a socket client leaves.

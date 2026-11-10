@@ -15,7 +15,7 @@ use mesh_proto::{
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -32,7 +32,7 @@ use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
     encode_info, encode_removal, info_key, member_bytes,
 };
-use crate::peers::{PeerEnv, PeerManager, SignOut, SyncHandler};
+use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
 use crate::transport::{
     ALPN_JOIN, ALPN_SYNC, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
@@ -73,6 +73,17 @@ pub struct MemberStatus {
     pub last_seen_ms: Option<u64>,
     /// Ops this node holds that the member may lack.
     pub lag: u64,
+}
+
+/// What [`Node::wake`] saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeOutcome {
+    /// Peers connected when `wake` was called.
+    pub peers: usize,
+    /// Of those, the ones that completed a round before `wake` returned.
+    pub rounds_completed: usize,
+    /// `limit` passed with some of them neither done nor disconnected.
+    pub timed_out: bool,
 }
 
 /// A running mesh node. Call [`Node::shutdown`] to stop it; dropping it only cancels its
@@ -454,6 +465,10 @@ pub(crate) async fn start(
             signout: signout.clone(),
             serve_paused: serve_paused.clone(),
             stale: stale_tx,
+            catch_up: Arc::new(CatchUp::new(
+                cfg.wall.clone(),
+                cfg.catch_up_on_incoming_after,
+            )),
         },
         cancel.child_token(),
     );
@@ -760,6 +775,65 @@ impl Node {
             rt.spawn(async move { ep.network_change().await });
         }
         self.inner.peers.reset_backoff_all();
+    }
+
+    /// Turns the incoming-traffic catch-up on (`Some(silence)`) or off at runtime (see
+    /// [`NodeConfig::catch_up_on_incoming_after`]).
+    pub fn set_catch_up_on_incoming(&self, after: Option<Duration>) {
+        self.inner.peers.set_catch_up(after);
+    }
+
+    /// Catches up after a sleep (Android): [`Node::network_change`], then
+    /// [`Node::sync_now`], then waits until every peer connected at the call has completed
+    /// a round or disconnected, for at most `limit`.
+    pub async fn wake(&self, limit: Duration) -> WakeOutcome {
+        let deadline = Instant::now() + limit;
+        // Subscribed before anything starts, so no completion is missed; the per-peer
+        // round counters decide, the events only wake this loop (a lag loses nothing).
+        let mut rx = self.inner.events.subscribe();
+        let peers = &self.inner.peers;
+        let mut pending: Vec<_> = peers
+            .connected_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let m = peers.metrics(&id)?;
+                let at = m.rounds_completed.load(Ordering::SeqCst);
+                Some((id, m, at))
+            })
+            .collect();
+        let total = pending.len();
+        self.network_change();
+        self.sync_now();
+        let mut rounds = 0;
+        let mut stop = false;
+        loop {
+            let live = peers.connected_ids();
+            pending.retain(|(id, m, at)| {
+                if m.rounds_completed.load(Ordering::SeqCst) > *at {
+                    rounds += 1;
+                    false
+                } else {
+                    // A peer that disconnected (or stopped being a target) is done.
+                    live.contains(id)
+                }
+            });
+            if pending.is_empty() || stop {
+                break;
+            }
+            // Past the deadline (or on shutdown) one last look, then give up.
+            stop = tokio::select! {
+                _ = self.inner.cancel.cancelled() => true,
+                r = timeout_at(deadline, rx.recv()) => match r {
+                    Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => false,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => true,
+                },
+            };
+        }
+        WakeOutcome {
+            peers: total,
+            rounds_completed: rounds,
+            timed_out: !pending.is_empty(),
+        }
     }
 
     /// Removes member `id` (spec §4). Takes effect on each node once it receives the

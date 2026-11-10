@@ -17,12 +17,13 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
+use mesh_hlc::WallClock;
 use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -92,6 +93,70 @@ impl SignOut {
     }
 }
 
+/// The incoming-traffic catch-up (Android): peer traffic after at least `after` of
+/// silence on the wall clock starts a round with every connected peer. The wall clock,
+/// not the monotonic one, because monotonic time stops while a phone sleeps.
+pub(crate) struct CatchUp {
+    wall: Arc<dyn WallClock>,
+    /// The silence in ms; `OFF` = turned off.
+    after_ms: AtomicU64,
+    /// Wall time of the latest incoming connection or `sync/1` message.
+    last_ms: AtomicU64,
+}
+
+impl CatchUp {
+    const OFF: u64 = u64::MAX;
+
+    pub fn new(wall: Arc<dyn WallClock>, after: Option<Duration>) -> CatchUp {
+        let now = wall.now_ms();
+        let c = CatchUp {
+            wall,
+            after_ms: AtomicU64::new(Self::OFF),
+            last_ms: AtomicU64::new(now),
+        };
+        c.set(after);
+        c
+    }
+
+    pub fn set(&self, after: Option<Duration>) {
+        let ms = after.map_or(Self::OFF, |d| {
+            u64::try_from(d.as_millis())
+                .unwrap_or(Self::OFF)
+                .min(Self::OFF - 1)
+        });
+        self.after_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Records incoming traffic now; true if it ends a silence long enough for a catch-up.
+    /// Only the first event after the silence sees the old time, so a burst (or traffic
+    /// from several peers at once) yields a single catch-up.
+    fn traffic(&self) -> bool {
+        let now = self.wall.now_ms();
+        let prev = self.last_ms.swap(now, Ordering::Relaxed);
+        let after = self.after_ms.load(Ordering::Relaxed);
+        after != Self::OFF && now.saturating_sub(prev) >= after
+    }
+}
+
+/// What a session calls for every `sync/1` message it reads (see [`CatchUp`]). Holds the
+/// manager weakly: sessions live inside it.
+#[derive(Clone)]
+pub(crate) struct IncomingHook {
+    catch_up: Arc<CatchUp>,
+    peers: Weak<Shared>,
+}
+
+impl IncomingHook {
+    pub fn traffic(&self) {
+        if self.catch_up.traffic()
+            && let Some(sh) = self.peers.upgrade()
+        {
+            debug!("peer traffic after a long silence; catching up");
+            PeerManager(sh).start_round_all();
+        }
+    }
+}
+
 /// What every session of this node shares.
 pub(crate) struct PeerEnv {
     pub store: StoreHandle,
@@ -108,6 +173,7 @@ pub(crate) struct PeerEnv {
     pub serve_paused: Arc<AtomicBool>,
     /// A session found the store stale (spec §7); the re-bootstrap hook.
     pub stale: mpsc::Sender<NodeId>,
+    pub catch_up: Arc<CatchUp>,
 }
 
 #[derive(Clone)]
@@ -384,6 +450,29 @@ impl PeerManager {
         }
     }
 
+    /// Turns the incoming-traffic catch-up on (`Some(silence)`) or off.
+    pub fn set_catch_up(&self, after: Option<Duration>) {
+        self.0.env.catch_up.set(after);
+    }
+
+    /// The hook a session reports its incoming messages to.
+    fn incoming_hook(sh: &Arc<Shared>) -> IncomingHook {
+        IncomingHook {
+            catch_up: sh.env.catch_up.clone(),
+            peers: Arc::downgrade(sh),
+        }
+    }
+
+    /// The peers a session runs with now.
+    pub fn connected_ids(&self) -> Vec<NodeId> {
+        self.lock()
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.lock().live.is_some())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn reset_backoff_all(&self) {
         for slot in self.lock().slots.values() {
             slot.lock().reset_backoff = true;
@@ -442,6 +531,11 @@ impl PeerManager {
         st.track(conn.clone());
         slot.lock().incoming.push(conn);
         slot.kick.notify_one();
+        drop(st);
+        if self.0.env.catch_up.traffic() {
+            debug!("incoming connection after a long silence; catching up");
+            self.start_round_all();
+        }
     }
 
     /// Stops every task and refuses new peers for good (this node was removed).

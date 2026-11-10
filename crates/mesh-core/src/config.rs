@@ -87,6 +87,11 @@ pub struct NodeConfig {
     pub wall: Arc<dyn WallClock>,
     /// Further protocols (ALPN, handler), served behind the membership gate like `sync/1`.
     pub extra_protocols: Vec<(Vec<u8>, Arc<dyn DynProtocolHandler>)>,
+    /// Incoming peer traffic (an accepted `sync/1` connection or message) after at least
+    /// this much silence, measured on `wall`, starts a round with every connected peer: a
+    /// phone that slept catches up. `None` (the default) turns it off; see
+    /// `Node::set_catch_up_on_incoming`.
+    pub catch_up_on_incoming_after: Option<Duration>,
 }
 
 impl NodeConfig {
@@ -102,6 +107,7 @@ impl NodeConfig {
             timings: Timings::default(),
             wall: Arc::new(SystemClock),
             extra_protocols: Vec::new(),
+            catch_up_on_incoming_after: None,
         }
     }
 }

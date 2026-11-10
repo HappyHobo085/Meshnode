@@ -33,4 +33,4 @@ pub use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler};
 pub use maint::MaintJob;
 /// Store types that appear in this crate's API (store errors and change events).
 pub use mesh_store::{Change, ChangeKind, StoreError};
-pub use node::{MemberStatus, Node, NodeHandle, NodeStatus};
+pub use node::{MemberStatus, Node, NodeHandle, NodeStatus, WakeOutcome};

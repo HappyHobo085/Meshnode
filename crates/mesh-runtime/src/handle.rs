@@ -17,6 +17,7 @@ use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
 use crate::RequestCtx;
+use crate::engine::TickerHandle;
 use crate::host::{KvStatus, State};
 
 /// Node-wide state shared by every request a `Runtime` serves.
@@ -25,6 +26,8 @@ pub(crate) struct Shared {
     pub(crate) in_flight: Arc<Semaphore>,
     /// Instances created so far (a test hook reads it).
     pub(crate) instantiations: Arc<AtomicU64>,
+    /// Keeps the epoch ticking while a guest runs.
+    pub(crate) ticker: TickerHandle,
 }
 
 /// Serves `req` within `ctx.limits`: an oversized request body is refused before
@@ -131,8 +134,10 @@ async fn run(
 
     let pre = pre.clone();
     let instantiations = shared.instantiations.clone();
+    let busy = shared.ticker.busy();
     let mut guest = AbortOnDrop(tokio::spawn(async move {
         let _permit = permit;
+        let _ticking = busy;
         instantiations.fetch_add(1, Ordering::Relaxed);
         let proxy = pre.instantiate_async(&mut store).await?;
         proxy

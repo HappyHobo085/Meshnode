@@ -112,6 +112,7 @@ impl Runtime {
                 max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
             )),
             instantiations: Arc::default(),
+            ticker: ticker.handle(),
         };
         Ok(Runtime {
             engine,
@@ -156,6 +157,13 @@ impl Runtime {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn cache_stats(&self) -> (u64, u64) {
         self.cache.stats()
+    }
+
+    /// How many times the epoch ticker has advanced the engine's epoch (it only ticks
+    /// while a request is in flight).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn epoch_ticks(&self) -> u64 {
+        self.shared.ticker.ticks()
     }
 
     /// How many component instances this runtime has created.

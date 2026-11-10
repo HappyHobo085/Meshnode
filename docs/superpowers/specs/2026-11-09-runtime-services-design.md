@@ -35,7 +35,7 @@ Dependencies: `wasmtime`, `wasmtime-wasi`, `wasmtime-wasi-http` **50.0.x** (the 
 ### 3.1 API
 
 ```rust
-pub struct Runtime;   // one Engine + Linker per node; owns the epoch ticker
+pub struct Runtime;   // one Engine + Linker per node; owns the epoch ticker (parked while no request is in flight, amended in final review)
 impl Runtime {
     pub fn new(cfg: RuntimeConfig) -> Result<Runtime, RuntimeError>;
     /// Compiles or loads from the code cache; validates the component against the world.

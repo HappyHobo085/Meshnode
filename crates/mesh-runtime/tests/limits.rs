@@ -480,3 +480,31 @@ async fn queued_spin_frees_slot_within_one_timeout() {
         "slot freed after {took:?}"
     );
 }
+
+/// The epoch ticker only runs while a request is in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_ticker_parks_when_idle() {
+    let rt = runtime(4);
+    let spin = load(&rt, "spin", 1).await;
+    let idle = rt.epoch_ticks();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(rt.epoch_ticks(), idle, "ticked with no request in flight");
+
+    let (status, _) = serve_within(
+        &rt,
+        &spin,
+        get("/"),
+        ctx(timeout_ms(300)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT);
+    let busy = rt.epoch_ticks();
+    assert!(busy > idle, "no ticks while the guest ran");
+
+    // Once the aborted guest has stopped (its next yield), the ticker parks again.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = rt.epoch_ticks();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(rt.epoch_ticks(), after, "kept ticking once idle");
+}

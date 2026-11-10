@@ -548,7 +548,7 @@ async fn kv_write_refused_when_removed_gives_503() {
 
     // Freeze B's deployer so the service is still active there when B learns of its
     // removal (left alone, the deployer would unplace it: B is no longer effective).
-    b.pause_deployer(true);
+    b.pause_deployer(true).await;
     n.nodes[0].remove(n.id(1)).await.unwrap();
     wait_until("B learns of its removal", T, || {
         matches!(n.nodes[1].status(), NodeStatus::Removed { .. })
@@ -559,7 +559,7 @@ async fn kv_write_refused_when_removed_gives_503() {
     // Reads still work, so the 503 came from the write.
     assert_eq!(call(b, "counter", "/get?k=n").await, (200, "1".into()));
 
-    b.pause_deployer(false);
+    b.pause_deployer(false).await;
     wait_not_placed(b, "counter").await;
     assert_eq!(call(b, "counter", "/").await, (503, NOT_PLACED.into()));
     n.shutdown().await;

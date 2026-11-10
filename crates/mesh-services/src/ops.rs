@@ -114,10 +114,12 @@ impl Services {
     }
 
     /// While `on`, the deployer leaves the active table as it is (it scans again once
-    /// resumed). Fetches already running still complete.
+    /// resumed). Fetches already running still complete. Pausing returns once no scan is
+    /// running, so none started before the pause can still change the table.
     #[cfg(feature = "test-hooks")]
-    pub fn pause_deployer(&self, on: bool) {
+    pub async fn pause_deployer(&self, on: bool) {
         self.shared.paused.send_replace(on);
+        drop(self.shared.scanning.lock().await);
     }
 
     /// How many scans the deployer has finished.

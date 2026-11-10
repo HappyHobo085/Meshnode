@@ -92,6 +92,9 @@ pub(crate) struct Shared {
     /// While true the deployer does not scan (a test hook; always present so the loop
     /// has one shape).
     pub paused: watch::Sender<bool>,
+    /// Held by the deployer for each scan (checking `paused` under it), so a pause can wait
+    /// until no scan runs.
+    pub scanning: tokio::sync::Mutex<()>,
     /// Blob GC holds the write side while it decides and removes; deploys hold the read
     /// side from storing a blob until its manifest is written, so GC never removes a blob
     /// a deploy is about to reference (this also serializes GC passes).
@@ -115,6 +118,7 @@ impl Shared {
             active: RwLock::default(),
             known: Mutex::default(),
             paused: watch::Sender::new(false),
+            scanning: tokio::sync::Mutex::new(()),
             gc_lock: tokio::sync::RwLock::new(()),
             owned_file: Mutex::new(()),
             gc_hold: watch::Sender::new(false),
@@ -314,8 +318,12 @@ async fn run(shared: Arc<Shared>, timings: DeployerTimings, mut stop: watch::Rec
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
-        if scan && !*paused.borrow_and_update() {
-            d.scan(periodic).await;
+        if scan {
+            let shared = d.shared.clone();
+            let _scanning = shared.scanning.lock().await;
+            if !*paused.borrow_and_update() {
+                d.scan(periodic).await;
+            }
         }
     }
     d.tracks.clear();

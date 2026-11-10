@@ -40,3 +40,5 @@ async-trait = "0.1"
 toml = "1"
 tracing-appender = "0.2"
 wat = "1"
+clap = { version = "4", features = ["derive"] }
+qrcode = { version = "0.14", default-features = false }

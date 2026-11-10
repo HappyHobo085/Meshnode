@@ -10,4 +10,4 @@ pub mod paths;
 pub use config::{ConfigError, MeshdConfig};
 #[cfg(feature = "test-hooks")]
 pub use daemon::TestOptions;
-pub use daemon::{Daemon, DaemonError};
+pub use daemon::{Daemon, DaemonError, wipe_identity};

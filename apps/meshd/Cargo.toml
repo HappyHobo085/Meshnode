@@ -8,6 +8,10 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "meshd"
+path = "src/main.rs"
+
 [dependencies]
 mesh-admin = { path = "../../crates/mesh-admin" }
 mesh-core = { path = "../../crates/mesh-core" }
@@ -16,11 +20,15 @@ mesh-proto = { path = "../../crates/mesh-proto" }
 mesh-services = { path = "../../crates/mesh-services" }
 async-trait.workspace = true
 bytes.workspace = true
+clap.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex.workspace = true
+qrcode.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "signal"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -37,5 +45,4 @@ test-hooks = ["mesh-core/test-hooks", "mesh-services/test-hooks"]
 [dev-dependencies]
 meshd = { path = ".", features = ["test-hooks"] }
 mesh-runtime = { path = "../../crates/mesh-runtime", features = ["test-hooks"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tempfile.workspace = true

@@ -243,6 +243,12 @@ impl Daemon {
     }
 }
 
+/// Deletes everything in the data directory but `meshd.toml` and the logs (what
+/// `reset-identity` does; the CLI uses it when no daemon runs).
+pub fn wipe_identity(dir: &Path) -> io::Result<()> {
+    requests::wipe(dir)
+}
+
 fn dir_error(path: &Path, source: io::Error) -> DaemonError {
     DaemonError::DataDir {
         path: path.to_path_buf(),

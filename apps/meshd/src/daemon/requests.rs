@@ -184,7 +184,7 @@ impl Daemon {
             Err(e) if !released => AdminResponse::error(
                 ErrorCode::Internal,
                 format!(
-                    "reset failed: {e}; the services were still in use. Restart meshd, then                      retry reset-identity"
+                    "reset failed: {e}; the services were still in use. Restart meshd, then retry reset-identity"
                 ),
             ),
             Err(e) => AdminResponse::error(ErrorCode::Internal, format!("reset failed: {e}")),
@@ -379,7 +379,7 @@ async fn save_config(cfg: &MeshdConfig, dir: &Path) -> Result<(), String> {
 
 /// Deletes every entry of `dir` except [`KEPT_ON_RESET`]. Retries briefly: on Windows a
 /// file closed a moment ago may still be in use.
-fn wipe(dir: &Path) -> io::Result<()> {
+pub(super) fn wipe(dir: &Path) -> io::Result<()> {
     let mut attempt = 0;
     loop {
         let r = (|| {

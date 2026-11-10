@@ -10,7 +10,7 @@ mod ticket;
 
 pub use httpfwd::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
-    MAX_HEADERS, MAX_PATH, is_hop_by_hop,
+    MAX_HEADERS, MAX_PATH, PING_SERVICE, is_hop_by_hop,
 };
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};

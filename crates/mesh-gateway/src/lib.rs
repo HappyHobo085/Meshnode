@@ -11,5 +11,5 @@ mod status_page;
 pub use config::GatewayConfig;
 pub use error::GatewayError;
 pub use forward::Forwarder;
-pub use serve_httpfwd::{HttpFwdHandler, HttpFwdSlot};
+pub use serve_httpfwd::{Activity, HttpFwdHandler, HttpFwdSlot};
 pub use server::Gateway;

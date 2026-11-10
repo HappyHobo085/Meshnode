@@ -704,3 +704,24 @@ async fn second_daemon_on_same_data_dir_refused() {
     assert_eq!(d.status().await.state, DaemonState::Running);
     d.stop().await;
 }
+
+#[tokio::test]
+async fn gateway_port_in_use_fails_start_then_restarts() {
+    let d = initialised("pc").await;
+    let addr = d.gateway();
+    let dir = d.stop().await;
+    let cfg = MeshdConfig::load_or_default(dir.path()).unwrap();
+    let blocker = std::net::TcpListener::bind(addr).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
+    let err = r
+        .err()
+        .expect("start refused while the port is taken")
+        .to_string();
+    assert!(err.contains(&addr.to_string()), "{err}");
+    // The failed start released the store and the endpoint: freeing the port is enough.
+    drop(blocker);
+    let d = start_in(dir, cfg).await;
+    assert_eq!(d.status().await.state, DaemonState::Running);
+    assert_eq!(d.gateway(), addr);
+    d.stop().await;
+}

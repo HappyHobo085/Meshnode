@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::{Backend, Daemon, DaemonError, How, KEPT_ON_RESET, Running, SHUTDOWN_LIMIT, lock};
-use crate::config::ConfigError;
+use crate::config::{ConfigError, MeshdConfig};
 use crate::paths::{logs_dir, tmp_dir};
 
 #[async_trait]
@@ -36,7 +36,11 @@ impl AdminBackend for Daemon {
                 Ok(t) => self.init(name, Some(t)).await,
                 Err(e) => AdminResponse::error(ErrorCode::InvalidArgument, e.to_string()),
             },
-            R::ResetIdentity { .. } => self.reset_identity().await,
+            R::ResetIdentity { confirm: true } => self.reset_identity().await,
+            R::ResetIdentity { confirm: false } => AdminResponse::error(
+                ErrorCode::InvalidArgument,
+                "reset-identity must be confirmed",
+            ),
             R::ConfigGet { key } => {
                 let cfg = inner.cfg.lock().await;
                 match key {
@@ -167,21 +171,34 @@ impl Daemon {
         ) {
             return AdminResponse::error(ErrorCode::WrongState, "this node was not removed");
         }
-        inner.stop_node(Instant::now() + SHUTDOWN_LIMIT).await;
+        let released = inner.stop_node(Instant::now() + SHUTDOWN_LIMIT).await;
         let dir = inner.data_dir.clone();
-        match tokio::task::spawn_blocking(move || wipe(&dir)).await {
-            Ok(Ok(())) => {
+        let wiped = tokio::task::spawn_blocking(move || wipe(&dir))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+        match wiped {
+            Ok(()) => {
                 info!("identity reset");
                 AdminResponse::Ok
             }
-            Ok(Err(e)) => AdminResponse::error(ErrorCode::Internal, format!("reset failed: {e}")),
+            Err(e) if !released => AdminResponse::error(
+                ErrorCode::Internal,
+                format!(
+                    "reset failed: {e}; the services were still in use. Restart meshd, then                      retry reset-identity"
+                ),
+            ),
             Err(e) => AdminResponse::error(ErrorCode::Internal, format!("reset failed: {e}")),
         }
     }
 
     async fn config_set(&self, key: &str, value: &str) -> AdminResponse {
         let inner = &*self.inner;
-        // Lock order everywhere: `run` before `cfg`.
+        // Lock order everywhere: `transition`, then `run`, then `cfg`. A name or tags change
+        // waits for an Init or Join in progress, so the node started there takes it too.
+        let _t = match key {
+            "name" | "tags" => Some(inner.transition.lock().await),
+            _ => None,
+        };
         let run = inner.run.read().await;
         let mut cfg = inner.cfg.lock().await;
         let mut new = cfg.clone();
@@ -196,8 +213,8 @@ impl Daemon {
                 return node_error(e).into();
             }
         }
-        if let Err(e) = new.save(&inner.data_dir) {
-            return AdminResponse::error(ErrorCode::Internal, e.to_string());
+        if let Err(e) = save_config(&new, &inner.data_dir).await {
+            return AdminResponse::error(ErrorCode::Internal, e);
         }
         *cfg = new;
         AdminResponse::ConfigSet { restart_required }
@@ -313,8 +330,9 @@ impl Daemon {
         if let Some(t) = tags {
             new.tags = t;
         }
-        new.save(&self.inner.data_dir)
-            .map_err(|e| Fail(ErrorCode::Internal, e.to_string()))?;
+        save_config(&new, &self.inner.data_dir)
+            .await
+            .map_err(|e| Fail(ErrorCode::Internal, e))?;
         *cfg = new;
         Ok(())
     }
@@ -347,6 +365,15 @@ impl Daemon {
             warn!("cannot remove {}: {e}", dir.display());
         }
         result
+    }
+}
+
+/// Writes `meshd.toml` on a blocking thread.
+async fn save_config(cfg: &MeshdConfig, dir: &Path) -> Result<(), String> {
+    let (cfg, dir) = (cfg.clone(), dir.to_path_buf());
+    match tokio::task::spawn_blocking(move || cfg.save(&dir)).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

@@ -26,6 +26,10 @@ const FOLLOW_POLL: Duration = Duration::from_millis(250);
 const LINES_PER_FRAME: usize = 1000;
 /// Bytes read per look at a log file.
 const READ_CHUNK: u64 = 1024 * 1024;
+/// Chunk size when reading a log file backwards.
+const TAIL_CHUNK: u64 = 64 * 1024;
+/// Most bytes read backwards for the initial tail.
+const MAX_TAIL_READ: u64 = 64 * 1024 * 1024;
 
 /// Keeps the file writer flushing; drop it last, when the process ends.
 pub struct LoggingGuard {
@@ -160,15 +164,18 @@ fn newest_log(dir: &Path) -> io::Result<Option<PathBuf>> {
 fn last_lines(path: &Path, n: usize) -> io::Result<(Vec<String>, u64)> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
-    // Read backwards until the buffer holds more than `n` line ends, or the whole file.
+    // Read backwards until the buffer holds more than `n` line ends, the whole file, or
+    // [`MAX_TAIL_READ`] bytes.
     let mut buf: Vec<u8> = Vec::new();
     let mut start = len;
-    while start > 0 && buf.iter().filter(|b| **b == b'\n').count() <= n {
-        let step = start.min(64 * 1024);
+    let mut newlines = 0;
+    while start > 0 && newlines <= n && len - start < MAX_TAIL_READ {
+        let step = start.min(TAIL_CHUNK).min(MAX_TAIL_READ - (len - start));
         start -= step;
         let mut chunk = vec![0; step as usize];
         f.seek(SeekFrom::Start(start))?;
         f.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|b| **b == b'\n').count();
         chunk.extend_from_slice(&buf);
         buf = chunk;
     }

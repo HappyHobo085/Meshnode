@@ -371,16 +371,17 @@ impl Inner {
                     (None, Some(e))
                 }
             };
-        *lock(&self.gateway_addrs) = gateway
-            .as_ref()
-            .map(Gateway::local_addrs)
-            .unwrap_or_default();
-        *lock(&self.handle) = Some(node.handle());
-        *self.run.write().await = Some(Running {
+        let addrs = gateway.as_ref().map(Gateway::local_addrs);
+        let handle = node.handle();
+        // `run` first: `state()` (from `handle`) never says Running while `run` is empty.
+        let mut run = self.run.write().await;
+        *run = Some(Running {
             node,
             services,
             gateway,
         });
+        *lock(&self.gateway_addrs) = addrs.unwrap_or_default();
+        *lock(&self.handle) = Some(handle);
         Ok(failed)
     }
 
@@ -400,13 +401,18 @@ impl Inner {
         Services::start(node, sc).await
     }
 
-    /// Stops the gateway, the services and the node, if running, by `deadline`.
-    async fn stop_node(&self, deadline: Instant) {
-        let Some(running) = self.run.write().await.take() else {
-            return;
+    /// Stops the gateway, the services and the node, if running, by `deadline`. False when
+    /// the services were still in use and the node was stopped without them.
+    async fn stop_node(&self, deadline: Instant) -> bool {
+        let running = {
+            let mut run = self.run.write().await;
+            lock(&self.handle).take();
+            lock(&self.gateway_addrs).clear();
+            run.take()
         };
-        lock(&self.handle).take();
-        lock(&self.gateway_addrs).clear();
+        let Some(running) = running else {
+            return true;
+        };
         let Running {
             node,
             services,
@@ -418,18 +424,23 @@ impl Inner {
             warn!("the gateway did not stop in time");
         }
         // The gateway dropped the forwarder; the httpfwd slot holds only a weak reference.
-        match release(services, Instant::now() + SERVICES_RELEASE).await {
+        let released = match release(services, Instant::now() + SERVICES_RELEASE).await {
             Some(s) => {
                 if timeout(SERVICES_STOP, s.shutdown()).await.is_err() {
                     warn!("the services did not stop in time");
                 }
+                true
             }
-            None => error!("the services are still in use; stopping the node without them"),
-        }
+            None => {
+                error!("the services are still in use; stopping the node without them");
+                false
+            }
+        };
         let left = deadline.saturating_duration_since(Instant::now());
         if timeout(left, node.shutdown()).await.is_err() {
             error!("the node did not stop in time");
         }
+        released
     }
 
     fn running_or<'a>(

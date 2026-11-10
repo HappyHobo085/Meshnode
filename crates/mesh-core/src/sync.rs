@@ -453,15 +453,17 @@ impl Session {
                 )));
             }
         }
-        let seen: Vec<(NodeId, u64)> = ops.iter().map(|o| (o.body.origin, o.body.seq)).collect();
-        let acc = self.ctx.acc.clone();
-        self.call(move |s| s.apply_batch(ops, &*acc)).await?;
+        // The peer holds these ops: raise `known` before applying them, so the writer never
+        // diffs against a `known` that lacks them and echoes them back. A failed apply ends
+        // the session, and the next session starts from the peer's Hello.
         {
             let mut st = self.lock();
-            for (origin, seq) in seen {
-                raise(&mut st.known, origin, seq);
+            for o in &ops {
+                raise(&mut st.known, o.body.origin, o.body.seq);
             }
         }
+        let acc = self.ctx.acc.clone();
+        self.call(move |s| s.apply_batch(ops, &*acc)).await?;
         self.update_lag().await
     }
 

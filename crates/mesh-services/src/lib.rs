@@ -14,6 +14,7 @@ mod static_site;
 mod status;
 
 pub use deployer::DeployerTimings;
+pub use dispatch::LocalState;
 pub use error::ServicesError;
 pub use kv::ServiceKv;
 pub use manifest::{current_generation, data_ns, gen_key, manifest_key};

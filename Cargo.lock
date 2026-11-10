@@ -2287,6 +2287,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "libc",
  "mesh-proto",
  "mesh-runtime",
  "tempfile",
@@ -2298,6 +2299,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wat",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

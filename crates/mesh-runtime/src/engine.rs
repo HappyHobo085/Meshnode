@@ -12,13 +12,34 @@ use crate::RuntimeError;
 /// deadline once per tick.
 pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Guard region after (and before) each linear memory with compact memories.
+const COMPACT_GUARD: u64 = 64 << 10;
+/// Address space reserved for growth when a compact memory is relocated.
+const COMPACT_GROWTH: u64 = 16 << 20;
+
 /// One engine per node: Cranelift, epoch interruption for deadlines. Async host calls and
 /// async instantiation come with wasmtime's `async` feature (`Config::async_support` is a
 /// deprecated no-op in wasmtime 50).
-pub(crate) fn new_engine() -> Result<Engine, RuntimeError> {
+///
+/// `compact` trades bounds-check elision for address space. By default (64-bit hosts)
+/// every linear memory reserves 4 GiB plus a 32 MiB guard on each side, and 2 GiB more
+/// when it moves; Android limits a process's address space far below what many such
+/// memories need. Compact: `memory_reservation(0)` allocates only the memory's current
+/// size, `memory_may_move(true)` lets it be relocated on growth (copying its contents),
+/// `memory_reservation_for_growth(16 MiB)` bounds the slack after each move, and
+/// `memory_guard_size(64 KiB)` keeps a small guard (compiled code bounds-checks every
+/// access then). The per-service `memory_mb` cap is enforced by the store's limiter
+/// either way.
+pub(crate) fn new_engine(compact: bool) -> Result<Engine, RuntimeError> {
     let mut cfg = Config::new();
     cfg.strategy(Strategy::Cranelift);
     cfg.epoch_interruption(true);
+    if compact {
+        cfg.memory_reservation(0)
+            .memory_may_move(true)
+            .memory_reservation_for_growth(COMPACT_GROWTH)
+            .memory_guard_size(COMPACT_GUARD);
+    }
     Engine::new(&cfg).map_err(|e| RuntimeError::Compile(format!("create engine: {e:#}")))
 }
 

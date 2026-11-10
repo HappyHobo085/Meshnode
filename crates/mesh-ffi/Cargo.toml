@@ -1,0 +1,43 @@
+[package]
+name = "mesh-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# The cdylib is the Tauri app's crate (apps/android/src-tauri), which re-exports this
+# crate's scaffolding.
+crate-type = ["lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+mesh-admin = { path = "../mesh-admin" }
+mesh-host = { path = "../mesh-host" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniffi = { version = "0.29", features = ["tokio"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+tracing-android = "0.2"
+
+[features]
+# The `uniffi-bindgen` binary (Kotlin bindings from the built library).
+bindgen = ["uniffi/cli"]
+# Test-only helpers: a panic inside `start`, a start counter, no global log subscriber.
+test-hooks = []
+
+[dev-dependencies]
+mesh-ffi = { path = ".", features = ["test-hooks"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -10,9 +10,9 @@ use std::time::Duration;
 use mesh_admin::{AdminResponse, ErrorCode, RequestIo};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{Builder, Rotation};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::paths::logs_dir;
 
@@ -40,6 +40,14 @@ pub struct LoggingGuard {
 /// can be created (otherwise stdout only, with a warning). `level` is the `log_level`
 /// setting; `RUST_LOG`, when set, wins. A second call leaves the first subscriber in place.
 pub fn init(data_dir: &Path, level: &str) -> LoggingGuard {
+    init_with(data_dir, level, None)
+}
+
+/// A layer added to the global subscriber by [`init_with`] (e.g. Android's logcat).
+pub type ExtraLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+/// [`init`], with `extra` also receiving every event that passes the level filter.
+pub fn init_with(data_dir: &Path, level: &str, extra: Option<ExtraLayer>) -> LoggingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let dir = logs_dir(data_dir);
     let appender = std::fs::create_dir_all(&dir)
@@ -60,6 +68,7 @@ pub fn init(data_dir: &Path, level: &str) -> LoggingGuard {
                 .with_ansi(false)
                 .with_writer(writer);
             let _ = tracing_subscriber::registry()
+                .with(extra)
                 .with(filter)
                 .with(stdout)
                 .with(file)
@@ -68,6 +77,7 @@ pub fn init(data_dir: &Path, level: &str) -> LoggingGuard {
         }
         Err(e) => {
             let _ = tracing_subscriber::registry()
+                .with(extra)
                 .with(filter)
                 .with(stdout)
                 .try_init();

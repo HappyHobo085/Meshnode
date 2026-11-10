@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, StreamExt};
 use mesh_admin::{
@@ -76,8 +77,12 @@ pub struct FfiStatus {
     pub peers_online: u32,
     /// The gateway's main port first, then the mapped ones.
     pub gateway_ports: Vec<u16>,
-    /// Why the last start failed, or the last panic; cleared by a successful start.
+    /// Why the last start failed, why `initAndroid` failed, or the last panic; cleared
+    /// by a successful start.
     pub last_error: Option<String>,
+    /// The power policy in force (from `meshd.toml`, changed by [`set_power`]); `None`
+    /// when stopped.
+    pub power_policy: Option<FfiPowerPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -136,12 +141,25 @@ struct SinkSlot(Mutex<SinkSt>);
 #[derive(Default)]
 struct SinkSt {
     sink: Option<Arc<dyn FfiWakeLockSink>>,
-    held: BTreeMap<String, u64>,
+    /// The locks held and when each times out (`None`: never).
+    held: BTreeMap<String, Option<Instant>>,
+}
+
+/// The timeout left until `deadline`, as `acquire` takes it: `u64::MAX` for none, at
+/// least 1 ms otherwise.
+fn remaining_ms(deadline: Option<Instant>, now: Instant) -> u64 {
+    match deadline {
+        None => u64::MAX,
+        Some(d) => {
+            let ms = d.saturating_duration_since(now).as_millis();
+            u64::try_from(ms).unwrap_or(u64::MAX - 1).max(1)
+        }
+    }
 }
 
 impl SinkSlot {
     /// Registers `sink`: the previous sink lets go of the locks held, the new one takes
-    /// them.
+    /// them for the time they have left.
     fn set(&self, sink: Arc<dyn FfiWakeLockSink>) {
         let mut st = lock(&self.0);
         if let Some(old) = &st.sink {
@@ -152,8 +170,9 @@ impl SinkSlot {
                 old.release(tag.clone());
             }
         }
-        for (tag, max_ms) in &st.held {
-            sink.acquire(tag.clone(), *max_ms);
+        let now = Instant::now();
+        for (tag, deadline) in &st.held {
+            sink.acquire(tag.clone(), remaining_ms(*deadline, now));
         }
         st.sink = Some(sink);
     }
@@ -162,7 +181,12 @@ impl SinkSlot {
 impl WakeLockSink for SinkSlot {
     fn acquire(&self, tag: &str, max_ms: u64) {
         let mut st = lock(&self.0);
-        st.held.insert(tag.to_owned(), max_ms);
+        let deadline = if max_ms == u64::MAX {
+            None
+        } else {
+            Instant::now().checked_add(Duration::from_millis(max_ms))
+        };
+        st.held.insert(tag.to_owned(), deadline);
         if let Some(sink) = &st.sink {
             sink.acquire(tag.to_owned(), max_ms);
         }
@@ -191,8 +215,9 @@ struct Host {
     /// a stop begins). A wake holds a clone while it runs; [`stop`] waits for it.
     live: Mutex<Option<Arc<Daemon>>>,
     last_error: Mutex<Option<String>>,
-    /// Bumped by every [`stop`]: a start asked for before a stop does not start after it.
-    stops: AtomicU64,
+    /// Bumped by every [`stop`]: a start asked for before a stop does not start after it,
+    /// and `admin_logs` streams end.
+    stops: tokio::sync::watch::Sender<u64>,
     /// The last power state reported (applied to every daemon started).
     power: Mutex<Option<PowerState>>,
     sink: Arc<SinkSlot>,
@@ -207,7 +232,10 @@ struct Host {
 #[derive(Default)]
 struct TestHooks {
     starts: AtomicU64,
-    panic_next: std::sync::atomic::AtomicBool,
+    panic_next: AtomicBool,
+    pause_next: AtomicBool,
+    paused: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 static HOST: OnceLock<Host> = OnceLock::new();
@@ -223,7 +251,7 @@ fn host() -> &'static Host {
         daemon: tokio::sync::Mutex::new(None),
         live: Mutex::new(None),
         last_error: Mutex::new(None),
-        stops: AtomicU64::new(0),
+        stops: tokio::sync::watch::Sender::new(0),
         power: Mutex::new(None),
         sink: Arc::new(SinkSlot::default()),
         control: Mutex::new(None),
@@ -298,7 +326,7 @@ impl Host {
         let live = lock(&self.live).clone();
         let last_error = lock(&self.last_error).clone();
         match live {
-            Some(d) => status_of(d.status(), last_error),
+            Some(d) => status_of(d.status(), d.power_state().policy, last_error),
             None => stopped(last_error),
         }
     }
@@ -341,7 +369,7 @@ impl Host {
             }
             return Ok(self.status());
         }
-        if self.stops.load(Ordering::SeqCst) != stops {
+        if *self.stops.borrow() != stops {
             info!("a stop was asked for after this start: not starting");
             return Ok(self.status());
         }
@@ -353,22 +381,27 @@ impl Host {
                 return Err(e);
             }
         };
+        if *self.stops.borrow() != stops {
+            info!("a stop was asked for while starting: stopping again");
+            shutdown(daemon).await;
+            return Ok(self.status());
+        }
         let published = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(feature = "test-hooks")]
-            {
-                self.test.starts.fetch_add(1, Ordering::SeqCst);
-                if self
-                    .test
-                    .panic_next
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    panic!("test panic in start");
-                }
+            if self.test.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("test panic in start");
             }
-            // Under the power lock, so that a concurrent `set_power` is not lost.
-            let power = lock(&self.power);
-            if let Some(state) = *power {
+            // Under the power lock, so that a concurrent `set_power` is not lost. The
+            // policy is the one in meshd.toml (the daemon loaded it); charging and screen
+            // are the platform's last report.
+            let mut power = lock(&self.power);
+            if let Some(reported) = *power {
+                let state = PowerState {
+                    policy: daemon.power_state().policy,
+                    ..reported
+                };
                 daemon.set_power(state);
+                *power = Some(state);
             }
             *lock(&self.live) = Some(daemon.clone());
         }));
@@ -399,7 +432,7 @@ impl Host {
             periodic: Periodic::Driven,
             power: Some(sink),
         };
-        Daemon::start_opts(dir.to_owned(), cfg, opts)
+        let daemon = Daemon::start_opts(dir.to_owned(), cfg, opts)
             .await
             .map_err(|e| match e {
                 DaemonError::AlreadyRunning(_) => FfiError::AlreadyRunning {
@@ -408,7 +441,15 @@ impl Host {
                 e => FfiError::Start {
                     message: e.to_string(),
                 },
-            })
+            })?;
+        #[cfg(feature = "test-hooks")]
+        self.test.starts.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "test-hooks")]
+        if self.test.pause_next.swap(false, Ordering::SeqCst) {
+            self.test.paused.notify_one();
+            self.test.resume.notified().await;
+        }
+        Ok(daemon)
     }
 
     async fn stop(&'static self) {
@@ -447,10 +488,11 @@ fn stopped(last_error: Option<String>) -> FfiStatus {
         peers_online: 0,
         gateway_ports: Vec::new(),
         last_error,
+        power_policy: None,
     }
 }
 
-fn status_of(s: HostStatus, last_error: Option<String>) -> FfiStatus {
+fn status_of(s: HostStatus, policy: PowerPolicy, last_error: Option<String>) -> FfiStatus {
     FfiStatus {
         state: match s.state {
             DaemonState::Uninitialised => FfiState::Uninitialised,
@@ -464,6 +506,7 @@ fn status_of(s: HostStatus, last_error: Option<String>) -> FfiStatus {
         peers_online: s.peers_online,
         gateway_ports: s.gateway_ports,
         last_error,
+        power_policy: Some(policy.into()),
     }
 }
 
@@ -474,6 +517,16 @@ impl From<FfiWakeReason> for WakeReason {
             FfiWakeReason::Network => WakeReason::Network,
             FfiWakeReason::Boot => WakeReason::Boot,
             FfiWakeReason::Incoming => WakeReason::Incoming,
+        }
+    }
+}
+
+impl From<PowerPolicy> for FfiPowerPolicy {
+    fn from(p: PowerPolicy) -> Self {
+        match p {
+            PowerPolicy::Balanced => FfiPowerPolicy::Balanced,
+            PowerPolicy::AlwaysOn => FfiPowerPolicy::AlwaysOn,
+            PowerPolicy::Saver => FfiPowerPolicy::Saver,
         }
     }
 }
@@ -503,11 +556,13 @@ fn encode(resp: &AdminResponse) -> Result<Vec<u8>, FfiError> {
 /// Starts the host on `data_dir`: reads `meshd.toml` and starts the daemon (no admin
 /// socket; periodic work driven by the platform; wake locks through the registered sink).
 /// Idempotent: while running (with the same directory) it returns the status; concurrent
-/// calls start one daemon. A [`stop`] called after this start was called wins.
+/// calls start one daemon. A [`stop`] called after this start was called wins: then this
+/// returns `Ok` with state `Stopped`. The power policy is the one in `meshd.toml`; a
+/// [`set_power`] before the start only contributes charging and screen state.
 #[uniffi::export]
 pub async fn start(data_dir: String) -> Result<FfiStatus, FfiError> {
     on_host(move |h| {
-        let stops = h.stops.load(Ordering::SeqCst);
+        let stops = *h.stops.borrow();
         h.start(data_dir, stops)
     })
     .await
@@ -519,7 +574,8 @@ pub async fn start(data_dir: String) -> Result<FfiStatus, FfiError> {
 #[uniffi::export]
 pub async fn stop() {
     let r = on_host(|h| {
-        h.stops.fetch_add(1, Ordering::SeqCst);
+        // Ends the `admin_logs` streams (they watch this), and any start called earlier.
+        h.stops.send_modify(|n| *n += 1);
         h.stop()
     })
     .await;
@@ -564,8 +620,9 @@ pub fn network_changed() {
     )
 }
 
-/// Reports the power state. Kept, and applied to every daemon started; a policy change
-/// is saved to `meshd.toml` by the running daemon.
+/// Reports the power state. While running, it is applied, and a policy change is saved
+/// to `meshd.toml`. Before a start, only charging and screen are kept for it (the policy
+/// in `meshd.toml` wins).
 #[uniffi::export]
 pub fn set_power(policy: FfiPowerPolicy, charging: bool, screen_on: bool) {
     guarded(
@@ -680,18 +737,25 @@ pub fn admin_logs(request: Vec<u8>, sink: Arc<dyn FfiLineSink>) {
             }
         };
         let sink = sink.clone();
+        // A stop ends the stream (a `follow` would otherwise wait for its next line).
+        let mut stopping = h.stops.subscribe();
         h.rt.spawn(async move {
             let run = AssertUnwindSafe(async {
                 let mut lines = std::pin::pin!(admin.logs_tail(req));
                 loop {
-                    match lines.next().await {
-                        Some(Ok(line)) => {
-                            if !sink.line(line) {
-                                break AdminResponse::Ok;
+                    tokio::select! {
+                        next = lines.next() => match next {
+                            Some(Ok(line)) => {
+                                if !sink.line(line) {
+                                    break AdminResponse::Ok;
+                                }
                             }
+                            Some(Err(resp)) => break resp,
+                            None => break AdminResponse::Ok,
+                        },
+                        _ = stopping.changed() => {
+                            break AdminResponse::error(ErrorCode::NotRunning, "the host stopped");
                         }
-                        Some(Err(resp)) => break resp,
-                        None => break AdminResponse::Ok,
                     }
                 }
             });
@@ -726,8 +790,63 @@ pub fn starts_for_test() -> u64 {
 /// Makes the next start panic once its daemon is up.
 #[cfg(feature = "test-hooks")]
 pub fn panic_in_next_start_for_test() {
-    host()
-        .test
-        .panic_next
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    host().test.panic_next.store(true, Ordering::SeqCst);
+}
+
+/// Makes the next start wait, once its daemon is up (holding the data lock), until
+/// [`resume_start_for_test`]; [`start_paused_for_test`] resolves when it waits.
+#[cfg(feature = "test-hooks")]
+pub fn pause_next_start_for_test() {
+    host().test.pause_next.store(true, Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-hooks")]
+pub async fn start_paused_for_test() {
+    host().test.paused.notified().await;
+}
+
+#[cfg(feature = "test-hooks")]
+pub fn resume_start_for_test() {
+    host().test.resume.notify_one();
+}
+
+/// Records why the platform setup failed (shown as [`FfiStatus::last_error`]).
+#[cfg(target_os = "android")]
+pub(crate) fn record_error(msg: String) {
+    error!("{msg}");
+    *lock(&host().last_error) = Some(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<(String, u64)>>);
+
+    impl FfiWakeLockSink for Rec {
+        fn acquire(&self, tag: String, max_ms: u64) {
+            lock(&self.0).push((tag, max_ms));
+        }
+        fn release(&self, _tag: String) {}
+    }
+
+    #[test]
+    fn a_new_sink_gets_the_time_left() {
+        let slot = SinkSlot::default();
+        slot.acquire("request", 60_000);
+        slot.acquire("always", u64::MAX);
+        slot.acquire("alarm", 0);
+        std::thread::sleep(Duration::from_millis(20));
+        let rec = Arc::new(Rec::default());
+        slot.set(rec.clone());
+        let got: BTreeMap<_, _> = lock(&rec.0).iter().cloned().collect();
+        assert_eq!(got["always"], u64::MAX);
+        assert_eq!(got["alarm"], 1, "expired: at least 1 ms");
+        assert!((1..60_000).contains(&got["request"]), "{got:?}");
+        assert!(got["request"] > 50_000, "{got:?}");
+        let now = Instant::now();
+        assert_eq!(remaining_ms(Some(now), now + Duration::from_secs(1)), 1);
+        assert_eq!(remaining_ms(None, now), u64::MAX);
+    }
 }

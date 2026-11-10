@@ -179,8 +179,8 @@ async fn wake_lock_sink_set_after_start_gets_held_locks() {
     let dir = TempDir::new().unwrap();
     let early = Arc::new(Rec::default());
     mesh_ffi::set_wake_lock_sink(early.clone());
-    mesh_ffi::set_power(FfiPowerPolicy::AlwaysOn, false, true);
     mesh_ffi::start(dir_str(&dir)).await.unwrap();
+    mesh_ffi::set_power(FfiPowerPolicy::AlwaysOn, false, true);
     assert_eq!(early.take(), [format!("+always:{}", u64::MAX)]);
     // A sink registered later (the service restarted) takes the locks held and gets the
     // later events; the old one lets go of them and gets nothing more.
@@ -264,4 +264,87 @@ async fn admin_logs_and_deploy_static() {
     let resp: AdminResponse = postcard::from_bytes(&resp).unwrap();
     assert!(matches!(resp, AdminResponse::Error { .. }), "{resp:?}");
     mesh_ffi::stop().await;
+}
+
+#[tokio::test]
+async fn policy_comes_from_meshd_toml() {
+    let _g = serial().await;
+    let dir = TempDir::new().unwrap();
+    let toml = "[android]
+power = \"saver\"
+";
+    std::fs::write(dir.path().join("meshd.toml"), toml).unwrap();
+    // Reported before the start: only charging and screen count.
+    mesh_ffi::set_power(FfiPowerPolicy::Balanced, true, false);
+    assert_eq!(mesh_ffi::status().power_policy, None);
+    let st = mesh_ffi::start(dir_str(&dir)).await.unwrap();
+    assert_eq!(st.power_policy, Some(FfiPowerPolicy::Saver));
+    assert_eq!(mesh_ffi::status().power_policy, Some(FfiPowerPolicy::Saver));
+    mesh_ffi::stop().await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("meshd.toml")).unwrap(),
+        toml
+    );
+    mesh_ffi::set_power(FfiPowerPolicy::Balanced, false, true);
+}
+
+#[tokio::test]
+async fn stop_while_start_holds_the_lock_ends_stopped() {
+    let _g = serial().await;
+    let dir = TempDir::new().unwrap();
+    mesh_ffi::pause_next_start_for_test();
+    let d = dir_str(&dir);
+    let start = tokio::spawn(async move { mesh_ffi::start(d).await });
+    // The daemon is up (data lock held) and start holds the host lock.
+    tokio::time::timeout(Duration::from_secs(10), mesh_ffi::start_paused_for_test())
+        .await
+        .unwrap();
+    let stop = tokio::spawn(mesh_ffi::stop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!stop.is_finished(), "stop waits for the start");
+    mesh_ffi::resume_start_for_test();
+    let st = start.await.unwrap().unwrap();
+    assert_eq!(st.state, FfiState::Stopped);
+    stop.await.unwrap();
+    assert_eq!(mesh_ffi::status().state, FfiState::Stopped);
+    // The data lock was released.
+    let st = mesh_ffi::start(dir_str(&dir)).await.unwrap();
+    assert_eq!(st.state, FfiState::Uninitialised);
+    mesh_ffi::stop().await;
+}
+
+#[tokio::test]
+async fn admin_logs_follow_ends_on_stop() {
+    let _g = serial().await;
+    let dir = TempDir::new().unwrap();
+    let logs = dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("meshd.log.2026-11-11"),
+        "one
+two
+",
+    )
+    .unwrap();
+    mesh_ffi::start(dir_str(&dir)).await.unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let sink = Arc::new(Lines {
+        lines: Mutex::new(Vec::new()),
+        end: Mutex::new(Some(tx)),
+    });
+    let req = AdminRequest::LogsTail {
+        lines: 10,
+        follow: true,
+    };
+    mesh_ffi::admin_logs(postcard::to_allocvec(&req).unwrap(), sink.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(rx.try_recv().is_err(), "the follow is still running");
+    assert_eq!(*sink.lines.lock().unwrap(), ["one", "two"]);
+    mesh_ffi::stop().await;
+    let end = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("the follow ends on stop")
+        .unwrap();
+    let end: AdminResponse = postcard::from_bytes(&end).unwrap();
+    assert!(matches!(end, AdminResponse::Error { .. }), "{end:?}");
 }

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `mesh-gateway` (localhost HTTP gateway, `http/1` forwarding, port mappings, status page), `mesh-admin` (admin protocol over a socket/pipe), and the `meshd` app (daemon, CLI, OS services, logging), plus the sub-spec 3 resource limits carried here.
+**Goal:** Build `mesh-gateway` (localhost HTTP gateway, `httpfwd` forwarding, port mappings, status page), `mesh-admin` (admin protocol over a socket/pipe), and the `meshd` app (daemon, CLI, OS services, logging), plus the sub-spec 3 resource limits carried here.
 
-**Architecture:** `mesh-core` registers extra ALPN handlers behind its membership gate; `mesh-gateway` provides a late-bound `http/1` handler (answers `503 Service not yet replicated` until `Services` is attached) and a forwarding client. `mesh-admin` defines the protocol, the transports and an `AdminBackend` trait; `apps/meshd` is a lib + bin crate whose `Daemon` implements the backend by composing `Node`, `Services` and the gateway.
+**Architecture:** `mesh-core` registers extra ALPN handlers behind its membership gate; `mesh-gateway` provides a late-bound `httpfwd` handler (answers `503 Service not yet replicated` until `Services` is attached) and a forwarding client. `mesh-admin` defines the protocol, the transports and an `AdminBackend` trait; `apps/meshd` is a lib + bin crate whose `Daemon` implements the backend by composing `Node`, `Services` and the gateway.
 
 **Tech Stack:** Rust 2024 (MSRV 1.90), tokio (incl. `tokio::net::windows::named_pipe`, `UnixListener`), hyper 1.12 + hyper-util 0.1, http-body-util, clap 4 (derive), toml, qrcode, tracing-appender, windows-service, windows-sys 0.61 (Win32 security, named pipes, event log).
 
@@ -16,8 +16,8 @@
 - Every task ends with `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all --check` passing; library crates also warning-free without features.
 - Git needs `git -c safe.directory=D:/AI_Apps/Meshnode`; branch `feat/gateway-admin-meshd`. Commit trailers as given by your own system instructions.
 - All store access from async code via `StoreHandle`; no blocking file or socket calls on the async runtime (use tokio APIs or `spawn_blocking`).
-- Frames: `mesh_core::frame` codec (`u32` BE length + version byte + postcard). `http/1` frame cap 64 MiB + 64 KiB; admin frame cap 64 MiB.
-- Values: gateway `127.0.0.1:7777`, default port map `7801 → "sync"`; 256 connections; 30 s header read; 60 s keep-alive; 64 MiB request-body cap; forward attempts 3, per-attempt timeout = `request_timeout_ms + 5 s`, forwarding semaphore 64; `http/1` stream read timeout 30 s, ≤ 256 streams per connection; ≤ 128 headers, ≤ 64 KiB header bytes, path ≤ 8 KiB; admin ≤ 16 connections, `FileData` ≤ 64 MiB, static upload ≤ 1 GiB, `LogsTail` ≤ 10 000 lines; shutdown bound 20 s; logs 7 daily files; memory budget default half of RAM capped at 4096 MiB.
+- Frames: `mesh_core::frame` codec (`u32` BE length + version byte + postcard). `httpfwd` frame cap 64 MiB + 64 KiB; admin frame cap 64 MiB.
+- Values: gateway `127.0.0.1:7777`, default port map `7801 → "sync"`; 256 connections; 30 s header read; 60 s keep-alive; 64 MiB request-body cap; forward attempts 3, per-attempt timeout = `request_timeout_ms + 5 s`, forwarding semaphore 64; `httpfwd` stream read timeout 30 s, ≤ 256 streams per connection; ≤ 128 headers, ≤ 64 KiB header bytes, path ≤ 8 KiB; admin ≤ 16 connections, `FileData` ≤ 64 MiB, static upload ≤ 1 GiB, `LogsTail` ≤ 10 000 lines; shutdown bound 20 s; logs 7 daily files; memory budget default half of RAM capped at 4096 MiB.
 - Retryable `503` bodies (exact): `Service not placed on this node`, `Service not yet replicated`, `Node re-bootstrapping`. Others (exact): `404 Service not deployed`, `404 Unknown host`, `421 Misdirected Request`, `502 No host could serve <name>`, `503 Memory budget exhausted`, `413` for bodies over the cap.
 - Test API behind `cfg(any(test, feature = "test-hooks"))`; each new crate has a `test-hooks` feature and the self dev-dependency pattern.
 
@@ -31,17 +31,17 @@
 
 ---
 
-### Task 1: Proto — `http/1` messages
+### Task 1: Proto — `httpfwd` messages
 
-**Files:** Create `crates/mesh-proto/src/http.rs`; modify `crates/mesh-proto/src/lib.rs`.
+**Files:** Create `crates/mesh-proto/src/httpfwd.rs`; modify `crates/mesh-proto/src/lib.rs`.
 
-**Interfaces — Produces:** `ForwardRequest { service: String, method: String, path_and_query: String, headers: Vec<(String, Vec<u8>)>, body: Vec<u8> }`, `ForwardResponse { status: u16, headers: Vec<(String, Vec<u8>)>, body: Vec<u8> }` with decode-time validation (spec §3.1: valid service name, HTTP-token method, ≤ 128 headers, ≤ 64 KiB header bytes, `path_and_query` starts with `/` and ≤ 8 KiB, status 100–999); `pub const ALPN_HTTP: &[u8] = b"meshnode/http/1"`; `pub const HTTP_MAX_FRAME: usize = 64 * 1024 * 1024 + 64 * 1024`; `pub fn is_hop_by_hop(name: &str) -> bool` (case-insensitive list from spec §3.1).
+**Interfaces — Produces:** `ForwardRequest { service: String, method: String, path_and_query: String, headers: Vec<(String, Vec<u8>)>, body: Vec<u8> }`, `ForwardResponse { status: u16, headers: Vec<(String, Vec<u8>)>, body: Vec<u8> }` with decode-time validation (spec §3.1: valid service name, HTTP-token method, ≤ 128 headers, ≤ 64 KiB header bytes, `path_and_query` starts with `/` and ≤ 8 KiB, status 100–999); `pub const ALPN_HTTPFWD: &[u8] = b"meshnode/httpfwd/1"`; `pub const HTTPFWD_MAX_FRAME: usize = 64 * 1024 * 1024 + 64 * 1024`; `pub fn is_hop_by_hop(name: &str) -> bool` (case-insensitive list from spec §3.1).
 
-- [ ] **Step 1: Failing tests** in `http.rs`: round trip both types via `encode`/`decode`; rejects: invalid service, method `"GE T"`, 129 headers, 65 KiB of header bytes, path without leading `/`, 8 KiB + 1 path, status 99; `is_hop_by_hop` true for `connection`, `Keep-Alive`, `transfer-encoding`, `TE`, `upgrade`, `Proxy-Authorization`, false for `host`, `content-type`; version byte `2` → `ProtoError::Version(2)`.
-- [ ] **Step 2: Run** `cargo test -p mesh-proto http` — FAIL.
+- [ ] **Step 1: Failing tests** in `httpfwd.rs`: round trip both types via `encode`/`decode`; rejects: invalid service, method `"GE T"`, 129 headers, 65 KiB of header bytes, path without leading `/`, 8 KiB + 1 path, status 99; `is_hop_by_hop` true for `connection`, `Keep-Alive`, `transfer-encoding`, `TE`, `upgrade`, `Proxy-Authorization`, false for `host`, `content-type`; version byte `2` → `ProtoError::Version(2)`.
+- [ ] **Step 2: Run** `cargo test -p mesh-proto httpfwd` — FAIL.
 - [ ] **Step 3: Implement** (follow `join.rs`/`service.rs` stash-validation pattern).
 - [ ] **Step 4: Run** `cargo test -p mesh-proto` — PASS.
-- [ ] **Step 5: Commit** `feat(proto): http/1 forward messages`.
+- [ ] **Step 5: Commit** `feat(proto): httpfwd forward messages`.
 
 ### Task 2: `mesh-core` — extra gated protocols, `NodeHandle::connect`
 
@@ -72,21 +72,21 @@
 - [ ] **Step 4: Run** `cargo test -p mesh-runtime -p mesh-services --all-features` — PASS.
 - [ ] **Step 5: Commit** `feat(runtime,services): memory budget, static in flight, compact memory, local_state`.
 
-### Task 4: `mesh-gateway` — `http/1` handler and forwarder
+### Task 4: `mesh-gateway` — `httpfwd` handler and forwarder
 
-**Files:** Create `crates/mesh-gateway/{Cargo.toml, src/lib.rs, src/forward.rs, src/serve_http1.rs, src/error.rs}`, `crates/mesh-gateway/tests/{common/mod.rs, forward.rs}`.
+**Files:** Create `crates/mesh-gateway/{Cargo.toml, src/lib.rs, src/forward.rs, src/serve_httpfwd.rs, src/error.rs}`, `crates/mesh-gateway/tests/{common/mod.rs, forward.rs}`.
 
 **Interfaces — Consumes:** Task 1 types, Task 2 `extra_protocols`/`connect`, Task 3 `local_state`, `Services::handle`, `placed_hosts`/`services()` status, `NodeHandle::members()` (`online`, `rtt_ms`, role).
 **Produces:**
-- `pub struct Http1Handler` (implements iroh's protocol handler) with `Http1Handler::new() -> (Http1Handler, Http1Slot)`; `Http1Slot::attach(&self, services: Services)` (late binding; before attach every request answers `503 Service not yet replicated`).
+- `pub struct HttpFwdHandler` (implements iroh's protocol handler) with `HttpFwdHandler::new() -> (HttpFwdHandler, HttpFwdSlot)`; `HttpFwdSlot::attach(&self, services: Services)` (late binding; before attach every request answers `503 Service not yet replicated`).
 - `pub struct Forwarder` with `Forwarder::new(node: NodeHandle, services: Services) -> Forwarder` and `Forwarder::dispatch(&self, name: &str, req: http::Request<Bytes>) -> http::Response<Bytes>` (spec §3.3: local when `Active`, `404 Service not deployed`, else forward with up to 3 attempts, retryable bodies, `502 No host could serve <name>`, per-peer connection cache, forwarding semaphore 64, hop-by-hop stripping).
-- Test harness: multi-node meshes with `Services` + `Http1Handler` wired in (copy the minimal pieces of `mesh-services/tests/common`).
+- Test harness: multi-node meshes with `Services` + `HttpFwdHandler` wired in (copy the minimal pieces of `mesh-services/tests/common`).
 
-- [ ] **Step 1: Failing tests:** `forward_to_placed_host` (counter placed only on A; B dispatches → A's count); `forward_skips_unreachable_then_succeeds` (placed on A and C; A partitioned from B; B reaches C); `forward_all_fail_502` (exact body); `forwarded_request_never_reforwarded` (A receives an `http/1` request for a service it doesn't run → retryable 503, no outgoing forward — count connections/forwards via a test hook); `client_role_always_forwards`; `hop_by_hop_headers_stripped`; `unattached_handler_answers_retryable_503`; `forward_oversized_response_rejected` (Review Focus 2: a raw test handler answers with a length prefix > `HTTP_MAX_FRAME` and with garbage bytes → next host / 502, no panic).
+- [ ] **Step 1: Failing tests:** `forward_to_placed_host` (counter placed only on A; B dispatches → A's count); `forward_skips_unreachable_then_succeeds` (placed on A and C; A partitioned from B; B reaches C); `forward_all_fail_502` (exact body); `forwarded_request_never_reforwarded` (A receives an `httpfwd` request for a service it doesn't run → retryable 503, no outgoing forward — count connections/forwards via a test hook); `client_role_always_forwards`; `hop_by_hop_headers_stripped`; `unattached_handler_answers_retryable_503`; `forward_oversized_response_rejected` (Review Focus 2: a raw test handler answers with a length prefix > `HTTPFWD_MAX_FRAME` and with garbage bytes → next host / 502, no panic).
 - [ ] **Step 2: Run** `cargo test -p mesh-gateway --all-features --test forward` — FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** 3× — PASS.
-- [ ] **Step 5: Commit** `feat(gateway): http/1 forwarding`.
+- [ ] **Step 5: Commit** `feat(gateway): httpfwd forwarding`.
 
 ### Task 5: `mesh-gateway` — localhost server, routing, ports, status page
 
@@ -126,7 +126,7 @@
 - `paths::default_data_dir() -> PathBuf` (spec §6.1 per OS), honouring `MESHD_DATA`.
 - `MeshdConfig` (serde, spec §6.1 TOML), `MeshdConfig::load_or_default(dir)`, `save(dir)` (atomic), `set(key, value) -> Result<bool /*restart_required*/, ConfigError>` with spec validation.
 - `logging::init(data_dir, level) -> LoggingGuard` (stdout + daily rolling file, 7 kept).
-- `Daemon::start(data_dir: PathBuf, cfg: MeshdConfig) -> Result<Daemon, DaemonError>`: Uninitialised (admin only) or Running (Node with `extra_protocols = [(ALPN_HTTP, http1_handler)]` → `Services::start` → `slot.attach(services)` → `Gateway::start`) — and `impl AdminBackend for Daemon` covering every request (Init/Join transitions in place; ResetIdentity stops and wipes all but `meshd.toml`; DeployStatic stages under `<data>/tmp/<random>` and cleans up; LogsTail reads the newest log file); `Daemon::run_until(self, shutdown: impl Future)` (admin server + orderly 20 s shutdown).
+- `Daemon::start(data_dir: PathBuf, cfg: MeshdConfig) -> Result<Daemon, DaemonError>`: Uninitialised (admin only) or Running (Node with `extra_protocols = [(ALPN_HTTPFWD, httpfwd_handler)]` → `Services::start` → `slot.attach(services)` → `Gateway::start`) — and `impl AdminBackend for Daemon` covering every request (Init/Join transitions in place; ResetIdentity stops and wipes all but `meshd.toml`; DeployStatic stages under `<data>/tmp/<random>` and cleans up; LogsTail reads the newest log file); `Daemon::run_until(self, shutdown: impl Future)` (admin server + orderly 20 s shutdown).
 
 - [ ] **Step 1: Failing tests:** `uninitialised_accepts_only_init_join`; `init_then_status_running`; `join_through_daemon` (two daemons on temp dirs; B joins A's ticket via its admin endpoint); `every_request_against_real_daemon` (status, members, invite, set_info, deploy wasm counter + call through the gateway, deploy static, set_placement/outbound/limits, undeploy, purge, config get/set, logs tail); `reset_identity_only_when_removed`; `config_set_validation` (bad listen, port 80, unknown key → errors; `name` applies at once; `gateway.listen` → restart_required); `shutdown_within_20s`.
 - [ ] **Step 2: Run** `cargo test -p meshd --all-features --test daemon` — FAIL.

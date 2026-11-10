@@ -102,7 +102,7 @@ Each crate is testable on its own. `mesh-hlc`, `mesh-store` and `mesh-proto` hav
 - All peer traffic is iroh QUIC with these ALPNs, each versioned:
   - `meshnode/join/1`: redeem an invite ticket
   - `meshnode/sync/1`: catch-up (version-vector exchange + missing ops)
-  - `meshnode/http/1`: forward an HTTP request to a node that hosts the service
+  - `meshnode/httpfwd/1`: forward an HTTP request to a node that hosts the service
   - iroh-blobs' ALPN: fetch module and site content by BLAKE3 hash
   - There is no gossip protocol: live replication runs over the per-peer `sync/1` sessions (a direct connection per peer; push on every local change) *(back-ported from sub-spec 2)*.
 - **Every incoming connection is checked against membership** right after the handshake, using the remote `NodeId` iroh has authenticated. Non-members and removed nodes are closed with an error code. The only exception is `join/1`, which needs a valid ticket instead.
@@ -227,15 +227,15 @@ A built-in native handler serves files from an iroh-blobs collection: `index.htm
 - Listens on `127.0.0.1:7777` (configurable; loopback only).
 - **Routing by Host header:** `<service>.mesh.localhost[:port]` → that service. Browsers resolve `*.localhost` to loopback by themselves.
 - **Port mappings** for clients that can't resolve `*.localhost`: node-local `ports = { 7801 = "sync" }` binds `127.0.0.1:7801` straight to a service. **Default mapping: `7801 → sync`** on every node, so Aegis's sync URL is always `http://127.0.0.1:7801`.
-- **Dispatch:** if this node runs the service, it's handled locally. Otherwise (client role, not in placement, or not yet replicated) it's forwarded over `http/1` to the online host running it with the lowest recent round-trip time, trying the next host on failure, up to 3 attempts. If none work: `502`.
+- **Dispatch:** if this node runs the service, it's handled locally. Otherwise (client role, not in placement, or not yet replicated) it's forwarded over `httpfwd` to the online host running it with the lowest recent round-trip time, trying the next host on failure, up to 3 attempts. If none work: `502`.
 - `http://mesh.localhost:7777/` serves a read-only status page.
 - **Security:** any local process can reach the gateway, the same as any localhost server. Services handle their own user-level auth (the Aegis sync service does).
 
-### `http/1` forward protocol
+### `httpfwd` forward protocol
 One bidirectional QUIC stream per request: a length-prefixed `RequestHead { service, method, path, headers }`, the streamed body, then `ResponseHead { status, headers }` and the streamed body back. Hosts accept it only from effective members.
 
 ### `mesh-client` library
-A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts; partial replication for clients moves to sub-spec 8 *(back-ported from sub-spec 2)*: until then a client member replicates everything) and talks `http/1`. Intended for embedding in apps on devices that don't run the full node.
+A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts; partial replication for clients moves to sub-spec 8 *(back-ported from sub-spec 2)*: until then a client member replicates everything) and talks `httpfwd`. Intended for embedding in apps on devices that don't run the full node.
 
 ---
 

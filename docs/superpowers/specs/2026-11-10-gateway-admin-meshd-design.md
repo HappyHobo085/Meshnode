@@ -4,7 +4,7 @@
 **Status:** Draft, awaiting owner review
 **Parent:** `2026-11-08-meshnode-design.md` (§8 client access, §9 admin API and CLI, §10.1 desktop daemon, §12, §14 row 4)
 **Builds on:** `2026-11-09-node-core-design.md` (sub-spec 2) and `2026-11-09-runtime-services-design.md` (sub-spec 3)
-**Delivers:** crates `mesh-gateway` (localhost HTTP gateway, `http/1` forwarding, port mappings, status page) and `mesh-admin` (admin protocol, server, client); the `apps/meshd` binary (CLI, daemon, OS services, logging); additions to `mesh-proto`, `mesh-core`, `mesh-runtime` and `mesh-services`.
+**Delivers:** crates `mesh-gateway` (localhost HTTP gateway, `httpfwd` forwarding, port mappings, status page) and `mesh-admin` (admin protocol, server, client); the `apps/meshd` binary (CLI, daemon, OS services, logging); additions to `mesh-proto`, `mesh-core`, `mesh-runtime` and `mesh-services`.
 
 ---
 
@@ -26,15 +26,15 @@ New dependencies (workspace): `hyper` 1, `hyper-util` (server, tokio), `http-bod
 2. **The CLI talks to the running daemon.** Except `init`, `join`, `reset-identity` (through the daemon when it is reachable, otherwise directly on the data directory) and `service install|uninstall|start|stop|status` (the OS), every command needs a running daemon and otherwise prints `meshd is not running (start it with "meshd run" or "meshd service install")`. This narrows master §9's "or works on the data directory directly when no daemon is running".
 3. **The daemon can run uninitialised.** `meshd run` without `mesh.json` serves only the admin API, accepting `Init` and `Join`; on success it starts the node in place.
 4. **Logging.** A daily rolling file `<data>/logs/meshd.log.<date>` (7 kept) plus stdout; under systemd stdout reaches journald. On Windows only service start/stop and fatal startup errors go to the Event Log (source `Meshnode`).
-5. **Bodies stay buffered** end to end (gateway, `http/1`, services), with caps.
+5. **Bodies stay buffered** end to end (gateway, `httpfwd`, services), with caps.
 6. **macOS is best-effort**: the launchd plist and install code are written and built in CI, not verified on a Mac here. Linux (systemd) is verified later in a VM.
 7. **Resource limits carried over from sub-spec 3 (I5)**: a node-wide memory budget for WASM requests, static requests counted in flight, and a compact memory reservation on Android (§4.4).
 
-## 3. `http/1` forwarding (`mesh-gateway`)
+## 3. `httpfwd` forwarding (`mesh-gateway`)
 
-### 3.1 Wire format (`mesh-proto/src/http.rs`)
+### 3.1 Wire format (`mesh-proto/src/httpfwd.rs`)
 
-ALPN `meshnode/http/1`. One bidirectional QUIC stream per request; frames use the existing codec (`u32` big-endian length, then the version byte and postcard).
+ALPN `meshnode/httpfwd/1` (the mesh's own request-forwarding protocol between nodes, version 1; browsers and apps speak plain HTTP/1.1 to the gateway, §4). One bidirectional QUIC stream per request; frames use the existing codec (`u32` big-endian length, then the version byte and postcard).
 
 ```rust
 pub struct ForwardRequest  { pub service: String, pub method: String, pub path_and_query: String,
@@ -186,7 +186,7 @@ A local `join` (no daemon) starts the node, joins, waits up to 60 s for the firs
 ### 6.3 `run`
 
 1. Load `meshd.toml` (create defaults if missing) and set up logging (§6.5).
-2. If `mesh.json` exists: `Node::open` → `Services::start` (with `extra_protocols` carrying the `http/1` handler) → gateway → admin server. Otherwise start only the admin server (`Uninitialised`).
+2. If `mesh.json` exists: `Node::open` → `Services::start` (with `extra_protocols` carrying the `httpfwd` handler) → gateway → admin server. Otherwise start only the admin server (`Uninitialised`).
 3. On Ctrl-C, SIGTERM or a Windows service stop: stop accepting admin connections → stop the gateway → `Services::shutdown` → `Node::shutdown`, all within 20 s.
 
 ### 6.4 OS services

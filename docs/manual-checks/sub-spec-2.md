@@ -4,7 +4,7 @@ Run by the owner on two desktops on different networks (spec §11.3). Until this
 
 ## Setup
 
-Build once: `cargo build -p mesh-core --example meshdev`. Run on each desktop:
+Build once: `cargo build -p mesh-services --example meshdev`. Run on each desktop:
 
 ```
 meshdev <data-dir> init | join <ticket-text> | run

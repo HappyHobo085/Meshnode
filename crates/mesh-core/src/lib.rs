@@ -22,10 +22,12 @@ pub mod transport;
 #[cfg(windows)]
 mod winfs;
 
-pub use blobs::{BlobHash, Blobs};
+pub use blobs::{BlobHash, BlobKind, Blobs};
 pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
 pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;
 pub use maint::MaintJob;
-pub use node::{MemberStatus, Node, NodeStatus};
+/// Store types that appear in this crate's API (store errors and change events).
+pub use mesh_store::{Change, ChangeKind, StoreError};
+pub use node::{MemberStatus, Node, NodeHandle, NodeStatus};

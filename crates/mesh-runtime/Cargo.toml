@@ -1,0 +1,36 @@
+[package]
+name = "mesh-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-proto = { path = "../mesh-proto" }
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wasmtime-wasi-http.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+hex.workspace = true
+
+[features]
+# Test-only helpers (`MemKv`), also used by later crates' tests.
+test-hooks = []
+
+[dev-dependencies]
+mesh-runtime = { path = ".", features = ["test-hooks"] }
+tokio.workspace = true
+http.workspace = true
+bytes.workspace = true
+wat.workspace = true
+tempfile.workspace = true
+async-trait.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true

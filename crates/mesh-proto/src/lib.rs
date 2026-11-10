@@ -3,12 +3,14 @@
 mod ids;
 mod join;
 mod op;
+mod service;
 mod sync;
 mod ticket;
 
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};
+pub use service::{Limits, Placement, ServiceKind, ServiceManifest, valid_service_name};
 pub use sync::{MAX_BATCH_BYTES, MAX_BATCH_OPS, SyncMsg, VersionVector, batch_ops};
 pub use ticket::InviteTicket;
 
@@ -52,6 +54,21 @@ pub fn decode<T: DeserializeOwned>(b: &[u8]) -> Result<T, ProtoError> {
     if ver != FORMAT_VERSION {
         return Err(ProtoError::Version(ver));
     }
+    decode_body(rest)
+}
+
+/// Plain postcard, no version byte (the encoding of `_mesh` values).
+pub fn encode_raw<T: Serialize>(v: &T) -> Vec<u8> {
+    // Serializing into a Vec cannot fail for the wire types; an empty result fails to decode.
+    postcard::to_allocvec(v).unwrap_or_default()
+}
+
+/// Inverse of [`encode_raw`], with the same validation as [`decode`].
+pub fn decode_raw<T: DeserializeOwned>(b: &[u8]) -> Result<T, ProtoError> {
+    decode_body(b)
+}
+
+fn decode_body<T: DeserializeOwned>(rest: &[u8]) -> Result<T, ProtoError> {
     let _ = op::take_stashed_error();
     match postcard::take_from_bytes::<T>(rest) {
         Ok((v, [])) => Ok(v),

@@ -275,7 +275,7 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
 
 1. Emit `RebootstrapStarting` and log a `warn`.
 2. `s = store.synced_self_seq()` — **before** the reset, which deletes it. `export = store.export_unsynced_local_ops(now)` (§2.4). Write `{ s, export.items, export.expired }` to `rebootstrap.bin` with an atomic, durable write (temp file, fsync, durable rename, §3) *(amended during implementation)*.
-3. `store.reset_to_empty()`. The store refuses local writes with `Rebootstrapping` from here until the own ops are back (sub-spec 1 §5.7). `status = Rebootstrapping { waiting_for_self_seq: s }`.
+3. `status = Rebootstrapping { waiting_for_self_seq: s }`, then `store.reset_to_empty()` (the status changes first, so a reader that still sees `Running` after its reads read a whole store) *(order amended in final review)*. The store refuses local writes with `Rebootstrapping` from here until the own ops are back (sub-spec 1 §5.7).
 4. Wait until this node is a member in the store *(amended during implementation)*, then run ordinary rounds (§6.3) with online peers. The emptied store has nothing to serve, so in practice this is a pull. After each completed round, check `version_vector()[self] ≥ s`. If not, the peer lacked this node's synced ops; continue with the next round and other peers on the normal schedule.
 5. Once `vv[self] ≥ s`: apply the export's items in their own order *(amended during implementation)* (a `Covered` marker precedes the op after each hole; trusted local data, `advertised = upto`). A self `Covered` item is never applied until `vv[self]` covers every exported op before it, and the sequence ends with a self `Covered` up to the export-time last seq (a trailing hole). Local writes are drained (in-flight writes finish) before the export. `rebootstrap.bin` also carries peer address hints. A present self-removal record ends the run as `Removed`.
 6. If `export.expired` is non-empty, write it to `expired-edits.bin` and emit `ExpiredOfflineEdits { count, keys }`.
@@ -304,7 +304,7 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
   ```
 - The blob kind is supplied by the caller: `fetch(hash)` is raw-only; `fetch_collection(hash)` and `has_collection(hash)` handle collections. There is no content sniffing. A collection root and its names blob are capped at 16 MiB *(amended during implementation)*.
 - `fetch` tries online effective members in RTT order and moves to the next on failure; iroh-blobs verifies the hash while streaming. It fails with `BlobUnavailable` when every peer fails.
-- Everything added or fetched is protected by a named tag `meshnode/pin/<hash>`. iroh-blobs' own GC is disabled. Unpinning and reference-based GC are sub-spec 3.
+- Everything added or fetched is protected by a named tag `meshnode/pin/<hash>`. iroh-blobs' GC loop is now on but protect-gated: it only sweeps when `Blobs::remove` arms it (tick `Timings::blob_gc_tick`, default 30 s; `remove` takes up to about 3 ticks; a dead GC loop makes `remove` fail fast). `fetch` and `fetch_collection` hold an iroh-blobs temp tag across download and pin, so an armed sweep never deletes in-flight data. New: `Blobs::{pins, remove, remove_many, collection_entries, size}`, `BlobKind`, and `NodeHandle` *(amended in sub-spec 3)*; `remove_many(&[Hash])` drops all the pins, then runs one sweep, so it takes about as long as one `remove` *(amended in final review)*. Reference-based GC is in `mesh-services`.
 
 ## 9. Scheduled work (`maint`)
 
@@ -384,7 +384,7 @@ Plus:
 
 ### 11.3 Demo and manual check
 
-`cargo run -p mesh-core --example meshdev -- <data-dir> init | join <ticket> | run`. `init` and `join` drop into the same REPL as `run`:
+`cargo run -p mesh-services --example meshdev -- <data-dir> init | join <ticket> | run` (the example moved to `mesh-services` in sub-spec 3, *amended in final review*). `init` and `join` drop into the same REPL as `run`:
 
 `invite [host|client]`, `members`, `put <ns> <key> <value>`, `get <ns> <key>`, `del <ns> <key>`, `ls <ns> [prefix]`, `remove <id-prefix>`, `status`, `sync`, `blob add <path>`, `blob get <hash> <out>`, `quit`.
 

@@ -395,3 +395,46 @@ async fn crashed_peer_reconnects_quickly() {
     timeout(T, restarted.shutdown()).await.unwrap();
     timeout(T, survivor.shutdown()).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_handle_drop_does_not_cancel() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = pair(da.path(), db.path(), true).await;
+    let h = a.handle();
+    assert_eq!(h.node_id(), a.node_id());
+    assert_eq!(h.mesh(), a.mesh());
+    assert_eq!(h.status(), NodeStatus::Running);
+    assert_eq!(h.members().len(), a.members().len());
+    let copy = h.clone();
+    drop(h);
+    drop(copy);
+    assert!(!a.is_stopped());
+    // The node still replicates.
+    a.store().set("app", "k", b"v".to_vec()).await.unwrap();
+    wait_until("b sees the write", T, || async {
+        b.store().get("app", "k").await.unwrap().as_deref() == Some(&b"v"[..])
+    })
+    .await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_handle_cancelled_resolves_on_shutdown() {
+    let d = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(d.path(), "a").0).await.unwrap();
+    let h = a.handle();
+    let mut cancelled = Box::pin(h.cancelled());
+    assert!(
+        timeout(Duration::from_millis(200), &mut cancelled)
+            .await
+            .is_err(),
+        "not cancelled while the node runs"
+    );
+    a.shutdown().await;
+    timeout(T, cancelled)
+        .await
+        .expect("cancelled never resolved");
+    // Also after the fact, and for a clone.
+    timeout(T, h.clone().cancelled()).await.unwrap();
+}

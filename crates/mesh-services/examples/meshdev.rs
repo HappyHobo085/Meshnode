@@ -1,4 +1,4 @@
-//! Demo and manual-check driver for the node core (spec §11.3). Replaced by `meshd` in
+//! Demo and manual-check driver for the node core and its services. Replaced by `meshd` in
 //! sub-spec 4.
 //!
 //! `meshdev <data-dir> init | join <ticket-text> | run`, then a REPL on stdin.
@@ -6,14 +6,21 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use bytes::Bytes;
 use mesh_core::{Node, NodeConfig, NodeError, NodeEvent};
-use mesh_proto::{InviteTicket, NodeId, Role};
+use mesh_proto::{InviteTicket, NodeId, Placement, Role};
+use mesh_services::{DeployOpts, LocalStatus, Services, ServicesConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "commands: invite [host|client] | members | put <ns> <key> <value...> | \
 get <ns> <key> | del <ns> <key> | ls <ns> [prefix] | remove <id-prefix> | status | sync | \
-blob add <path> | blob get <hash> <out> | blob getdir <hash> | quit";
+blob add <path> | blob get <hash> <out> | blob getdir <hash> | \
+deploy wasm <name> <file> [--tags a,b | --nodes id,..] [--outbound host:port,..] | \
+deploy static <name> <dir> [--tags a,b | --nodes id,..] | services | undeploy <name> | \
+purge <name> | call <name> <METHOD> <path> [body] | quit";
+/// Largest response body printed in full by `call`.
+const BODY_PRINT_LIMIT: usize = 4096;
 const INVITE_TTL: Duration = Duration::from_secs(3600);
 const FIRST_SYNC_WAIT: Duration = Duration::from_secs(60);
 const BLOB_WAIT: Duration = Duration::from_secs(120);
@@ -68,8 +75,17 @@ async fn run() -> Result<(), String> {
     if mode == "join" && !node.wait_first_sync(FIRST_SYNC_WAIT).await {
         println!("first sync not complete after {FIRST_SYNC_WAIT:?}; continuing");
     }
+    // The default config caches compiled components under `<data>/services/cache`.
+    let services = match Services::start(&node, ServicesConfig::default()).await {
+        Ok(s) => s,
+        Err(e) => {
+            node.shutdown().await;
+            return Err(format!("cannot start services: {e}"));
+        }
+    };
     println!("{USAGE}");
-    repl(&node).await;
+    repl(&node, &services).await;
+    services.shutdown().await;
     node.shutdown().await;
     Ok(())
 }
@@ -97,7 +113,7 @@ fn log_event(ev: &NodeEvent) {
     }
 }
 
-async fn repl(node: &Node) {
+async fn repl(node: &Node, services: &Services) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         let line = match lines.next_line().await {
@@ -111,7 +127,7 @@ async fn repl(node: &Node) {
         if words[0] == "quit" || words[0] == "exit" {
             break;
         }
-        if let Err(msg) = command(node, &line, &words).await {
+        if let Err(msg) = command(node, services, &line, &words).await {
             println!("error: {msg}");
         }
     }
@@ -139,7 +155,7 @@ fn parse_hash(s: &str) -> Result<mesh_core::BlobHash, String> {
     s.parse().map_err(|e| format!("bad hash: {e}"))
 }
 
-async fn command(node: &Node, line: &str, w: &[&str]) -> Result<(), String> {
+async fn command(node: &Node, services: &Services, line: &str, w: &[&str]) -> Result<(), String> {
     match w {
         ["invite"] | ["invite", "host"] => invite(node, Role::Host).await,
         ["invite", "client"] => invite(node, Role::Client).await,
@@ -224,10 +240,150 @@ async fn command(node: &Node, line: &str, w: &[&str]) -> Result<(), String> {
             println!("collection {hash} fetched");
             Ok(())
         }
+        ["deploy", "wasm", name, file, flags @ ..] => {
+            let opts = deploy_opts(node, flags, true)?;
+            let wasm = tokio::fs::read(file)
+                .await
+                .map_err(|e| format!("cannot read {file}: {e}"))?;
+            let m = services
+                .deploy_wasm(name, Bytes::from(wasm), opts)
+                .await
+                .map_err(err)?;
+            println!("deployed {} version {}", m.name, m.version);
+            Ok(())
+        }
+        ["deploy", "static", name, dir, flags @ ..] => {
+            let opts = deploy_opts(node, flags, false)?;
+            let m = services
+                .deploy_static(name, Path::new(dir), opts)
+                .await
+                .map_err(err)?;
+            println!("deployed {} version {}", m.name, m.version);
+            Ok(())
+        }
+        ["services"] => {
+            list_services(services);
+            Ok(())
+        }
+        ["undeploy", name] => {
+            services.undeploy(name).await.map_err(err)?;
+            println!("ok");
+            Ok(())
+        }
+        ["purge", name] => {
+            services.purge(name).await.map_err(err)?;
+            println!("ok");
+            Ok(())
+        }
+        ["call", ..] => {
+            let Some((name, method, path, body)) = parse_call(line) else {
+                println!("{USAGE}");
+                return Ok(());
+            };
+            call(services, name, method, path, body).await
+        }
         _ => {
             println!("{USAGE}");
             Ok(())
         }
+    }
+}
+
+/// Parses the flags after `deploy wasm|static <name> <src>`. `--outbound` is wasm only.
+fn deploy_opts(node: &Node, flags: &[&str], allow_outbound: bool) -> Result<DeployOpts, String> {
+    let mut opts = DeployOpts::default();
+    let mut placement_flag: Option<&str> = None;
+    let mut it = flags.iter();
+    while let Some(&flag) = it.next() {
+        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        let items = || value.split(',').filter(|s| !s.is_empty());
+        if matches!(flag, "--tags" | "--nodes")
+            && let Some(first) = placement_flag.replace(flag)
+        {
+            return Err(format!("{first} and {flag} cannot be combined"));
+        }
+        match flag {
+            "--tags" => opts.placement = Placement::Tags(items().map(String::from).collect()),
+            "--nodes" => {
+                let ids = items()
+                    .map(|p| find_member(node, p))
+                    .collect::<Result<_, _>>()?;
+                opts.placement = Placement::Nodes(ids);
+            }
+            "--outbound" if allow_outbound => opts.outbound = items().map(String::from).collect(),
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok(opts)
+}
+
+fn list_services(services: &Services) {
+    let all = services.services();
+    if all.is_empty() {
+        println!("(no services)");
+    }
+    for s in all {
+        let local = match &s.local {
+            LocalStatus::NotPlaced => "not placed".to_owned(),
+            LocalStatus::Fetching => "fetching".to_owned(),
+            LocalStatus::Ready { version } => format!("ready v{version}"),
+            LocalStatus::Failed { error, .. } => format!("failed: {error}"),
+        };
+        let hosts: Vec<String> = s.placed_hosts.iter().map(|h| h.short()).collect();
+        println!(
+            "{} v{} gen={} local={} hosts=[{}] data={}B",
+            s.manifest.name,
+            s.manifest.version,
+            s.generation,
+            local,
+            hosts.join(","),
+            s.data_bytes,
+        );
+    }
+}
+
+/// Splits `call <name> <METHOD> <path> [body...]`; the body is the rest of the line.
+fn parse_call(line: &str) -> Option<(&str, &str, &str, &str)> {
+    let rest = line.trim_start().strip_prefix("call")?;
+    let (name, rest) = next_word(rest)?;
+    let (method, rest) = next_word(rest)?;
+    let (path, rest) = next_word(rest)?;
+    Some((name, method, path, rest.trim_start()))
+}
+
+async fn call(
+    services: &Services,
+    name: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<(), String> {
+    let method = method
+        .to_ascii_uppercase()
+        .parse::<http::Method>()
+        .map_err(|e| format!("bad method: {e}"))?;
+    let req = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Bytes::from(body.to_owned()))
+        .map_err(|e| format!("bad request: {e}"))?;
+    let resp = services.handle(name, req).await;
+    println!("{}", resp.status());
+    for (k, v) in resp.headers() {
+        println!("{k}: {}", String::from_utf8_lossy(v.as_bytes()));
+    }
+    println!();
+    println!("{}", render_body(resp.body()));
+    Ok(())
+}
+
+/// The body as lossy UTF-8, cut after [`BODY_PRINT_LIMIT`] bytes.
+fn render_body(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(&body[..body.len().min(BODY_PRINT_LIMIT)]);
+    if body.len() > BODY_PRINT_LIMIT {
+        format!("{text}\n... ({} bytes total, truncated)", body.len())
+    } else {
+        text.into_owned()
     }
 }
 
@@ -286,7 +442,25 @@ async fn ls(node: &Node, ns: &str, prefix: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_put;
+    use super::{parse_call, parse_put, render_body};
+
+    #[test]
+    fn call_splits_body_from_path() {
+        assert_eq!(
+            parse_call("call c post /x  hello world"),
+            Some(("c", "post", "/x", "hello world"))
+        );
+        assert_eq!(parse_call("call c GET /"), Some(("c", "GET", "/", "")));
+        assert_eq!(parse_call("call c GET"), None);
+    }
+
+    #[test]
+    fn render_body_truncates_large_and_non_utf8() {
+        assert_eq!(render_body(b"ok"), "ok");
+        let big = vec![b'a'; 10_000];
+        assert!(render_body(&big).contains("10000 bytes total"));
+        assert!(!render_body(&[0xff, 0xfe]).is_empty());
+    }
 
     #[test]
     fn put_ignores_extra_whitespace_before_value() {

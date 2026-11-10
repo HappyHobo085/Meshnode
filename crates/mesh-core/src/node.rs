@@ -103,12 +103,107 @@ pub(crate) struct Inner {
     /// Test hook: the next re-bootstrap stops the node right after its step 3.
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     pub(crate) crash_after_reset: AtomicBool,
+    /// Test hook: while true, a re-bootstrap waits in its step 3, after the status became
+    /// `Rebootstrapping` and before the store is reset.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    pub(crate) hold_before_reset: watch::Sender<bool>,
     tasks: Mutex<JoinSet<()>>,
     pub(crate) cancel: CancellationToken,
     /// Makes the reactor run a full rescan (a test hook, and the end of a re-bootstrap).
     pub(crate) force_lagged: Arc<Notify>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     lose_events: Arc<AtomicBool>,
+}
+
+impl Inner {
+    fn members(&self) -> Vec<MemberStatus> {
+        let snap = self.membership.borrow().clone();
+        snap.members()
+            .map(|(id, m)| {
+                let mut s = MemberStatus {
+                    id: *id,
+                    role: m.role,
+                    info: m.info.clone(),
+                    effective: snap.is_effective(id),
+                    online: *id == self.me,
+                    rtt_ms: None,
+                    last_seen_ms: None,
+                    lag: 0,
+                };
+                if *id != self.me {
+                    if let Some(rtt) = self.peers.link(id) {
+                        s.online = true;
+                        s.rtt_ms = rtt;
+                    }
+                    if let Some(mx) = self.peers.metrics(id) {
+                        let seen = mx.last_seen_ms.load(Ordering::SeqCst);
+                        s.last_seen_ms = (seen != 0).then_some(seen);
+                        s.lag = mx.lag.load(Ordering::SeqCst);
+                    }
+                }
+                s
+            })
+            .collect()
+    }
+
+    fn status(&self) -> NodeStatus {
+        self.status.borrow().clone()
+    }
+}
+
+/// A non-owning, cloneable handle to a running [`Node`], for services that must neither
+/// keep the node running nor stop it: dropping a handle never cancels anything. A handle
+/// that outlives [`Node::shutdown`] keeps the store file open until it is dropped.
+#[derive(Clone)]
+pub struct NodeHandle {
+    inner: Arc<Inner>,
+}
+
+impl NodeHandle {
+    pub fn node_id(&self) -> NodeId {
+        self.inner.me
+    }
+
+    pub fn mesh(&self) -> MeshId {
+        self.inner.genesis.mesh_id()
+    }
+
+    pub fn store(&self) -> &StoreHandle {
+        &self.inner.store
+    }
+
+    pub fn blobs(&self) -> &Blobs {
+        &self.inner.blobs
+    }
+
+    pub fn members(&self) -> Vec<MemberStatus> {
+        self.inner.members()
+    }
+
+    pub fn status(&self) -> NodeStatus {
+        self.inner.status()
+    }
+
+    /// The node's data directory.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.inner.cfg.data_dir
+    }
+
+    /// The node's wall clock, in ms since the Unix epoch.
+    pub fn now_ms(&self) -> u64 {
+        self.inner.cfg.wall.now_ms()
+    }
+
+    /// The node's events (see [`Node::subscribe`]); `MembersChanged` follows every change
+    /// to the membership snapshot that [`NodeHandle::members`] reads.
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Resolves once the node is cancelled: shut down, or its owning `Node` dropped.
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.cancel.clone().cancelled_owned()
+    }
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -341,6 +436,7 @@ pub(crate) async fn start(
             peers: peers.clone(),
             me,
         },
+        cfg.timings.blob_gc_tick,
     )
     .await?;
     let router = Router::builder(endpoint.clone())
@@ -436,6 +532,7 @@ pub(crate) async fn start(
         serve_paused,
         rebootstrap: tokio::sync::Mutex::new(()),
         crash_after_reset: AtomicBool::new(false),
+        hold_before_reset: watch::Sender::new(false),
         tasks: Mutex::new(tasks),
         cancel,
         force_lagged,
@@ -577,38 +674,18 @@ impl Node {
 
     /// Every member of the mesh, with this node's view of its link.
     pub fn members(&self) -> Vec<MemberStatus> {
-        let snap = self.inner.membership.borrow().clone();
-        let peers = &self.inner.peers;
-        snap.members()
-            .map(|(id, m)| {
-                let mut s = MemberStatus {
-                    id: *id,
-                    role: m.role,
-                    info: m.info.clone(),
-                    effective: snap.is_effective(id),
-                    online: *id == self.inner.me,
-                    rtt_ms: None,
-                    last_seen_ms: None,
-                    lag: 0,
-                };
-                if *id != self.inner.me {
-                    if let Some(rtt) = peers.link(id) {
-                        s.online = true;
-                        s.rtt_ms = rtt;
-                    }
-                    if let Some(mx) = peers.metrics(id) {
-                        let seen = mx.last_seen_ms.load(Ordering::SeqCst);
-                        s.last_seen_ms = (seen != 0).then_some(seen);
-                        s.lag = mx.lag.load(Ordering::SeqCst);
-                    }
-                }
-                s
-            })
-            .collect()
+        self.inner.members()
     }
 
     pub fn status(&self) -> NodeStatus {
-        self.inner.status.borrow().clone()
+        self.inner.status()
+    }
+
+    /// A cloneable, non-owning view of this node. Dropping it never cancels anything.
+    pub fn handle(&self) -> NodeHandle {
+        NodeHandle {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Reads and local writes; local writes fail with `Removed` once this node is removed.
@@ -845,6 +922,12 @@ impl Node {
     /// right after its step 3, leaving `rebootstrap.bin` and the reset store behind.
     pub fn crash_after_reset(&self) {
         self.inner.crash_after_reset.store(true, Ordering::SeqCst);
+    }
+
+    /// While `on`, a re-bootstrap waits in its step 3: the status is already
+    /// `Rebootstrapping`, the store not yet reset.
+    pub fn hold_rebootstrap_before_reset(&self, on: bool) {
+        self.inner.hold_before_reset.send_replace(on);
     }
 
     /// Whether this node's tasks were stopped (by `shutdown`, a drop or a test crash).

@@ -86,8 +86,15 @@ pub(crate) struct Shared {
     /// While true the deployer does not scan (a test hook; always present so the loop
     /// has one shape).
     pub paused: watch::Sender<bool>,
-    /// Serializes blob GC passes.
-    pub gc_lock: tokio::sync::Mutex<()>,
+    /// Blob GC holds the write side while it decides and removes; deploys hold the read
+    /// side from storing a blob until its manifest is written, so GC never removes a blob
+    /// a deploy is about to reference (this also serializes GC passes).
+    pub gc_lock: tokio::sync::RwLock<()>,
+    /// Test hook: while true, a GC pass that has chosen blobs to remove waits (holding the
+    /// lock) before re-checking and removing them.
+    pub gc_hold: watch::Sender<bool>,
+    /// Test hook: notified when a pass reaches that wait.
+    pub gc_reached: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -98,7 +105,9 @@ impl Shared {
             active: RwLock::default(),
             known: Mutex::default(),
             paused: watch::Sender::new(false),
-            gc_lock: tokio::sync::Mutex::new(()),
+            gc_lock: tokio::sync::RwLock::new(()),
+            gc_hold: watch::Sender::new(false),
+            gc_reached: tokio::sync::Notify::new(),
         }
     }
 

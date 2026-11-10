@@ -1,9 +1,16 @@
-//! Blob GC (spec §5.5): a service blob that no manifest and no active service references
+//! Blob GC (spec Â§5.5): a service blob that no manifest and no active service references
 //! is removed once it has been unreferenced for 24 hours.
 //!
 //! The first-unreferenced times live in `<data>/services/gc.json` and are measured with the
 //! node's wall clock. A pass never removes anything unless the node is `Running`: while it
 //! re-bootstraps or is removed, the manifests in `_mesh` may be incomplete.
+//!
+//! The GC considers every pinned blob on the node, not only service blobs: spec §5.5 says
+//! "a pinned hash". Anything pinned that no service references ages out after 24 hours.
+//!
+//! A pass holds the write side of `Shared::gc_lock`, which deploys hold (read side) from
+//! storing a blob until its manifest is written. Just before removing, it recomputes the
+//! referenced set, so a manifest that arrived from another node meanwhile also saves a blob.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -115,9 +122,16 @@ async fn referenced(shared: &Shared) -> Result<Option<BTreeSet<BlobHash>>, Servi
     Ok((node.status() == NodeStatus::Running).then_some(keep))
 }
 
+/// Where the test hook pauses a pass that has chosen blobs to remove.
+async fn hold_point(shared: &Shared) {
+    shared.gc_reached.notify_one();
+    let mut hold = shared.gc_hold.subscribe();
+    let _ = hold.wait_for(|on| !*on).await;
+}
+
 /// One GC pass.
 pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
-    let _one_at_a_time = shared.gc_lock.lock().await;
+    let _exclusive = shared.gc_lock.write().await;
     let Some(keep) = referenced(shared).await? else {
         info!("blob GC skipped: node is not running");
         return Ok(());
@@ -144,6 +158,15 @@ pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
         } else {
             next.first_unreferenced_ms.insert(key, first);
         }
+    }
+    if !doomed.is_empty() {
+        hold_point(shared).await;
+        // Manifests may have changed since `keep` was computed: look again before removing.
+        let Some(keep) = referenced(shared).await? else {
+            info!("blob GC skipped: node is not running");
+            return Ok(());
+        };
+        doomed.retain(|h| !keep.contains(h));
     }
     save_state(&path, &next)?;
     for hash in doomed {

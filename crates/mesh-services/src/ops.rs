@@ -136,6 +136,18 @@ impl Services {
         gc::run_once(&self.shared).await
     }
 
+    /// While `on`, a GC pass that has chosen blobs to remove waits before removing them.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_gc(&self, on: bool) {
+        self.shared.gc_hold.send_replace(on);
+    }
+
+    /// Resolves once a GC pass has reached the wait of [`Services::hold_gc`].
+    #[cfg(feature = "test-hooks")]
+    pub async fn gc_held(&self) {
+        self.shared.gc_reached.notified().await;
+    }
+
     /// The code cache's `(hits, misses)` since start.
     #[cfg(feature = "test-hooks")]
     pub fn cache_stats(&self) -> (u64, u64) {
@@ -166,6 +178,7 @@ impl Services {
                 }
                 e => ServicesError::Runtime(e),
             })?;
+        let _deploying = self.shared.gc_lock.read().await;
         let stored = self.node().blobs().add_bytes(wasm).await?;
         let kind = ServiceKind::Wasm {
             module: *stored.as_bytes(),
@@ -186,6 +199,7 @@ impl Services {
                 "static site root is not a directory",
             )));
         }
+        let _deploying = self.shared.gc_lock.read().await;
         let root = self.node().blobs().add_path(dir).await?;
         let kind = ServiceKind::Static {
             root: *root.as_bytes(),

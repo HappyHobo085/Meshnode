@@ -206,12 +206,104 @@ async fn hourly_task_removes_without_gc_now() {
     let v1 = t.deploy("web", "counter", 1).await;
     t.deploy("web", "echo", 2).await;
     // Let the task record v1, then jump past 24 h.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let recorded = v1.to_hex().to_string();
+    wait_until("v1 recorded in gc.json", T, || {
+        std::fs::read_to_string(t.gc_file()).is_ok_and(|s| s.contains(&recorded))
+    })
+    .await;
     t.clock.advance(25 * HOUR_MS);
     let deadline = tokio::time::Instant::now() + T;
     while t.pinned(v1).await {
         assert!(tokio::time::Instant::now() < deadline, "v1 never removed");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    t.shutdown().await;
+}
+
+/// Records v1 as unreferenced, moves to +24 h, and returns with a GC pass held between
+/// deciding to remove v1 and removing it.
+async fn held_at_boundary(t: &One) -> BlobHash {
+    let v1 = t.deploy("web", "counter", 1).await;
+    t.deploy("web", "echo", 2).await;
+    t.svc.gc_now().await.unwrap();
+    t.clock.advance(24 * HOUR_MS);
+    t.svc.hold_gc(true);
+    v1
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_does_not_remove_blob_redeployed_at_the_boundary() {
+    let t = one(None).await;
+    let v1 = held_at_boundary(&t).await;
+    {
+        let gc = t.svc.gc_now();
+        tokio::pin!(gc);
+        tokio::select! {
+            r = &mut gc => panic!("pass ended before the hold: {r:?}"),
+            () = t.svc.gc_held() => {}
+        }
+        // The redeploy of v1's bytes waits for the pass instead of racing its removal.
+        let redeploy = t.svc.deploy_wasm(
+            "web",
+            Bytes::from(fixture("counter")),
+            DeployOpts::default(),
+        );
+        tokio::pin!(redeploy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut redeploy)
+                .await
+                .is_err(),
+            "deploy must wait for the GC pass"
+        );
+        t.svc.hold_gc(false);
+        let (g, d) = tokio::join!(gc, redeploy);
+        g.unwrap();
+        assert_eq!(module_of(&d.unwrap()), v1);
+    }
+    t.ready("web", 3).await;
+    assert!(t.pinned(v1).await);
+    assert!(t.node.blobs().size(v1).await.unwrap().is_some());
+    let req = http::Request::get("http://web.mesh.localhost/")
+        .body(Bytes::new())
+        .unwrap();
+    assert_eq!(t.svc.handle("web", req).await.status(), 200);
+    t.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_rechecks_manifests_before_removing() {
+    let t = one(None).await;
+    let v1 = held_at_boundary(&t).await;
+    {
+        let gc = t.svc.gc_now();
+        tokio::pin!(gc);
+        tokio::select! {
+            r = &mut gc => panic!("pass ended before the hold: {r:?}"),
+            () = t.svc.gc_held() => {}
+        }
+        // A manifest for v1 arrives (as if replicated from another node) while the pass waits.
+        let m = ServiceManifest {
+            name: "other".into(),
+            kind: ServiceKind::Wasm {
+                module: *v1.as_bytes(),
+            },
+            version: 1,
+            limits: Default::default(),
+            placement: Placement::Tags(vec!["elsewhere".into()]),
+            outbound: vec![],
+        };
+        t.node
+            .store()
+            .set(
+                mesh_core::membership::MESH_NS,
+                "service/other",
+                mesh_proto::encode_raw(&m),
+            )
+            .await
+            .unwrap();
+        t.svc.hold_gc(false);
+        gc.await.unwrap();
+    }
+    assert!(t.pinned(v1).await);
     t.shutdown().await;
 }

@@ -185,7 +185,7 @@ One task, supervised and stopped by the node's cancel token.
 
 ### 5.4 Status
 
-`services() -> Vec<ServiceStatus>`, `ServiceStatus { manifest, generation, local: NotPlaced | Fetching | Ready { version } | Failed { error, retry_at }, placed_hosts: Vec<NodeId>, data_bytes: u64 }`. `data_bytes` comes from `namespace_sizes()` for the current namespace. An empty `placed_hosts` is a warning the UI shows.
+`services() -> Vec<ServiceStatus>`, `ServiceStatus { manifest, generation, local: NotPlaced | Fetching | Ready { version } | Failed { error, retry_at }, placed_hosts: Vec<NodeId>, data_bytes: u64 }`. `data_bytes` comes from `namespace_sizes()` for the current namespace, recomputed only on the periodic rescan (it reads the whole store); other scans report the last known value *(amended in final review)*. An empty `placed_hosts` is a warning the UI shows.
 
 ### 5.5 Blob GC (hourly)
 

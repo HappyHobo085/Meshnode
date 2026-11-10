@@ -248,6 +248,9 @@ struct Deployer {
     timings: DeployerTimings,
     tracks: HashMap<String, Track>,
     tasks: JoinSet<LoadDone>,
+    /// Bytes per namespace as of the last periodic rescan: computing them reads the whole
+    /// store, so the other wake-ups reuse these.
+    sizes: BTreeMap<String, u64>,
 }
 
 async fn run(shared: Arc<Shared>, timings: DeployerTimings, mut stop: watch::Receiver<bool>) {
@@ -263,14 +266,19 @@ async fn run(shared: Arc<Shared>, timings: DeployerTimings, mut stop: watch::Rec
         timings,
         tracks: HashMap::new(),
         tasks: JoinSet::new(),
+        sizes: BTreeMap::new(),
     };
     loop {
         let retry = d.next_retry();
         let mut scan = false;
+        let mut periodic = false;
         tokio::select! {
             _ = &mut cancelled => break,
             _ = stop.changed() => break,
-            _ = tick.tick() => scan = true,
+            _ = tick.tick() => {
+                scan = true;
+                periodic = true;
+            }
             _ = paused.changed() => scan = true,
             r = changes.recv() => match r {
                 Ok(ch) => scan = relevant(&ch),
@@ -307,7 +315,7 @@ async fn run(shared: Arc<Shared>, timings: DeployerTimings, mut stop: watch::Rec
             }
         }
         if scan && !*paused.borrow_and_update() {
-            d.scan().await;
+            d.scan(periodic).await;
         }
     }
     d.tracks.clear();
@@ -329,7 +337,14 @@ fn wakes(ev: &NodeEvent) -> bool {
 }
 
 impl Deployer {
-    async fn scan(&mut self) {
+    /// A full scan; `periodic` (the rescan tick) also recomputes the namespace sizes.
+    async fn scan(&mut self, periodic: bool) {
+        if periodic {
+            match self.shared.node.store().call(|r| r.namespace_sizes()).await {
+                Ok(sizes) => self.sizes = sizes,
+                Err(e) => warn!(error = %e, "cannot compute namespace sizes"),
+            }
+        }
         if let Err(e) = self.try_scan().await {
             warn!(error = %e, "service scan failed");
         }
@@ -362,7 +377,6 @@ impl Deployer {
         names.extend(self.shared.active_names());
         names.extend(self.tracks.keys().cloned());
 
-        let sizes = store.call(|r| r.namespace_sizes()).await?;
         let mut seen = Vec::with_capacity(names.len());
         for name in names {
             let manifest = match read_manifest(store, &name).await {
@@ -400,7 +414,11 @@ impl Deployer {
             if frozen && !placed {
                 continue;
             }
-            let data_bytes = sizes.get(&data_ns(&name, generation)).copied().unwrap_or(0);
+            let data_bytes = self
+                .sizes
+                .get(&data_ns(&name, generation))
+                .copied()
+                .unwrap_or(0);
             self.apply(&name, m, generation, placed, data_bytes);
         }
         Ok(())

@@ -16,7 +16,7 @@ pub struct ServiceStatus {
     pub local: LocalStatus,
     /// Effective hosts the placement selects; empty is a warning for the UI.
     pub placed_hosts: Vec<NodeId>,
-    /// Bytes in the current data namespace, as of the deployer's last scan.
+    /// Bytes in the current data namespace, as of the deployer's last periodic rescan.
     pub data_bytes: u64,
 }
 

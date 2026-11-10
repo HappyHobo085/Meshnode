@@ -256,6 +256,11 @@ async fn deploy_wasm_on_a_served_on_b() {
     assert_eq!(call(b, "counter", "/").await, (200, "2".into()));
     wait_kv(&n.nodes[0], "counter", "n", "2").await;
     assert_eq!(call(a, "counter", "/").await, (200, "3".into()));
+    // The data size comes with the periodic rescan.
+    wait_until("B reports the data size", T, || {
+        status(b, "counter").is_some_and(|s| s.data_bytes > 0)
+    })
+    .await;
     let st = status(b, "counter").unwrap();
     assert_eq!(st.generation, 0);
     let mut hosts = st.placed_hosts.clone();

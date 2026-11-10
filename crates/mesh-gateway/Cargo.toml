@@ -13,8 +13,15 @@ bytes.workspace = true
 http.workspace = true
 iroh.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
 tracing.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
 
 [features]
 # Test-only helpers: forward and serve counters.

@@ -156,11 +156,21 @@ fn deployer_timings() -> DeployerTimings {
 /// A founder (always a host) plus one node per further entry, each with its role and its
 /// way of serving `httpfwd`. Every node sees every other online before this returns.
 pub async fn mesh(nodes: Vec<(Role, Serve)>) -> Mesh {
+    mesh_named("n0", nodes).await
+}
+
+/// [`mesh`] with the founder's member name set to `founder`.
+pub async fn mesh_named(founder: &str, nodes: Vec<(Role, Serve)>) -> Mesh {
     assert_eq!(nodes[0].0, Role::Host, "the founder is a host");
     let mut built: Vec<(Node, Option<HttpFwdSlot>, bool, TempDir)> = Vec::new();
     for (i, (role, serve)) in nodes.into_iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = test_cfg(dir.path(), &format!("n{i}"));
+        let name = if i == 0 {
+            founder.to_string()
+        } else {
+            format!("n{i}")
+        };
+        let mut cfg = test_cfg(dir.path(), &name);
         let (handler, slot, attach): (Option<Arc<dyn DynProtocolHandler>>, _, _) = match serve {
             Serve::Attached => {
                 let (h, s) = HttpFwdHandler::new();

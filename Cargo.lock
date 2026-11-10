@@ -2262,7 +2262,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "hex",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "mesh-core",
  "mesh-gateway",
@@ -2270,9 +2274,12 @@ dependencies = [
  "mesh-proto",
  "mesh-runtime",
  "mesh-services",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

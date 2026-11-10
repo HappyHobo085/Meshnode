@@ -10,7 +10,8 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "test-hooks")]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -214,6 +215,9 @@ struct Host {
     /// The running daemon, for the other calls (set once a start completed, cleared when
     /// a stop begins). A wake holds a clone while it runs; [`stop`] waits for it.
     live: Mutex<Option<Arc<Daemon>>>,
+    /// The `stops` generation `live` was published under (read and written with the
+    /// `live` lock held): a different current generation means a stop has begun.
+    live_stops: AtomicU64,
     last_error: Mutex<Option<String>>,
     /// Bumped by every [`stop`]: a start asked for before a stop does not start after it,
     /// and `admin_logs` streams end.
@@ -250,6 +254,7 @@ fn host() -> &'static Host {
             .expect("cannot build the host runtime"),
         daemon: tokio::sync::Mutex::new(None),
         live: Mutex::new(None),
+        live_stops: AtomicU64::new(0),
         last_error: Mutex::new(None),
         stops: tokio::sync::watch::Sender::new(0),
         power: Mutex::new(None),
@@ -403,7 +408,9 @@ impl Host {
                 daemon.set_power(state);
                 *power = Some(state);
             }
-            *lock(&self.live) = Some(daemon.clone());
+            let mut live = lock(&self.live);
+            *live = Some(daemon.clone());
+            self.live_stops.store(stops, Ordering::SeqCst);
         }));
         if let Err(p) = published {
             *lock(&self.live) = None;
@@ -726,9 +733,16 @@ pub fn admin_logs(request: Vec<u8>, sink: Arc<dyn FfiLineSink>) {
     };
     let started = catch_unwind(AssertUnwindSafe(|| {
         let h = host();
-        let admin = match h.admin() {
-            Ok(a) => a,
-            Err(e) => return Err((ErrorCode::NotRunning, e.to_string())),
+        // Subscribe first, then check that no stop began since the daemon was published:
+        // a stop either happened before (refused here) or wakes `stopping` later.
+        let mut stopping = h.stops.subscribe();
+        let current = *stopping.borrow_and_update();
+        let admin = {
+            let live = lock(&h.live);
+            match live.as_ref() {
+                Some(d) if h.live_stops.load(Ordering::SeqCst) == current => d.in_process_admin(),
+                _ => return Err((ErrorCode::NotRunning, FfiError::NotRunning.to_string())),
+            }
         };
         let req: AdminRequest = match decode(&request) {
             Ok(r) => r,
@@ -738,7 +752,6 @@ pub fn admin_logs(request: Vec<u8>, sink: Arc<dyn FfiLineSink>) {
         };
         let sink = sink.clone();
         // A stop ends the stream (a `follow` would otherwise wait for its next line).
-        let mut stopping = h.stops.subscribe();
         h.rt.spawn(async move {
             let run = AssertUnwindSafe(async {
                 let mut lines = std::pin::pin!(admin.logs_tail(req));

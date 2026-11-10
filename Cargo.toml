@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/meshd"]
-exclude = ["spikes", "crates/mesh-runtime/tests/fixtures"]
+exclude = ["spikes", "crates/mesh-runtime/tests/fixtures", "patches"]
 
 [workspace.package]
 edition = "2024"
@@ -43,3 +43,9 @@ tracing-appender = "0.2"
 wat = "1"
 clap = { version = "4", features = ["derive"] }
 qrcode = { version = "0.14", default-features = false }
+
+# Patched copy: initialisation is idempotent and race-free, so tao and mesh-ffi can both set
+# the Android context (see patches/ndk-context/README.md). apps/android/src-tauri, its own
+# workspace, repeats this.
+[patch.crates-io]
+ndk-context = { path = "patches/ndk-context" }

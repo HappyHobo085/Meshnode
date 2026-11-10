@@ -106,6 +106,9 @@ pub(crate) struct CatchUp {
 
 impl CatchUp {
     const OFF: u64 = u64::MAX;
+    /// The shortest silence honoured: a shorter one (even zero) is raised to this, so
+    /// steady traffic cannot start a round on every message.
+    const MIN_AFTER: Duration = Duration::from_secs(1);
 
     pub fn new(wall: Arc<dyn WallClock>, after: Option<Duration>) -> CatchUp {
         let now = wall.now_ms();
@@ -118,9 +121,10 @@ impl CatchUp {
         c
     }
 
+    /// `Some(silence)` turns it on (clamped to at least [`CatchUp::MIN_AFTER`]), `None` off.
     pub fn set(&self, after: Option<Duration>) {
         let ms = after.map_or(Self::OFF, |d| {
-            u64::try_from(d.as_millis())
+            u64::try_from(d.max(Self::MIN_AFTER).as_millis())
                 .unwrap_or(Self::OFF)
                 .min(Self::OFF - 1)
         });
@@ -532,6 +536,8 @@ impl PeerManager {
         slot.lock().incoming.push(conn);
         slot.kick.notify_one();
         drop(st);
+        // Recorded only for connections taken (a refused or partitioned peer's redials
+        // returned above and do not reset the silence).
         if self.0.env.catch_up.traffic() {
             debug!("incoming connection after a long silence; catching up");
             self.start_round_all();
@@ -614,5 +620,59 @@ impl ProtocolHandler for SyncHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         self.0.accept(conn);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_hlc::ManualClock;
+
+    const T0: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn catch_up_fires_once_per_silence() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), Some(Duration::from_secs(60)));
+        assert!(!c.traffic(), "no silence yet");
+        clock.advance(59_999);
+        assert!(!c.traffic(), "silence too short");
+        clock.advance(60_000);
+        // A burst in the same silence: only the first event triggers.
+        assert!(c.traffic());
+        assert!(!c.traffic());
+        clock.advance(10);
+        assert!(!c.traffic());
+    }
+
+    #[test]
+    fn catch_up_ignores_a_wall_clock_stepping_back() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), Some(Duration::from_secs(60)));
+        clock.set(T0 - 3_600_000);
+        assert!(!c.traffic(), "a backwards step is no silence");
+        clock.set(0);
+        assert!(!c.traffic());
+        // Silence counts again from the stepped-back time.
+        clock.advance(60_000);
+        assert!(c.traffic());
+    }
+
+    #[test]
+    fn catch_up_off_and_clamped() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), None);
+        clock.advance(3_600_000);
+        assert!(!c.traffic(), "off");
+        // Zero is raised to one second: back-to-back traffic does not trigger.
+        c.set(Some(Duration::ZERO));
+        clock.advance(999);
+        assert!(!c.traffic());
+        clock.advance(1_000);
+        assert!(c.traffic());
+        // Toggling back off stops it.
+        c.set(None);
+        clock.advance(3_600_000);
+        assert!(!c.traffic());
     }
 }

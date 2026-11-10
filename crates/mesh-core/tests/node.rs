@@ -770,15 +770,30 @@ mod catch_up {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn wake_completes_rounds_with_connected_peers() {
         let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (a, b) = pair(da.path(), db.path(), true).await;
-        let a_id = a.node_id();
-        wait_until("connected", T, || async {
-            online(&a, b.node_id()) && online(&b, a_id)
-        })
-        .await;
+        // No periodic round and no catch-up: only `wake` can start one.
+        let (a, b, _) = quiet_pair(da.path(), db.path(), None).await;
         let out = timeout(T, b.wake(Duration::from_secs(10))).await.unwrap();
         assert_eq!(out.peers, 1, "{out:?}");
         assert_eq!(out.rounds_completed, 1, "{out:?}");
+        assert!(!out.timed_out, "{out:?}");
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_times_out_when_rounds_cannot_finish_in_time() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, _) = quiet_pair(da.path(), db.path(), None).await;
+        // No round is in progress (quiet timings) and none can cross the network in a
+        // zero limit, while the peer stays connected: wake must give up, not wait.
+        let out = timeout(Duration::from_secs(1), b.wake(Duration::ZERO))
+            .await
+            .expect("wake waited past its limit");
+        assert_eq!(out.peers, 1, "{out:?}");
+        assert_eq!(out.rounds_completed, 0, "{out:?}");
+        assert!(out.timed_out, "{out:?}");
+        // A huge limit does not overflow, and the round completes.
+        let out = timeout(T, b.wake(Duration::MAX)).await.unwrap();
         assert!(!out.timed_out, "{out:?}");
         timeout(T, b.shutdown()).await.unwrap();
         timeout(T, a.shutdown()).await.unwrap();

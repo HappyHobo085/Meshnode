@@ -82,7 +82,8 @@ pub struct WakeOutcome {
     pub peers: usize,
     /// Of those, the ones that completed a round before `wake` returned.
     pub rounds_completed: usize,
-    /// `limit` passed with some of them neither done nor disconnected.
+    /// `limit` passed (or the node shut down) with some of them neither done nor
+    /// disconnected.
     pub timed_out: bool,
 }
 
@@ -785,9 +786,16 @@ impl Node {
 
     /// Catches up after a sleep (Android): [`Node::network_change`], then
     /// [`Node::sync_now`], then waits until every peer connected at the call has completed
-    /// a round or disconnected, for at most `limit`.
+    /// a round or disconnected, for at most `limit`. A round already in progress at the
+    /// call counts once it completes; a peer that disconnects counts as done (not as a
+    /// round). `timed_out` is also true when the node is shut down with peers pending.
     pub async fn wake(&self, limit: Duration) -> WakeOutcome {
-        let deadline = Instant::now() + limit;
+        // A huge `limit` must not overflow: about 30 years is "forever".
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(limit)
+            .or_else(|| now.checked_add(Duration::from_secs(30 * 365 * 24 * 3600)))
+            .unwrap_or(now);
         // Subscribed before anything starts, so no completion is missed; the per-peer
         // round counters decide, the events only wake this loop (a lag loses nothing).
         let mut rx = self.inner.events.subscribe();

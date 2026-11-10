@@ -52,6 +52,32 @@ fn runtime(max_in_flight: usize) -> Runtime {
     .unwrap()
 }
 
+fn compact_runtime() -> Runtime {
+    Runtime::new(RuntimeConfig {
+        max_in_flight: 4,
+        compact_memory: true,
+        ..RuntimeConfig::default()
+    })
+    .unwrap()
+}
+
+fn budget_runtime(max_memory_mb: u32) -> Runtime {
+    Runtime::new(RuntimeConfig {
+        max_in_flight: 4,
+        max_memory_mb,
+        ..RuntimeConfig::default()
+    })
+    .unwrap()
+}
+
+fn memory(memory_mb: u32, request_timeout_ms: u64) -> Limits {
+    Limits {
+        memory_mb,
+        request_timeout_ms,
+        ..Limits::default()
+    }
+}
+
 async fn load(rt: &Runtime, name: &str, id: u8) -> Loaded {
     rt.load([id; 32], &fixture(name)).await.unwrap()
 }
@@ -248,7 +274,17 @@ async fn wall_timeout_during_host_call_gives_504_and_frees_slot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_cap_gives_500() {
-    let rt = runtime(4);
+    memory_cap_gives_500_with(runtime(4)).await;
+}
+
+/// The same cap and out-of-memory status with compact memories (small reservation and
+/// guard, movable on growth).
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_cap_gives_500_compact() {
+    memory_cap_gives_500_with(compact_runtime()).await;
+}
+
+async fn memory_cap_gives_500_with(rt: Runtime) {
     let hog = load(&rt, "hog", 1).await;
     let echo = load(&rt, "echo", 2).await;
     let limits = Limits {
@@ -507,4 +543,194 @@ async fn epoch_ticker_parks_when_idle() {
     let after = rt.epoch_ticks();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(rt.epoch_ticks(), after, "kept ticking once idle");
+}
+
+/// The defaults: a budget of half the machine's RAM, capped at 4 GiB; compact memories
+/// only on Android.
+#[test]
+fn memory_defaults() {
+    let budget = mesh_runtime::default_memory_budget_mb();
+    assert!((64..=4096).contains(&budget), "budget {budget} MiB");
+    let cfg = RuntimeConfig::default();
+    assert_eq!(cfg.max_memory_mb, budget);
+    assert_eq!(cfg.compact_memory, cfg!(target_os = "android"));
+}
+
+/// Waits until `rt` has created `n` more instances than `before`.
+async fn wait_instantiated(rt: &Runtime, before: u64, n: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.instantiations() < before + n {
+        assert!(Instant::now() < deadline, "never instantiated");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Two 48 MiB requests under a 64 MiB budget: the second waits for the first's
+/// reservation. It gets `503 Memory budget exhausted` when the first holds it past the
+/// second's timeout, and is served when the first finishes in time.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_budget_waits_then_503() {
+    let rt = Arc::new(budget_runtime(64));
+    let counter = load(&rt, "counter", 1).await;
+    let echo = load(&rt, "echo", 2).await;
+
+    // The holder keeps its 48 MiB until its 1.5 s deadline.
+    let before = rt.instantiations();
+    let holder = tokio::spawn({
+        let (rt, counter) = (rt.clone(), counter.clone());
+        async move {
+            serve_within(
+                &rt,
+                &counter,
+                get("/"),
+                ctx_with_kv(memory(48, 1_500), Arc::new(StalledKv)),
+                Duration::from_secs(20),
+            )
+            .await
+        }
+    });
+    wait_instantiated(&rt, before, 1).await;
+
+    let start = Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.handle(&echo, get("/?size=3"), ctx(memory(48, 300))),
+    )
+    .await
+    .expect("no response");
+    let took = start.elapsed();
+    assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.body().as_ref(), b"Memory budget exhausted");
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(1_400),
+        "503 after {took:?}"
+    );
+    assert_eq!(
+        rt.instantiations(),
+        before + 1,
+        "the waiting request was instantiated"
+    );
+    assert_eq!(holder.await.unwrap().0, http::StatusCode::GATEWAY_TIMEOUT);
+
+    // Now the holder finishes (at its 400 ms deadline) within the second's 5 s.
+    let before = rt.instantiations();
+    let holder = tokio::spawn({
+        let rt = rt.clone();
+        async move {
+            serve_within(
+                &rt,
+                &counter,
+                get("/"),
+                ctx_with_kv(memory(48, 400), Arc::new(StalledKv)),
+                Duration::from_secs(20),
+            )
+            .await
+        }
+    });
+    wait_instantiated(&rt, before, 1).await;
+    let start = Instant::now();
+    let (status, took) = serve_within(
+        &rt,
+        &echo,
+        get("/?size=3"),
+        ctx(memory(48, 5_000)),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert!(took >= Duration::from_millis(200), "did not wait: {took:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(holder.await.unwrap().0, http::StatusCode::GATEWAY_TIMEOUT);
+}
+
+/// A request reserving more than the whole budget is refused at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_larger_than_budget_503() {
+    let rt = budget_runtime(64);
+    let echo = load(&rt, "echo", 1).await;
+    let before = rt.instantiations();
+
+    let start = Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.handle(&echo, get("/?size=3"), ctx(memory(65, 5_000))),
+    )
+    .await
+    .expect("no response");
+    assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.body().as_ref(), b"Memory budget exhausted");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(rt.instantiations(), before);
+
+    // Exactly the whole budget is served.
+    let (status, _) = serve_within(
+        &rt,
+        &echo,
+        get("/?size=3"),
+        ctx(memory(64, 5_000)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+}
+
+/// An engine with compact memories builds and serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_memory_engine_serves() {
+    let rt = compact_runtime();
+    let echo = load(&rt, "echo", 1).await;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.handle(&echo, get("/?size=100000"), ctx(Limits::default())),
+    )
+    .await
+    .expect("no response");
+    assert_eq!(resp.status(), http::StatusCode::OK);
+    assert_eq!(resp.body().len(), 100_000);
+}
+
+/// [`Runtime::acquire_slot`] takes a slot from the same in-flight semaphore as WASM
+/// requests, waiting at most until its deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn acquire_slot_shares_in_flight_cap() {
+    let rt = runtime(1);
+    let slot = rt
+        .acquire_slot(Instant::now() + Duration::from_millis(100))
+        .await
+        .expect("a free slot");
+    let start = Instant::now();
+    assert!(
+        rt.acquire_slot(Instant::now() + Duration::from_millis(200))
+            .await
+            .is_none()
+    );
+    assert!(start.elapsed() >= Duration::from_millis(150));
+    let echo = load(&rt, "echo", 1).await;
+    let (status, _) = serve_within(
+        &rt,
+        &echo,
+        get("/?size=3"),
+        ctx(timeout_ms(300)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT);
+    drop(slot);
+    let (status, _) = serve_within(
+        &rt,
+        &echo,
+        get("/?size=3"),
+        ctx(timeout_ms(2_000)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
 }

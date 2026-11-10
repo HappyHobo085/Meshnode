@@ -33,6 +33,12 @@ pub enum NodeError {
     JoinRefused(RefuseReason),
     #[error("inviter unreachable")]
     InviterUnreachable,
+    #[error("extra protocol {0}")]
+    ProtocolConflict(String),
+    #[error("cannot connect to this node itself")]
+    ConnectToSelf,
+    #[error("node is shutting down")]
+    ShuttingDown,
     #[error("blob unavailable from every peer")]
     BlobUnavailable,
 }

@@ -25,7 +25,11 @@ pub struct ServicesConfig {
     /// `<data>/services/cache`, memory-mapped on desktop and read into memory on Android;
     /// `Some(CodeCache::None)` turns the cache off.
     pub cache: Option<CodeCache>,
+    /// WASM and static-site requests served at once.
     pub max_in_flight: usize,
+    /// The node-wide memory budget for WASM requests, in MiB. `None` (the default) is
+    /// [`mesh_runtime::default_memory_budget_mb`].
+    pub max_memory_mb: Option<u32>,
 }
 
 impl Default for ServicesConfig {
@@ -33,6 +37,7 @@ impl Default for ServicesConfig {
         ServicesConfig {
             cache: None,
             max_in_flight: RuntimeConfig::default().max_in_flight,
+            max_memory_mb: None,
         }
     }
 }
@@ -101,9 +106,12 @@ impl Services {
         let cache = cfg
             .cache
             .unwrap_or_else(|| default_cache(handle.data_dir()));
+        let defaults = RuntimeConfig::default();
         let runtime = Runtime::new(RuntimeConfig {
             cache,
             max_in_flight: cfg.max_in_flight,
+            max_memory_mb: cfg.max_memory_mb.unwrap_or(defaults.max_memory_mb),
+            ..defaults
         })
         .map_err(ServicesError::Runtime)?;
         let shared = Arc::new(Shared::new(handle, runtime));
@@ -178,6 +186,12 @@ impl Services {
     #[cfg(feature = "test-hooks")]
     pub fn cache_stats(&self) -> (u64, u64) {
         self.shared.runtime.cache_stats()
+    }
+
+    /// How many WASM instances the runtime has created.
+    #[cfg(feature = "test-hooks")]
+    pub fn instantiations(&self) -> u64 {
+        self.shared.runtime.instantiations()
     }
 
     fn node(&self) -> &NodeHandle {

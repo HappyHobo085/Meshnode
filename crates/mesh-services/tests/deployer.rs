@@ -11,11 +11,11 @@ use common::{T, fixture, test_cfg, wait_until};
 use mesh_core::membership::MESH_NS;
 use mesh_core::{Node, NodeEvent, NodeStatus};
 use mesh_hlc::ManualClock;
-use mesh_proto::{NodeId, Placement, Role, ServiceKind, ServiceManifest};
+use mesh_proto::{Limits, NodeId, Placement, Role, ServiceKind, ServiceManifest};
 use mesh_runtime::{CodeCache, Runtime, RuntimeConfig};
 use mesh_services::{
-    DeployOpts, DeployerTimings, LocalStatus, ServiceStatus, Services, ServicesConfig, data_ns,
-    placed, placed_hosts,
+    DeployOpts, DeployerTimings, LocalState, LocalStatus, ServiceStatus, Services, ServicesConfig,
+    data_ns, manifest_key, placed, placed_hosts,
 };
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
@@ -57,7 +57,7 @@ async fn warm_cache() -> CodeCache {
             ..RuntimeConfig::default()
         })
         .unwrap();
-        for name in ["counter", "echo"] {
+        for name in ["counter", "echo", "spin"] {
             let wasm = fixture(name);
             rt.load(*blake3::hash(&wasm).as_bytes(), &wasm)
                 .await
@@ -630,16 +630,41 @@ async fn full_sync_since(node: &Node, ms: u64) {
     .await;
 }
 
-/// While its node re-bootstraps (store emptied, `_mesh` refilling), a node's services
-/// answer 503 and the deployer keeps every active service; afterwards they serve again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rebootstrap_freezes_services() {
-    let clock = ManualClock::new(
+fn wall_now() -> ManualClock {
+    ManualClock::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
-    );
+    )
+}
+
+/// In a net of founder X, A (index 1) and C (index 2) on `clock`: cuts A off and moves the
+/// clock past A's 80-day staleness while X and C keep syncing, so A re-bootstraps on its
+/// next contact. A stays cut off.
+async fn make_a_stale(n: &Net, clock: &ManualClock) {
+    let (x, a, c) = (&n.nodes[0], &n.nodes[1], &n.nodes[2]);
+    let (ix, ia, ic) = (n.id(0), n.id(1), n.id(2));
+    a.partition(&[ix, ic]);
+    x.partition(&[ia]);
+    c.partition(&[ia]);
+    wait_until("A cut off", T, || {
+        !online(a, ix) && !online(a, ic) && !online(x, ia) && !online(c, ia)
+    })
+    .await;
+    let day0 = mesh_hlc::WallClock::now_ms(clock);
+    for day in [50, 81] {
+        clock.set(day0 + day * DAY_MS);
+        full_sync_since(x, day0 + day * DAY_MS).await;
+        full_sync_since(c, day0 + day * DAY_MS).await;
+    }
+}
+
+/// While its node re-bootstraps (store emptied, `_mesh` refilling), a node's services
+/// answer 503 and the deployer keeps every active service; afterwards they serve again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebootstrap_freezes_services() {
+    let clock = wall_now();
     // Founder X, hosts A (index 1, the node that goes stale) and C (index 2).
     let n = net_on(Some(&clock), &[], &[(Role::Host, &[]), (Role::Host, &[])]).await;
     let (x, a, c) = (&n.nodes[0], &n.nodes[1], &n.nodes[2]);
@@ -652,22 +677,8 @@ async fn rebootstrap_freezes_services() {
         wait_ready(s, "counter", 1).await;
     }
     assert_eq!(call(svc_a, "counter", "/").await.0, 200);
-
-    // A is cut off; X and C keep syncing while the clock moves past A's 80-day staleness.
     let (ix, ia, ic) = (n.id(0), n.id(1), n.id(2));
-    a.partition(&[ix, ic]);
-    x.partition(&[ia]);
-    c.partition(&[ia]);
-    wait_until("A cut off", T, || {
-        !online(a, ix) && !online(a, ic) && !online(x, ia) && !online(c, ia)
-    })
-    .await;
-    let day0 = mesh_hlc::WallClock::now_ms(&clock);
-    for day in [50, 81] {
-        clock.set(day0 + day * DAY_MS);
-        full_sync_since(x, day0 + day * DAY_MS).await;
-        full_sync_since(c, day0 + day * DAY_MS).await;
-    }
+    make_a_stale(&n, &clock).await;
 
     // On contact A re-bootstraps. It is held before its reset while it is cut off again,
     // so its store stays empty: nothing can refill `_mesh`.
@@ -733,4 +744,162 @@ async fn rebootstrap_freezes_services() {
         Some(LocalStatus::Ready { version: 1 })
     );
     n.shutdown().await;
+}
+
+/// `local_state` and what `handle` answers, for one service on one node.
+async fn state_and_answer(svc: &Services, name: &str) -> (LocalState, u16, String) {
+    let state = svc.local_state(name).await;
+    let (code, body) = call(svc, name, "/?size=1").await;
+    (state, code, body)
+}
+
+/// `local_state` reports every state, each matching what `handle` answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_state_reports_each_state() {
+    let clock = wall_now();
+    // Founder X, hosts A (index 1) and C (index 2).
+    let n = net_on(Some(&clock), &[], &[(Role::Host, &[]), (Role::Host, &[])]).await;
+    let (sx, sa) = (&n.svcs[0], &n.svcs[1]);
+
+    assert_eq!(
+        state_and_answer(sa, "nope").await,
+        (LocalState::NotDeployed, 404, NOT_DEPLOYED.into())
+    );
+
+    // Placed on X only: active there, not placed on A.
+    sx.deploy_wasm("web", wasm("echo"), opts(Placement::Nodes(vec![n.id(0)])))
+        .await
+        .unwrap();
+    wait_ready(sx, "web", 1).await;
+    wait_not_placed(sa, "web").await;
+    assert_eq!(
+        state_and_answer(sx, "web").await,
+        (LocalState::Active, 200, "a".into())
+    );
+    assert_eq!(
+        state_and_answer(sa, "web").await,
+        (LocalState::NotPlaced, 503, NOT_PLACED.into())
+    );
+
+    // Placed on A, but A's deployer is paused: the manifest is there, nothing is loaded.
+    sa.pause_deployer(true).await;
+    sx.deploy_wasm("late", wasm("echo"), DeployOpts::default())
+        .await
+        .unwrap();
+    wait_for("A has the manifest of late", || async {
+        n.nodes[1]
+            .store()
+            .get(MESH_NS, &manifest_key("late"))
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    assert_eq!(
+        state_and_answer(sa, "late").await,
+        (LocalState::NotReady, 503, NOT_REPLICATED.into())
+    );
+    sa.pause_deployer(false).await;
+    wait_ready(sa, "late", 1).await;
+    assert_eq!(
+        state_and_answer(sa, "late").await,
+        (LocalState::Active, 200, "a".into())
+    );
+
+    // A goes stale and starts to re-bootstrap; it is held before its store reset.
+    let a = &n.nodes[1];
+    make_a_stale(&n, &clock).await;
+    a.hold_rebootstrap_before_reset(true);
+    for node in &n.nodes {
+        node.heal();
+    }
+    wait_until("A re-bootstrapping", T, || {
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    for name in ["late", "web", "nope"] {
+        assert_eq!(
+            state_and_answer(sa, name).await,
+            (LocalState::Frozen, 503, REBOOTSTRAPPING.into()),
+            "{name}"
+        );
+    }
+    a.hold_rebootstrap_before_reset(false);
+    n.shutdown().await;
+}
+
+/// Starts a `spin` request that holds `svc`'s only slot for its 1.5 s timeout; returns
+/// once it runs.
+async fn hold_slot(svc: &std::sync::Arc<Services>) -> tokio::task::JoinHandle<u16> {
+    let before = svc.instantiations();
+    let spin = tokio::spawn({
+        let svc = svc.clone();
+        async move { call(&svc, "spin", "/").await.0 }
+    });
+    wait_until("spin running", T, || svc.instantiations() > before).await;
+    spin
+}
+
+/// Static-site requests take an in-flight slot: with one slot, held by a spinning WASM
+/// request, a static request waits; it times out per its own deadline, or is served once
+/// the slot is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_counts_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::create_mesh(test_cfg(dir.path(), "n0")).await.unwrap();
+    let cfg = ServicesConfig {
+        cache: Some(warm_cache().await),
+        max_in_flight: 1,
+        ..ServicesConfig::default()
+    };
+    let svc = Services::start_with_timings(&node, cfg, timings())
+        .await
+        .unwrap();
+    let limits = |request_timeout_ms| DeployOpts {
+        limits: Limits {
+            request_timeout_ms,
+            ..Limits::default()
+        },
+        ..DeployOpts::default()
+    };
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("index.html"), b"<h1>hi</h1>").unwrap();
+    svc.deploy_wasm("spin", wasm("spin"), limits(1_500))
+        .await
+        .unwrap();
+    svc.deploy_static("quick", site.path(), limits(300))
+        .await
+        .unwrap();
+    svc.deploy_static("patient", site.path(), limits(10_000))
+        .await
+        .unwrap();
+    for name in ["spin", "quick", "patient"] {
+        wait_ready(&svc, name, 1).await;
+    }
+    assert_eq!(call(&svc, "quick", "/").await, (200, "<h1>hi</h1>".into()));
+    let svc = std::sync::Arc::new(svc);
+
+    let spin = hold_slot(&svc).await;
+    let start = Instant::now();
+    let (code, _) = call(&svc, "quick", "/").await;
+    let took = start.elapsed();
+    assert_eq!(code, 504);
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(1_200),
+        "504 after {took:?}"
+    );
+    assert_eq!(spin.await.unwrap(), 504);
+
+    let spin = hold_slot(&svc).await;
+    let start = Instant::now();
+    assert_eq!(
+        call(&svc, "patient", "/").await,
+        (200, "<h1>hi</h1>".into())
+    );
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(500), "did not wait: {took:?}");
+    assert_eq!(spin.await.unwrap(), 504);
+
+    std::sync::Arc::into_inner(svc).unwrap().shutdown().await;
+    node.shutdown().await;
 }

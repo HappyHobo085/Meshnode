@@ -8,6 +8,7 @@ mod handle;
 mod host;
 mod kv;
 mod outbound;
+mod ram;
 mod stdio;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_fixtures;
@@ -17,10 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use bytes::Bytes;
 use mesh_proto::{Limits, NodeId};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wasmtime::Engine;
 use wasmtime::component::Linker;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
@@ -29,6 +31,7 @@ pub use error::RuntimeError;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use kv::MemKv;
 pub use kv::{KvBackend, KvError};
+pub use ram::default_memory_budget_mb;
 
 use cache::Cache;
 use engine::EpochTicker;
@@ -42,6 +45,13 @@ pub struct RuntimeConfig {
     /// Requests served at once by this node (at least 1); further requests wait, and the
     /// wait counts against their timeout.
     pub max_in_flight: usize,
+    /// The node-wide memory budget in MiB (at least 1): every WASM request reserves its
+    /// `limits.memory_mb` from it before instantiation. Default:
+    /// [`default_memory_budget_mb`].
+    pub max_memory_mb: u32,
+    /// Small, movable linear memories instead of a 4 GiB address-space reservation each
+    /// (see `engine::new_engine`). Default: on Android only.
+    pub compact_memory: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -49,8 +59,17 @@ impl Default for RuntimeConfig {
         RuntimeConfig {
             cache: CodeCache::None,
             max_in_flight: 64,
+            max_memory_mb: default_memory_budget_mb(),
+            compact_memory: cfg!(target_os = "android"),
         }
     }
+}
+
+/// One of the runtime's in-flight slots, held by work served outside WASM (static sites);
+/// released when dropped.
+#[derive(Debug)]
+pub struct SlotGuard {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Where compiled components are cached between runs.
@@ -102,8 +121,10 @@ impl Runtime {
         let RuntimeConfig {
             cache,
             max_in_flight,
+            max_memory_mb,
+            compact_memory,
         } = config;
-        let engine = engine::new_engine()?;
+        let engine = engine::new_engine(compact_memory)?;
         let linker = host::world_linker(&engine)?;
         let ticker = EpochTicker::start(&engine)?;
         let cache = Arc::new(Cache::new(cache, &engine));
@@ -111,6 +132,8 @@ impl Runtime {
             in_flight: Arc::new(Semaphore::new(
                 max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
             )),
+            max_memory_mb: max_memory_mb.max(1),
+            memory: Arc::new(Semaphore::new(max_memory_mb.max(1) as usize)),
             instantiations: Arc::default(),
             ticker: ticker.handle(),
         };
@@ -151,6 +174,18 @@ impl Runtime {
         ctx: RequestCtx,
     ) -> http::Response<Bytes> {
         handle::serve(&svc.pre, &self.shared, req, ctx).await
+    }
+
+    /// Takes an in-flight slot, waiting at most until `deadline`; `None` if none freed up
+    /// by then. For requests served without WASM, which count against `max_in_flight`
+    /// like WASM requests do.
+    pub async fn acquire_slot(&self, deadline: Instant) -> Option<SlotGuard> {
+        let acquire = self.shared.in_flight.clone().acquire_owned();
+        match tokio::time::timeout_at(deadline.into(), acquire).await {
+            Ok(Ok(permit)) => Some(SlotGuard { _permit: permit }),
+            // The semaphore is never closed; a timeout is the only real outcome here.
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
     /// Code cache `(hits, misses)` since this runtime was created.

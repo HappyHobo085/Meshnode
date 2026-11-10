@@ -20,18 +20,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use iroh::Endpoint;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::{Endpoint, EndpointAddr};
 use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::Timings;
 use crate::db::StoreHandle;
+use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::membership::MeshAcceptor;
 use crate::node::{NodeStatus, supervise};
@@ -39,7 +40,7 @@ use slot::run_slot;
 
 mod slot;
 use crate::sync::{PeerMetrics, SessionCmd};
-use crate::transport::{Provisional, SHUTDOWN, node_id_of};
+use crate::transport::{Provisional, SHUTDOWN, addr_from_bytes, endpoint_id_of, node_id_of};
 
 /// Upper bound on one dial attempt.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -167,6 +168,25 @@ struct SlotState {
     /// The application close code the peer gave when the last session ended, if any.
     #[cfg(any(test, feature = "test-hooks"))]
     peer_close: Option<u64>,
+}
+
+/// The address to dial `peer` at, built from the known address records. Without any, the
+/// target is still dialled when discovery can resolve it.
+fn dial_target(
+    peer: NodeId,
+    records: impl IntoIterator<Item = Option<NodeAddrBytes>>,
+    discovery: bool,
+) -> Option<EndpointAddr> {
+    let id = endpoint_id_of(&peer).ok()?;
+    let mut target = EndpointAddr::new(id);
+    for bytes in records.into_iter().flatten() {
+        match addr_from_bytes(&bytes) {
+            Ok(a) if a.id == id => target.addrs.extend(a.addrs),
+            Ok(_) => warn!(peer = %peer.short(), "address for another node ignored"),
+            Err(e) => debug!(peer = %peer.short(), error = %e, "bad address ignored"),
+        }
+    }
+    (!target.addrs.is_empty() || discovery).then_some(target)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -315,6 +335,34 @@ impl PeerManager {
             s.reset_backoff = true;
             drop(s);
             slot.kick.notify_one();
+        }
+    }
+
+    /// Dials `id` on `alpn` with the address knowledge the slots use, within the dial
+    /// timeout. The connection is the caller's; it does not touch the `sync/1` slot.
+    pub(crate) async fn connect(&self, id: NodeId, alpn: &[u8]) -> Result<Connection, NodeError> {
+        let (addr, hint) = {
+            let st = self.lock();
+            if st.stopped || self.0.cancel.is_cancelled() {
+                return Err(NodeError::ShuttingDown);
+            }
+            match st.slots.get(&id) {
+                Some(slot) => {
+                    let s = slot.lock();
+                    (
+                        s.addr.clone(),
+                        s.hint.clone().or_else(|| st.hints.get(&id).cloned()),
+                    )
+                }
+                None => (None, st.hints.get(&id).cloned()),
+            }
+        };
+        let target = dial_target(id, [addr, hint], self.0.env.discovery)
+            .ok_or_else(|| NodeError::Iroh("no known address for peer".into()))?;
+        match timeout(DIAL_TIMEOUT, self.0.env.endpoint.connect(target, alpn)).await {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(e)) => Err(NodeError::Iroh(e.to_string())),
+            Err(_) => Err(NodeError::Iroh("dial timed out".into())),
         }
     }
 

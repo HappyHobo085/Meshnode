@@ -1,0 +1,62 @@
+[package]
+name = "meshd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "meshd"
+path = "src/main.rs"
+
+[dependencies]
+mesh-admin = { path = "../../crates/mesh-admin" }
+mesh-core = { path = "../../crates/mesh-core" }
+mesh-gateway = { path = "../../crates/mesh-gateway" }
+mesh-proto = { path = "../../crates/mesh-proto" }
+mesh-services = { path = "../../crates/mesh-services" }
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex.workspace = true
+qrcode.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_EventLog",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[features]
+# Test-only helpers: `Daemon::start_with` (fast node timings, loopback binding, quick
+# deployer rescans).
+test-hooks = ["mesh-core/test-hooks", "mesh-services/test-hooks"]
+
+[dev-dependencies]
+meshd = { path = ".", features = ["test-hooks"] }
+mesh-runtime = { path = "../../crates/mesh-runtime", features = ["test-hooks"] }
+tempfile.workspace = true

@@ -34,7 +34,9 @@ use crate::membership::{
 };
 use crate::peers::{PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
-use crate::transport::{ALPN_JOIN, ALPN_SYNC, Gate, addr_to_bytes, build_endpoint};
+use crate::transport::{
+    ALPN_JOIN, ALPN_SYNC, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
+};
 
 const STORE_FILE: &str = "store.redb";
 const EVENT_CAPACITY: usize = 1024;
@@ -85,6 +87,7 @@ pub(crate) struct Inner {
     pub(crate) me: NodeId,
     pub(crate) endpoint: Endpoint,
     router: Router,
+    extra_conns: Arc<ExtraConns>,
     blobs: Blobs,
     pub(crate) store: StoreHandle,
     pub(crate) acc: Arc<MeshAcceptor>,
@@ -189,6 +192,27 @@ impl NodeHandle {
         &self.inner.cfg.data_dir
     }
 
+    /// Dials an effective member on `alpn` with the node's endpoint and the addresses the
+    /// peer manager knows (published record, hints, discovery). The peer's gate decides
+    /// whether it serves the protocol.
+    pub async fn connect(
+        &self,
+        peer: NodeId,
+        alpn: &[u8],
+    ) -> Result<iroh::endpoint::Connection, NodeError> {
+        if peer == self.inner.me {
+            return Err(NodeError::ConnectToSelf);
+        }
+        let snap = self.inner.membership.borrow().clone();
+        if !snap.is_effective(&peer) {
+            return Err(NodeError::NotEffective);
+        }
+        let conn = self.inner.peers.connect(peer, alpn).await?;
+        // Closed with `REMOVED` if the peer stops being effective.
+        self.inner.extra_conns.track(conn.clone());
+        Ok(conn)
+    }
+
     /// The node's wall clock, in ms since the Unix epoch.
     pub fn now_ms(&self) -> u64 {
         self.inner.cfg.wall.now_ms()
@@ -229,6 +253,22 @@ impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Extra protocols must not replace a built-in one or each other (iroh's `Router` keeps
+/// only the last handler per ALPN).
+fn check_extra_protocols(cfg: &NodeConfig) -> Result<(), NodeError> {
+    let mut seen: Vec<&[u8]> = vec![ALPN_SYNC, ALPN_JOIN, iroh_blobs::ALPN];
+    for (alpn, _) in &cfg.extra_protocols {
+        if seen.contains(&alpn.as_slice()) {
+            return Err(NodeError::ProtocolConflict(format!(
+                "ALPN {:?} is already taken",
+                String::from_utf8_lossy(alpn)
+            )));
+        }
+        seen.push(alpn);
+    }
+    Ok(())
 }
 
 /// Runs the task built by `make` and restarts it with backoff if it panics (spec §10).
@@ -398,6 +438,7 @@ pub(crate) async fn start(
         let _ = events.send(NodeEvent::ClockFloorAhead { ms });
     }
 
+    check_extra_protocols(&cfg)?;
     let endpoint = build_endpoint(&cfg, &key).await?;
     let peers = PeerManager::new(
         PeerEnv {
@@ -439,7 +480,7 @@ pub(crate) async fn start(
         cfg.timings.blob_gc_tick,
     )
     .await?;
-    let router = Router::builder(endpoint.clone())
+    let mut router = Router::builder(endpoint.clone())
         .accept(
             ALPN_SYNC,
             Gate::new(SyncHandler(peers.clone()), membership_rx.clone())
@@ -450,8 +491,16 @@ pub(crate) async fn start(
             Gate::new(blobs.protocol(), membership_rx.clone()),
         )
         // Not gated: a joiner is not a member yet.
-        .accept(ALPN_JOIN, JoinHandler(join.clone()))
-        .spawn();
+        .accept(ALPN_JOIN, JoinHandler(join.clone()));
+    let extra_conns = ExtraConns::new(membership_rx.clone());
+    for (alpn, handler) in &cfg.extra_protocols {
+        let extra = Extra {
+            handler: handler.clone(),
+            conns: extra_conns.clone(),
+        };
+        router = router.accept(alpn.clone(), Gate::new(extra, membership_rx.clone()));
+    }
+    let router = router.spawn();
 
     if let Err(e) = publish_addr(&store, me, &endpoint.addr()).await {
         warn!(error = %e, "could not publish own address");
@@ -491,6 +540,7 @@ pub(crate) async fn start(
     tasks.spawn(supervise("addr", cancel.clone(), t.clone(), move || {
         publish_addrs(ep.clone(), st.clone(), me, c.clone())
     }));
+    tasks.spawn(extra_conns.clone().watch(cancel.clone()));
     let first_sync_flag = Arc::new(watch::channel(false).0);
     let fsf = first_sync_flag.clone();
     let (ev, done, pm, fl, c) = (
@@ -519,6 +569,7 @@ pub(crate) async fn start(
         me,
         endpoint,
         router,
+        extra_conns,
         blobs,
         store,
         acc,

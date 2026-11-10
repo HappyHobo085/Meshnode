@@ -78,14 +78,14 @@ Run on **one desktop node (Linux or Windows) and one Android phone**, on differe
 | `crates/mesh-hlc` | Hybrid logical clock. Pure, no I/O. | — |
 | `crates/mesh-store` | Replicated store: ordered LWW registers + grow-only sets on `redb`; merge function; per-origin op log; tombstone GC | `mesh-hlc` |
 | `crates/mesh-proto` | Wire types for every ALPN (serde + postcard), invite tickets, signatures | `mesh-hlc` |
-| `crates/mesh-core` | `Node`: transport, membership, replicator, blob fetch; stores and replicates member tags. The deployer and placement live in `mesh-services` *(back-ported from sub-spec 3)* | store, proto, `iroh`, `iroh-blobs` |
+| `crates/mesh-core` | `Node`: transport, membership, replicator, blob fetch; stores and replicates member tags; extra gated protocols (`NodeConfig.extra_protocols`, registered on the `Router` behind the membership `Gate`) and `NodeHandle::connect(peer, alpn)`, so it stays HTTP-agnostic *(back-ported from sub-spec 4)*. The deployer and placement live in `mesh-services` *(back-ported from sub-spec 3)* | store, proto, `iroh`, `iroh-blobs` |
 | `crates/mesh-runtime` | Pure wasmtime host with no `mesh-core` or `mesh-store` dependency: the `wasi:http` incoming handler, `meshnode:kv` (through a trait the embedder implements), the outgoing-HTTP allowlist, limits *(back-ported from sub-spec 3)* | `mesh-proto`, `wasmtime`, `wasmtime-wasi-http` *(`mesh-proto` amended in final review)* |
 | `crates/mesh-services` | Manifests, deploy/undeploy/purge, placement, the deployer, static sites, service blob GC; service KV writes go through `mesh-core`'s gated `StoreHandle` *(back-ported from sub-spec 3)* | core, runtime |
-| `crates/mesh-gateway` | localhost HTTP server, Host and port routing, forwarding to a peer; serves through `mesh-services` | core, services |
-| `crates/mesh-admin` | Admin API: request/response types plus two transports (local socket, in-process channel) | core |
+| `crates/mesh-gateway` | localhost HTTP server, Host and port routing, `httpfwd` forwarding to a peer; serves through `mesh-services` | core, services, proto |
+| `crates/mesh-admin` | Admin API: request/response types plus two transports (local socket, in-process channel) | core, proto *(not `mesh-services`: amended in final review)* |
 | `crates/mesh-client` | Embeddable client: become a client-role member, send HTTP to services over iroh | proto, `iroh` |
 | `crates/mesh-ffi` | UniFFI bindings exposing `Node` start/stop/status + admin calls to Kotlin | core, gateway, admin |
-| `apps/meshd` | Desktop daemon + CLI; Windows-service / launchd / systemd integration | core, gateway, admin |
+| `apps/meshd` | Desktop daemon + CLI; Windows-service / launchd / systemd integration | core, services, gateway, admin |
 | `apps/ui` | Tauri 2 management UI (desktop + Android) | admin |
 | `apps/android` | The Android Tauri project + Kotlin foreground service, boot receiver, notification | `mesh-ffi`, `apps/ui` |
 | `services/aegis-sync` | The Aegis sync-server as a Meshnode WASM component (§11) | `aegis-sync-core` (from the Aegis repo) |
@@ -102,7 +102,7 @@ Each crate is testable on its own. `mesh-hlc`, `mesh-store` and `mesh-proto` hav
 - All peer traffic is iroh QUIC with these ALPNs, each versioned:
   - `meshnode/join/1`: redeem an invite ticket
   - `meshnode/sync/1`: catch-up (version-vector exchange + missing ops)
-  - `meshnode/http/1`: forward an HTTP request to a node that hosts the service
+  - `meshnode/httpfwd/1`: forward an HTTP request to a node that hosts the service
   - iroh-blobs' ALPN: fetch module and site content by BLAKE3 hash
   - There is no gossip protocol: live replication runs over the per-peer `sync/1` sessions (a direct connection per peer; push on every local change) *(back-ported from sub-spec 2)*.
 - **Every incoming connection is checked against membership** right after the handshake, using the remote `NodeId` iroh has authenticated. Non-members and removed nodes are closed with an error code. The only exception is `join/1`, which needs a valid ticket instead.
@@ -227,15 +227,17 @@ A built-in native handler serves files from an iroh-blobs collection: `index.htm
 - Listens on `127.0.0.1:7777` (configurable; loopback only).
 - **Routing by Host header:** `<service>.mesh.localhost[:port]` → that service. Browsers resolve `*.localhost` to loopback by themselves.
 - **Port mappings** for clients that can't resolve `*.localhost`: node-local `ports = { 7801 = "sync" }` binds `127.0.0.1:7801` straight to a service. **Default mapping: `7801 → sync`** on every node, so Aegis's sync URL is always `http://127.0.0.1:7801`.
-- **Dispatch:** if this node runs the service, it's handled locally. Otherwise (client role, not in placement, or not yet replicated) it's forwarded over `http/1` to the online host running it with the lowest recent round-trip time, trying the next host on failure, up to 3 attempts. If none work: `502`.
+- **Dispatch:** if this node runs the service, it's handled locally. Otherwise (client role, not in placement, or not yet replicated) it's forwarded over `httpfwd` to the online host running it with the lowest recent round-trip time, trying the next host on failure, up to 3 attempts. If none work: `502`.
 - `http://mesh.localhost:7777/` serves a read-only status page.
 - **Security:** any local process can reach the gateway, the same as any localhost server. Services handle their own user-level auth (the Aegis sync service does).
 
-### `http/1` forward protocol
-One bidirectional QUIC stream per request: a length-prefixed `RequestHead { service, method, path, headers }`, the streamed body, then `ResponseHead { status, headers }` and the streamed body back. Hosts accept it only from effective members.
+### `httpfwd` forward protocol
+The protocol is named `httpfwd`, ALPN `meshnode/httpfwd/1` *(back-ported from sub-spec 4)*. One bidirectional QUIC stream per request: one length-prefixed `ForwardRequest { service, method, path, headers, body }` frame, answered by one length-prefixed `ForwardResponse { status, headers, body }` frame *(back-ported from sub-spec 4)*. Frames are capped at 64 MiB plus 64 KiB; deserialisation checks the limits (at most 128 headers and 64 KiB of header bytes, `path_and_query` at most 8 KiB and starting with `/`), the method, the service name and, for responses, a status of 100..=999. Header names and values are checked for CR/LF/NUL when converted to `http` types, and the forwarder refuses a response status below 200. The hop-by-hop headers (`connection`, `keep-alive`, `transfer-encoding`, `te`, `upgrade`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`) are stripped in both directions. Hosts accept it only from effective members. Hosts serve a forwarded request locally only and never forward it again. Bodies stay buffered end to end (gateway, `httpfwd`, services), with caps *(back-ported from sub-spec 4)*.
+- **Resource limits** *(back-ported from sub-spec 4)*: WASM requests share a node-wide memory budget (`ServicesConfig.max_memory_mb`; default half of physical RAM, 64 MiB to 4 GiB); a request that cannot get its share is answered `503 Memory budget exhausted`. Static-site requests count as in flight like WASM requests. On Android the runtime reserves memory compactly (`compact_memory`).
+- The gateway's HTTP keep-alive is 30 s, and a request body that does not arrive by its deadline is answered `408` *(back-ported from sub-spec 4)*.
 
 ### `mesh-client` library
-A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts; partial replication for clients moves to sub-spec 8 *(back-ported from sub-spec 2)*: until then a client member replicates everything) and talks `http/1`. Intended for embedding in apps on devices that don't run the full node.
+A Rust crate: `MeshClient::join(ticket)` / `MeshClient::open(identity)` and `client.request(service, http::Request) -> http::Response`. It's a client-role member that replicates only `_mesh` (to learn the hosts; partial replication for clients moves to sub-spec 8 *(back-ported from sub-spec 2)*: until then a client member replicates everything) and talks `httpfwd`. Intended for embedding in apps on devices that don't run the full node.
 
 ---
 
@@ -249,7 +251,11 @@ One set of typed requests, used by the CLI and the UI:
 - **Android:** an in-process channel. The UI and the foreground service share one process and one Rust library.
 
 ### `meshd` CLI
-`meshd init | join <ticket> | invite | members | remove <id> | deploy wasm|static … | services | status | logs | run`, plus `meshd service install|uninstall` for the OS service. Each command calls the admin API (or works on the data directory directly when no daemon is running).
+`meshd init | join <ticket> | invite | members | remove <id> | deploy wasm|static … | services | status | logs | run`, plus `meshd service install|uninstall|start|stop|status` for the OS service. Each command calls the running daemon's admin API; except `init`, `join` and `reset-identity` (through the daemon when it is reachable, otherwise directly on the data directory) and `service …` (the OS), a command without a running daemon prints `meshd is not running (start it with "meshd run" or "meshd service install")` *(back-ported from sub-spec 4)*.
+
+**Uninitialised daemon** *(back-ported from sub-spec 4)*: `meshd run` without `mesh.json` serves only the admin API, accepting `Init` and `Join` (plus `Status`, `ConfigGet`, `ConfigSet`, `LogsTail` and `ResetIdentity`; every other request is refused with a wrong-state error); on success it starts the node in place. `StatusInfo` includes the gateway's mapped `ports`.
+
+**Data directory and services** *(back-ported from sub-spec 4)*: `meshd` takes an exclusive lock on the data directory (`meshd.lock`). `meshd service uninstall --purge-data` purges only the data directory read back from the installed registration, and refuses on a mismatch or when nothing is installed. `meshd service install` refuses a reparse point (symlink or junction) as the data directory and resets the owner to Builtin Administrators (BA) and the children's ACLs.
 
 ### Tauri 2 UI (`apps/ui`, one codebase for desktop + Android)
 - **Home:** mesh status, a card for each member (online, platform, tags, last seen, replication lag), the node's own gateway URL.
@@ -268,7 +274,7 @@ One set of typed requests, used by the CLI and the UI:
 - **Linux:** a systemd **system** unit `meshnode.service` running as a dedicated `meshnode` user, data in `/var/lib/meshnode`, `After=network-online.target`, `Restart=always`. iroh binds a wildcard UDP socket, so there's no bind-address race like the one behind the Aegis sync-server's tailnet outage.
 - **Windows:** a Windows Service (`windows-service` crate) running as `LocalService`, data in `%ProgramData%\meshnode`, automatic (delayed) start, restart on failure. The MSI installs it along with the UI.
 - **macOS:** a LaunchDaemon plist with `KeepAlive`, data in `/Library/Application Support/meshnode`.
-- Logs go through `tracing` to a rotating file under `<data>/logs/` and to journald or the Windows Event Log.
+- Logs go through `tracing` to a daily rolling file `<data>/logs/meshd.log.<date>` (7 kept) and to stdout; under systemd stdout reaches journald. On Windows only service start/stop and fatal startup errors go to the Event Log (source `Meshnode`) *(back-ported from sub-spec 4)*. macOS is best-effort: the launchd plist and install code are built in CI but not verified on a Mac *(back-ported from sub-spec 4)*.
 
 ### 10.2 Android (`apps/android`)
 > Findings from the feasibility spike (`spikes/android/RESULTS.md`, Galaxy S23 / Android 17) are folded in below and marked *(spike)*.
@@ -364,7 +370,7 @@ Each row is its own sub-spec → plan → implementation cycle, in this order. E
 | 1 | Store + HLC + proto | merge, op log, compaction, tombstone GC; proptest convergence |
 | 2 | Node core *(implemented, manual check pending; see `docs/manual-checks/sub-spec-2.md`)* | transport, membership, invites, replicator, blobs; split-and-heal between two desktop nodes |
 | 3 | Runtime + services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-3.md`)* | wasmtime host, `meshnode:kv`, manifests, deployer, placement, static sites |
-| 4 | Gateway + admin API + `meshd` CLI + desktop OS services | two desktop nodes serving a site, installed as system services |
+| 4 | Gateway + admin API + `meshd` CLI + desktop OS services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-4.md`)* | two desktop nodes serving a site, installed as system services |
 | 5 | Android shell | `mesh-ffi`, the foreground service, boot/watchdog, power policy |
 | 6 | Tauri UI (desktop + Android) | the full management UI, QR invite/join |
 | 7 | Aegis sync port | `aegis-sync-core` extraction in Aegis, `services/aegis-sync`, Aegis client changes |

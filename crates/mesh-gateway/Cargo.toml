@@ -1,0 +1,37 @@
+[package]
+name = "mesh-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-proto = { path = "../mesh-proto" }
+mesh-services = { path = "../mesh-services" }
+bytes.workspace = true
+http.workspace = true
+iroh.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
+tracing.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+
+[features]
+# Test-only helpers: forward and serve counters.
+test-hooks = []
+
+[dev-dependencies]
+mesh-gateway = { path = ".", features = ["test-hooks"] }
+mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
+mesh-services = { path = "../mesh-services", features = ["test-hooks"] }
+mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
+mesh-hlc = { path = "../mesh-hlc" }
+blake3.workspace = true
+tempfile.workspace = true

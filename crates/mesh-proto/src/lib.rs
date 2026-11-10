@@ -1,5 +1,6 @@
 //! Wire/data types for the Meshnode mesh: ids, signed ops, sync messages, invite tickets.
 
+mod httpfwd;
 mod ids;
 mod join;
 mod op;
@@ -7,6 +8,10 @@ mod service;
 mod sync;
 mod ticket;
 
+pub use httpfwd::{
+    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
+    MAX_HEADERS, MAX_PATH, is_hop_by_hop,
+};
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};

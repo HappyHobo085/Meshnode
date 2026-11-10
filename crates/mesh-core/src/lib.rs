@@ -27,6 +27,9 @@ pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
 pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;
+/// Types that appear in the extra-protocol and `NodeHandle::connect` API.
+pub use iroh::endpoint::Connection;
+pub use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler};
 pub use maint::MaintJob;
 /// Store types that appear in this crate's API (store errors and change events).
 pub use mesh_store::{Change, ChangeKind, StoreError};

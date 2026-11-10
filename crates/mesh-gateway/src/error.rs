@@ -1,5 +1,6 @@
 //! Why a frame could not become an HTTP message, and why a forward attempt failed.
 
+use http::StatusCode;
 use mesh_core::NodeError;
 use mesh_core::frame::FrameError;
 
@@ -33,4 +34,33 @@ pub(crate) enum ForwardError {
     Convert(#[from] FrameConvError),
     #[error("timed out after {0} ms")]
     Timeout(u64),
+}
+
+/// A request that cannot be put in an `httpfwd` frame; answered with [`Unframeable::status`]
+/// instead of being forwarded.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Unframeable {
+    #[error(
+        "more than {} headers or {} bytes of headers",
+        mesh_proto::MAX_HEADERS,
+        mesh_proto::MAX_HEADER_BYTES
+    )]
+    HeaderFields,
+    #[error("path and query longer than {} bytes", mesh_proto::MAX_PATH)]
+    Uri,
+    #[error("request frame larger than {} bytes", mesh_proto::HTTPFWD_MAX_FRAME)]
+    TooLarge,
+    #[error("invalid request: {0}")]
+    Invalid(mesh_proto::ProtoError),
+}
+
+impl Unframeable {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Unframeable::HeaderFields => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            Unframeable::Uri => StatusCode::URI_TOO_LONG,
+            Unframeable::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Unframeable::Invalid(_) => StatusCode::BAD_REQUEST,
+        }
+    }
 }

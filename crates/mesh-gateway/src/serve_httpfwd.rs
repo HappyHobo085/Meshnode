@@ -23,6 +23,8 @@ use crate::error::FrameConvError;
 
 /// The request frame must arrive within this time, or the stream is reset.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The peer must take the response frame within this time, or the stream is reset.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Streams served at once on one connection.
 const MAX_STREAMS: usize = 256;
 /// Stream reset code: the request frame was late, oversized or malformed.
@@ -165,9 +167,17 @@ async fn serve_stream(slot: &SlotInner, mut send: SendStream, mut recv: RecvStre
         reset(&mut send, &mut recv, BAD_RESPONSE);
         return;
     }
-    if let Err(e) = write_frame(&mut send, &frame).await {
-        debug!(service, error = %e, "httpfwd response not written");
-        return;
+    match timeout(WRITE_TIMEOUT, write_frame(&mut send, &frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            debug!(service, error = %e, "httpfwd response not written");
+            return;
+        }
+        Err(_) => {
+            debug!(service, "httpfwd response not taken in time");
+            reset(&mut send, &mut recv, BAD_RESPONSE);
+            return;
+        }
     }
     let _ = send.finish();
 }

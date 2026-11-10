@@ -91,6 +91,8 @@ pub enum Serve {
     Unattached,
     /// A raw test handler.
     Raw(Arc<dyn DynProtocolHandler>),
+    /// No `httpfwd` at all: dialing it on that ALPN fails.
+    Nothing,
 }
 
 pub struct Member {
@@ -159,18 +161,21 @@ pub async fn mesh(nodes: Vec<(Role, Serve)>) -> Mesh {
     for (i, (role, serve)) in nodes.into_iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_cfg(dir.path(), &format!("n{i}"));
-        let (handler, slot, attach): (Arc<dyn DynProtocolHandler>, _, _) = match serve {
+        let (handler, slot, attach): (Option<Arc<dyn DynProtocolHandler>>, _, _) = match serve {
             Serve::Attached => {
                 let (h, s) = HttpFwdHandler::new();
-                (Arc::new(h), Some(s), true)
+                (Some(Arc::new(h)), Some(s), true)
             }
             Serve::Unattached => {
                 let (h, s) = HttpFwdHandler::new();
-                (Arc::new(h), Some(s), false)
+                (Some(Arc::new(h)), Some(s), false)
             }
-            Serve::Raw(h) => (h, None, false),
+            Serve::Raw(h) => (Some(h), None, false),
+            Serve::Nothing => (None, None, false),
         };
-        cfg.extra_protocols.push((ALPN_HTTPFWD.to_vec(), handler));
+        if let Some(handler) = handler {
+            cfg.extra_protocols.push((ALPN_HTTPFWD.to_vec(), handler));
+        }
         let node = if i == 0 {
             Node::create_mesh(cfg).await.unwrap()
         } else {

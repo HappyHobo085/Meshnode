@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -116,6 +117,29 @@ async fn forward_to_placed_host() {
         dispatch(mesh.fwd(1), "nope", "/").await,
         (404, "Service not deployed".into())
     );
+    assert_eq!(mesh.fwd(1).attempts(), 2);
+
+    // Requests that cannot be framed are refused with their status, not forwarded.
+    let mut headers = http::Request::get("/");
+    for i in 0..129 {
+        headers = headers.header(format!("x-{i}"), "v");
+    }
+    let long = http::Request::get(format!("/{}", "a".repeat(8 * 1024)));
+    let big = http::Request::post("/");
+    for (req, want) in [
+        (headers.body(Bytes::new()).unwrap(), 431),
+        (long.body(Bytes::new()).unwrap(), 414),
+        (
+            big.body(Bytes::from(vec![0u8; HTTPFWD_MAX_FRAME + 1]))
+                .unwrap(),
+            413,
+        ),
+    ] {
+        let resp = timeout(T, mesh.fwd(1).dispatch(COUNTER, req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), want);
+    }
     assert_eq!(mesh.fwd(1).attempts(), 2);
     mesh.shutdown().await;
 }
@@ -247,12 +271,14 @@ enum Answer {
     Oversized,
     /// A short frame of bytes that do not decode.
     Garbage,
+    /// Resets the stream without answering.
+    Reset,
     /// Records the request; answers 200 with hop-by-hop headers and `x-custom`.
     Record(Arc<Mutex<Vec<ForwardRequest>>>),
 }
 
 #[derive(Debug)]
-struct Raw(Answer);
+struct Raw(Answer, Arc<AtomicU64>);
 
 impl ProtocolHandler for Raw {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
@@ -261,6 +287,7 @@ impl ProtocolHandler for Raw {
             else {
                 continue;
             };
+            self.1.fetch_add(1, Ordering::SeqCst);
             match &self.0 {
                 Answer::Oversized => {
                     let len = u32::try_from(HTTPFWD_MAX_FRAME + 1).unwrap();
@@ -270,6 +297,10 @@ impl ProtocolHandler for Raw {
                 Answer::Garbage => {
                     let _ = send.write_all(&8u32.to_be_bytes()).await;
                     let _ = send.write_all(&[0xff; 8]).await;
+                }
+                Answer::Reset => {
+                    let _ = send.reset(7u32.into());
+                    continue;
                 }
                 Answer::Record(log) => {
                     log.lock().unwrap().push(req);
@@ -295,7 +326,13 @@ impl ProtocolHandler for Raw {
 }
 
 fn raw(answer: Answer) -> Serve {
-    Serve::Raw(Arc::new(Raw(answer)))
+    raw_counted(answer).0
+}
+
+/// A raw handler and the count of requests it has read.
+fn raw_counted(answer: Answer) -> (Serve, Arc<AtomicU64>) {
+    let seen = Arc::new(AtomicU64::new(0));
+    (Serve::Raw(Arc::new(Raw(answer, seen.clone()))), seen)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -372,13 +409,15 @@ async fn forward_oversized_response_rejected() {
         (502, "No host could serve counter".into())
     );
     assert_eq!(mesh.fwd(1).attempts(), 2);
-    // B is still fine, and a good host next to a bad one serves.
+    // B is still fine, and a good host tried after a bad one serves.
     for bad in [a, c] {
         set_nodes(&mesh, vec![bad, d]).await;
         wait_active(&mesh, 3).await;
-        let before = mesh.served(3);
+        mesh.fwd(1).try_first(vec![bad, d]);
+        let (served, attempts) = (mesh.served(3), mesh.fwd(1).attempts());
         assert_eq!(dispatch(mesh.fwd(1), COUNTER, "/").await.0, 200);
-        assert_eq!(mesh.served(3), before + 1);
+        assert_eq!(mesh.served(3), served + 1);
+        assert_eq!(mesh.fwd(1).attempts(), attempts + 2);
     }
     mesh.shutdown().await;
 }
@@ -395,4 +434,48 @@ async fn set_nodes(mesh: &Mesh, ids: Vec<NodeId>) {
         svcs.services().iter().any(|s| s.manifest.placement == want)
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn online_host_failing_at_stream_level_then_next_serves() {
+    // A is online and accepts the connection, then resets the request stream.
+    let (bad, seen) = raw_counted(Answer::Reset);
+    let mesh = mesh(vec![
+        (Role::Host, bad),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    deploy_counter(&mesh, Placement::Nodes(vec![a, c])).await;
+    wait_active(&mesh, 2).await;
+    wait_manifest(&mesh, 1).await;
+    mesh.fwd(1).try_first(vec![a, c]);
+    assert_eq!(dispatch(mesh.fwd(1), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.fwd(1).attempts(), 2);
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "A saw the request");
+    assert_eq!(mesh.served(2), 1, "C served it");
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn online_host_failing_at_connect_then_next_serves() {
+    // A is online (sync runs) but serves no `httpfwd`: dialing it fails.
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Nothing),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    deploy_counter(&mesh, Placement::Nodes(vec![a, c])).await;
+    wait_active(&mesh, 2).await;
+    wait_manifest(&mesh, 1).await;
+    assert!(common::online(&mesh.m[1].node, a));
+    mesh.fwd(1).try_first(vec![a, c]);
+    assert_eq!(dispatch(mesh.fwd(1), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.fwd(1).attempts(), 2);
+    assert_eq!(mesh.fwd(1).connects(), 1, "only C was connected");
+    assert_eq!(mesh.served(2), 1, "C served it");
+    mesh.shutdown().await;
 }

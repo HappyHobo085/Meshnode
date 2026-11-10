@@ -13,15 +13,15 @@ use mesh_core::frame::read_frame;
 use mesh_core::membership::MESH_NS;
 use mesh_core::{Connection, NodeHandle};
 use mesh_proto::{
-    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, NodeId, Role,
-    ServiceManifest, decode_raw,
+    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
+    MAX_HEADERS, MAX_PATH, NodeId, Role, ServiceManifest, decode_raw,
 };
 use mesh_services::{LocalState, Services, manifest_key, placed_hosts};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 use tracing::warn;
 
-use crate::error::{ForwardError, FrameConvError};
+use crate::error::{ForwardError, FrameConvError, Unframeable};
 use crate::serve_httpfwd::{copy_headers, frame_headers};
 
 /// Hosts tried per request.
@@ -59,6 +59,8 @@ struct Inner {
     attempts: AtomicU64,
     /// Connections opened (test hook).
     connects: AtomicU64,
+    /// Hosts tried first, in this order (test hook).
+    first: Mutex<Vec<NodeId>>,
 }
 
 impl Forwarder {
@@ -71,6 +73,7 @@ impl Forwarder {
                 permits: Semaphore::new(MAX_FORWARDS),
                 attempts: AtomicU64::new(0),
                 connects: AtomicU64::new(0),
+                first: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -101,6 +104,12 @@ impl Forwarder {
     pub fn connects(&self) -> u64 {
         self.inner.connects.load(Ordering::SeqCst)
     }
+
+    /// Tries the candidates among `ids` first, in this order, instead of by RTT.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn try_first(&self, ids: Vec<NodeId>) {
+        *self.inner.first.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
 }
 
 impl Inner {
@@ -113,6 +122,14 @@ impl Inner {
     }
 
     async fn forward(&self, name: &str, req: Request<Bytes>) -> Response<Bytes> {
+        let frame = match encode_request(name, req) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(service = name, error = %e, "request cannot be forwarded");
+                let code = e.status();
+                return text(code, code.canonical_reason().unwrap_or("").into());
+            }
+        };
         let manifest = match self.node.store().get(MESH_NS, &manifest_key(name)).await {
             Ok(Some(raw)) => match decode_raw::<ServiceManifest>(&raw) {
                 Ok(m) => m,
@@ -133,13 +150,6 @@ impl Inner {
             warn!(service = name, "no online host runs the service");
             return no_host(name);
         }
-        let frame = match encode_request(name, req) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(service = name, error = %e, "request cannot be forwarded");
-                return no_host(name);
-            }
-        };
         let Ok(_permit) = self.permits.acquire().await else {
             return no_host(name);
         };
@@ -176,7 +186,9 @@ impl Inner {
             .into_iter()
             .filter(|s| s.id != me && s.online && s.effective && hosts.contains(&s.id))
             .collect();
-        members.sort_by_key(|s| (s.rtt_ms.is_none(), s.rtt_ms));
+        let first = self.first.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let rank = |id: &NodeId| first.iter().position(|f| f == id).unwrap_or(usize::MAX);
+        members.sort_by_key(|s| (rank(&s.id), s.rtt_ms.is_none(), s.rtt_ms));
         members.into_iter().map(|s| s.id).collect()
     }
 
@@ -252,8 +264,11 @@ async fn exchange(conn: &Connection, frame: &[u8]) -> Result<ForwardResponse, Fo
 
 /// The whole `httpfwd` frame (length prefix included) for `req`, without hop-by-hop
 /// headers.
-fn encode_request(name: &str, req: Request<Bytes>) -> Result<Vec<u8>, String> {
+fn encode_request(name: &str, req: Request<Bytes>) -> Result<Vec<u8>, Unframeable> {
     let (parts, body) = req.into_parts();
+    if body.len() > HTTPFWD_MAX_FRAME {
+        return Err(Unframeable::TooLarge);
+    }
     let fr = ForwardRequest {
         service: name.to_owned(),
         method: parts.method.as_str().to_owned(),
@@ -265,10 +280,17 @@ fn encode_request(name: &str, req: Request<Bytes>) -> Result<Vec<u8>, String> {
         headers: frame_headers(&parts.headers),
         body: body.to_vec(),
     };
-    fr.validate().map_err(|e| e.to_string())?;
+    let header_bytes: usize = fr.headers.iter().map(|(n, v)| n.len() + v.len()).sum();
+    if fr.headers.len() > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
+        return Err(Unframeable::HeaderFields);
+    }
+    if fr.path_and_query.len() > MAX_PATH {
+        return Err(Unframeable::Uri);
+    }
+    fr.validate().map_err(Unframeable::Invalid)?;
     let body = mesh_proto::encode(&fr);
     if body.len() > HTTPFWD_MAX_FRAME {
-        return Err(format!("frame of {} bytes exceeds the limit", body.len()));
+        return Err(Unframeable::TooLarge);
     }
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -278,6 +300,10 @@ fn encode_request(name: &str, req: Request<Bytes>) -> Result<Vec<u8>, String> {
 
 /// The response a frame describes, without hop-by-hop headers.
 fn to_response(fr: ForwardResponse) -> Result<Response<Bytes>, ForwardError> {
+    // An informational status is no final answer to a forwarded request.
+    if fr.status < 200 {
+        return Err(FrameConvError::Status.into());
+    }
     let status = StatusCode::from_u16(fr.status).map_err(|_| FrameConvError::Status)?;
     let mut resp = Response::new(Bytes::from(fr.body));
     *resp.status_mut() = status;
@@ -359,6 +385,66 @@ mod tests {
         .unwrap();
         assert_eq!(ok.headers().len(), 1);
         assert_eq!(ok.headers()["x-a"], "1");
+    }
+
+    #[test]
+    fn unframeable_requests_get_their_status() {
+        let get = |path: &str| Request::get(path.to_owned());
+        let mut many = get("/");
+        for i in 0..=MAX_HEADERS {
+            many = many.header(format!("x-{i}"), "v");
+        }
+        let cases = [
+            (many.body(Bytes::new()).unwrap(), 431),
+            (
+                get("/")
+                    .header("x-big", "a".repeat(MAX_HEADER_BYTES))
+                    .body(Bytes::new())
+                    .unwrap(),
+                431,
+            ),
+            (
+                get(&format!("/{}", "a".repeat(MAX_PATH)))
+                    .body(Bytes::new())
+                    .unwrap(),
+                414,
+            ),
+            (
+                get("/")
+                    .body(Bytes::from(vec![0u8; HTTPFWD_MAX_FRAME + 1]))
+                    .unwrap(),
+                413,
+            ),
+            // The body fits, but not with the rest of the frame.
+            (
+                get("/")
+                    .body(Bytes::from(vec![0u8; HTTPFWD_MAX_FRAME - 8]))
+                    .unwrap(),
+                413,
+            ),
+        ];
+        for (req, want) in cases {
+            let err = encode_request("web", req).unwrap_err();
+            assert_eq!(err.status().as_u16(), want, "{err}");
+        }
+        // At the limits it still frames.
+        let mut most = get(&format!("/{}", "a".repeat(MAX_PATH - 1)));
+        for i in 0..MAX_HEADERS {
+            most = most.header(format!("x-{i}"), "v");
+        }
+        assert!(encode_request("web", most.body(Bytes::new()).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn informational_peer_status_rejected() {
+        for status in [100, 101, 199] {
+            let fr = ForwardResponse {
+                status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            assert!(to_response(fr).is_err(), "{status}");
+        }
     }
 
     #[test]

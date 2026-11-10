@@ -1,4 +1,4 @@
-//! Blob GC (spec Â§5.5): a service blob that no manifest and no active service references
+//! Blob GC (spec §5.5): a service blob that no manifest and no active service references
 //! is removed once it has been unreferenced for 24 hours.
 //!
 //! The first-unreferenced times live in `<data>/services/gc.json` and are measured with the

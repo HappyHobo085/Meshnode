@@ -78,9 +78,10 @@ Run on **one desktop node (Linux or Windows) and one Android phone**, on differe
 | `crates/mesh-hlc` | Hybrid logical clock. Pure, no I/O. | — |
 | `crates/mesh-store` | Replicated store: ordered LWW registers + grow-only sets on `redb`; merge function; per-origin op log; tombstone GC | `mesh-hlc` |
 | `crates/mesh-proto` | Wire types for every ALPN (serde + postcard), invite tickets, signatures | `mesh-hlc` |
-| `crates/mesh-core` | `Node`: transport, membership, replicator, deployer, placement, blob fetch (placement and the deployer arrive in sub-spec 3; sub-spec 2 only stores and replicates member tags) *(back-ported from sub-spec 2)* | store, proto, `iroh`, `iroh-blobs` |
-| `crates/mesh-runtime` | wasmtime host: the `wasi:http` incoming handler, `meshnode:kv`, the outgoing-HTTP allowlist, limits | store, `wasmtime`, `wasmtime-wasi-http` |
-| `crates/mesh-gateway` | localhost HTTP server, Host and port routing, static serving, forwarding to a peer | core, runtime |
+| `crates/mesh-core` | `Node`: transport, membership, replicator, blob fetch; stores and replicates member tags. The deployer and placement live in `mesh-services` *(back-ported from sub-spec 3)* | store, proto, `iroh`, `iroh-blobs` |
+| `crates/mesh-runtime` | Pure wasmtime host with no `mesh-core` or `mesh-store` dependency: the `wasi:http` incoming handler, `meshnode:kv` (through a trait the embedder implements), the outgoing-HTTP allowlist, limits *(back-ported from sub-spec 3)* | `wasmtime`, `wasmtime-wasi-http` |
+| `crates/mesh-services` | Manifests, deploy/undeploy/purge, placement, the deployer, static sites, service blob GC; service KV writes go through `mesh-core`'s gated `StoreHandle` *(back-ported from sub-spec 3)* | core, runtime |
+| `crates/mesh-gateway` | localhost HTTP server, Host and port routing, forwarding to a peer; serves through `mesh-services` | core, services |
 | `crates/mesh-admin` | Admin API: request/response types plus two transports (local socket, in-process channel) | core |
 | `crates/mesh-client` | Embeddable client: become a client-role member, send HTTP to services over iroh | proto, `iroh` |
 | `crates/mesh-ffi` | UniFFI bindings exposing `Node` start/stop/status + admin calls to Kotlin | core, gateway, admin |
@@ -181,15 +182,15 @@ ServiceManifest {
 }
 ```
 
-- **Placement:** each host has tags (`desktop`, `android`, `always-plugged`, plus any the user adds) stored with its member entry. A host runs a service only if it matches the placement. Hosts that don't run a service still replicate its **data** (so they can take it over immediately when placement changes) but don't fetch its blobs or run it. Their gateways forward requests for it (§8). If placement matches no host, the UI warns and the service returns `503`.
-- **Deploy:** the UI or CLI adds the module or site folder to the local iroh-blobs store, then writes the manifest. `undeploy` writes a tombstone manifest; the data stays until `purge`, which writes a namespace-tombstone marker and deletes all keys.
+- **Placement:** only effective host-role members run services; client-role nodes never fetch or run them and forward requests *(back-ported from sub-spec 3)*. Each host has tags (`desktop`, `android`, `always-plugged`, plus any the user adds) stored with its member entry. A host runs a service only if it matches the placement. Hosts that don't run a service still replicate its **data** (so they can take it over immediately when placement changes) but don't fetch its blobs or run it. Their gateways forward requests for it (§8). If placement matches no host, the UI warns and the service returns `503`.
+- **Deploy:** the UI or CLI adds the module or site folder to the local iroh-blobs store, then writes the manifest. `undeploy` deletes the manifest; the data stays until `purge`. A service's data lives in namespace `<name>` for generation 0 and `<name>.<gen>` after a purge; `purge` starts a new generation (so keys and grow-only sets written concurrently on other nodes are hidden too) instead of tombstoning key by key *(back-ported from sub-spec 3)*.
 - **Deployer loop:** whenever a manifest changes, each matching host fetches missing blobs from any peer, verifies the hash, and atomically swaps to the new version. Until then the previous version keeps serving. A service that has never been fetched answers `503 Service not yet replicated`.
 - **Blob GC:** blobs no manifest has referenced for 24 h are deleted.
 
 ### WASM runtime
 - **wasmtime, Component Model.** A service is a component targeting world `meshnode:service/service`:
   - **exports** `wasi:http/incoming-handler` (the standard WASI HTTP proxy interface, so any toolchain that supports `wasi:http` works)
-  - **imports** `wasi:clocks`, `wasi:random`, `wasi:logging` (routed to the node log), `meshnode:kv/store`, and `wasi:http/outgoing-handler`, which is **always linked** but refuses every destination not in `outbound`.
+  - **imports** `wasi:clocks`, `wasi:random`, `wasi:cli` stdio (the guest's stdout and stderr go to the node log line by line, tagged with the service name; wasmtime-wasi has no `wasi:logging`) *(back-ported from sub-spec 3)*, `meshnode:kv/store`, and `wasi:http/outgoing-handler`, which is **always linked** but refuses every destination not in `outbound`.
 
 ```wit
 package meshnode:kv;
@@ -210,8 +211,9 @@ interface store {
 
 - **Isolation:** each service can reach only its own namespace. No filesystem access. Outgoing network only to the allowlist.
 - **One fresh instance per request** (the wasi:http proxy model), from a cached `InstancePre` keyed by module hash.
-- **Compiled-code cache:** on desktop, a file cache under `<data>/cache/`. **On Android, compiled code is cached as bytes and loaded with `Module::deserialize` into anonymous memory, never memory-mapped from an app-data file**, because Android blocks executing code mapped from files in app-writable storage. To be verified in the Android spike (§14). The fallback is wasmtime's Pulley interpreter.
+- **Compiled-code cache:** on desktop, a file cache under `<data>/cache/`. **On Android, compiled code is cached as bytes and loaded with `Module::deserialize` into anonymous memory, never memory-mapped from an app-data file**, because Android blocks executing code mapped from files in app-writable storage. Verified in the Android spike (§14). There is no interpreter fallback: Cranelift works in the app sandbox, so Pulley is left out *(back-ported from sub-spec 3)*.
 - **Limits:** memory cap through `ResourceLimiter`, time cap through epoch interruption (10 ms ticks), body cap enforced before the module runs. A trap or timeout returns `500`/`504` and is logged; the node never crashes because of a service.
+- Request and response bodies are buffered, not streamed, for WASM and static responses (bounded by the limits) *(back-ported from sub-spec 3)*.
 - Writes made through `meshnode:kv` apply locally right away (read-your-writes on that node) and become ops for replication.
 
 ### Static sites
@@ -273,7 +275,7 @@ One set of typed requests, used by the CLI and the UI:
 
 - **One APK, one process:** the Tauri UI activity plus a Kotlin **foreground service** (`MeshService`). Both call the same Rust library (`mesh-ffi`, built with `cargo-ndk`, bindings generated by UniFFI). The service owns the `Node`; the UI talks to it in-process.
 - **Android context setup *(spike)*:** when `mesh-ffi` first loads, it must call `ndk_context::initialize_android_context(vm, context)` with a global ref to the application `Context`, before any iroh endpoint is created. iroh's DNS resolver and network monitor need it; without it a worker thread panics (`android context was not initialized`).
-- **WASM *(spike)*:** Cranelift compilation works inside the app sandbox (1.7–8 ms per request on the S23), and the in-memory compiled-code cache (§7) works as designed. Pulley stays as an unused fallback.
+- **WASM *(spike)*:** Cranelift compilation works inside the app sandbox (1.7–8 ms per request on the S23), and the in-memory compiled-code cache (§7) works as designed. Pulley is left out (no interpreter fallback).
 - **Foreground service type `specialUse`** (`FOREGROUND_SERVICE_SPECIAL_USE`), with a permanent notification ("Meshnode: hosting N services · M peers online"), and Stop/Open actions. `specialUse` because `dataSync` is time-limited on Android 15+ and can't start from boot. Sideloaded distribution means no Play Store review of this type.
 - **Starting automatically:** a `BOOT_COMPLETED` receiver starts the service after the first unlock (verified in the spike: it reconnected 4 s after boot). A `WorkManager` watchdog every 15 minutes restarts it if the system killed it.
 - **Swipe-away recovery *(spike)*:** on One UI, swiping the app out of recents **stops the node** despite the foreground service and battery exemption, and `START_STICKY` doesn't restart it. So `onTaskRemoved` schedules an exact alarm (`setExactAndAllowWhileIdle`, about 5 s out) whose receiver restarts the service, which is an allowed way to start a foreground service from the background. The WorkManager watchdog is the backstop. Onboarding tells the user to lock the app in recents. To verify on the S23 in sub-project 5.
@@ -344,7 +346,7 @@ Goal: the same HTTP contract (`/v1/records`, `/v1/devices*`, `/healthz`), unchan
 - **`mesh-proto`:** round-trip and wrong-version decode tests; tampered signatures are rejected.
 - **`mesh-core`:** in-process multi-node tests over local iroh endpoints (relay and discovery off), covering: invite/join; using a ticket twice; removal; split-and-heal; late join; placement changes; the stale-node re-bootstrap; clock-skew deferral.
 - **`mesh-runtime`:** fixture components in `tests/fixtures/` (a counter service, an infinite loop, a memory hog, an outbound-call probe), checking KV semantics, namespace isolation, limits and the outbound allowlist.
-- **`mesh-gateway`:** Host and port routing, static serving, forwarding fallback.
+- **`mesh-gateway`:** Host and port routing, forwarding fallback (static serving is in `mesh-services`).
 - **`services/aegis-sync`:** the native sync-server's HTTP contract test suite, run against the WASM service (shared through `aegis-sync-core` test vectors), plus a two-replica divergence test (concurrent pushes to the same uuid on two nodes → the same winner on both).
 - **Android:** instrumented tests on an emulator (service start, boot receiver, FFI round trip). The battery test is manual on a real device.
 - **End-to-end:** `docs/e2e-checklist.md` mirrors the §1 success criteria and is run on real hardware (desktop + Android phone) before each release. Results go in `docs/e2e-results.md`.
@@ -361,7 +363,7 @@ Each row is its own sub-spec → plan → implementation cycle, in this order. E
 | 0 | ~~**Android feasibility spike**~~ **done 2026-11-09** | Feasible. Results in `spikes/android/RESULTS.md`; changes folded into §10.2. Still open for 5: how quickly a sleeping phone answers incoming requests, and overnight on mobile data. |
 | 1 | Store + HLC + proto | merge, op log, compaction, tombstone GC; proptest convergence |
 | 2 | Node core *(implemented, manual check pending; see `docs/manual-checks/sub-spec-2.md`)* | transport, membership, invites, replicator, blobs; split-and-heal between two desktop nodes |
-| 3 | Runtime + services | wasmtime host, `meshnode:kv`, manifests, deployer, placement, static sites |
+| 3 | Runtime + services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-3.md`)* | wasmtime host, `meshnode:kv`, manifests, deployer, placement, static sites |
 | 4 | Gateway + admin API + `meshd` CLI + desktop OS services | two desktop nodes serving a site, installed as system services |
 | 5 | Android shell | `mesh-ffi`, the foreground service, boot/watchdog, power policy |
 | 6 | Tauri UI (desktop + Android) | the full management UI, QR invite/join |

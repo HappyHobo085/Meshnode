@@ -30,4 +30,6 @@ mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
 mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
 mesh-hlc = { path = "../mesh-hlc" }
 tempfile.workspace = true
+hex.workspace = true
+tracing-subscriber.workspace = true
 wat.workspace = true

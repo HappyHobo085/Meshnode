@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::deployer::{DeployerTask, DeployerTimings, Shared};
 use crate::error::ServicesError;
-use crate::gc::{self, GC_EVERY, GcTask};
+use crate::gc::{GC_EVERY, GcTask};
 use crate::manifest::{current_generation, data_ns, gen_key, manifest_key, read_manifest};
 
 /// Settings for [`Services::start`].
@@ -133,7 +133,7 @@ impl Services {
     /// Runs one blob GC pass now.
     #[cfg(any(test, feature = "test-hooks"))]
     pub async fn gc_now(&self) -> Result<(), ServicesError> {
-        gc::run_once(&self.shared).await
+        crate::gc::run_once(&self.shared).await
     }
 
     /// While `on`, a GC pass that has chosen blobs to remove waits before removing them.

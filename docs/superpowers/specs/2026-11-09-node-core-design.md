@@ -304,7 +304,7 @@ The check runs when the node opens and before each round. If `store.is_stale()` 
   ```
 - The blob kind is supplied by the caller: `fetch(hash)` is raw-only; `fetch_collection(hash)` and `has_collection(hash)` handle collections. There is no content sniffing. A collection root and its names blob are capped at 16 MiB *(amended during implementation)*.
 - `fetch` tries online effective members in RTT order and moves to the next on failure; iroh-blobs verifies the hash while streaming. It fails with `BlobUnavailable` when every peer fails.
-- Everything added or fetched is protected by a named tag `meshnode/pin/<hash>`. iroh-blobs' own GC is disabled. Unpinning and reference-based GC are sub-spec 3.
+- Everything added or fetched is protected by a named tag `meshnode/pin/<hash>`. iroh-blobs' GC loop is now on but protect-gated: it only sweeps when `Blobs::remove` arms it (tick `Timings::blob_gc_tick`, default 30 s; `remove` takes up to about 3 ticks; a dead GC loop makes `remove` fail fast). `fetch` and `fetch_collection` hold an iroh-blobs temp tag across download and pin, so an armed sweep never deletes in-flight data. New: `Blobs::{pins, remove, collection_entries, size}`, `BlobKind`, and `NodeHandle` *(amended in sub-spec 3)*. Reference-based GC is in `mesh-services`.
 
 ## 9. Scheduled work (`maint`)
 

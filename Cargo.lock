@@ -2307,6 +2307,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "hex",
  "http",
  "mesh-core",
  "mesh-hlc",
@@ -2320,6 +2321,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "wat",
 ]
 

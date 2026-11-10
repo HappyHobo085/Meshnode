@@ -76,15 +76,16 @@ pub enum RuntimeError { Invalid(String), Compile(String), Cache(std::io::Error) 
 
 ### 3.2 The world
 
-The component targets world `meshnode:service/service`: it exports `wasi:http/incoming-handler` and may import `wasi:clocks`, `wasi:random`, `wasi:cli` stdio, `wasi:http/outgoing-handler` and `meshnode:kv/store`. The `meshnode:kv` WIT is master §7's, unchanged (`get`, `set`, `set-ordered`, `delete`, `list-keys`, `set-add`, `set-contains`, `set-members`, `node-id`). No filesystem, no environment, no preopened directories, no sockets.
+The component targets world `meshnode:service/service`: it exports `wasi:http/incoming-handler` and may import `wasi:clocks`, `wasi:random`, `wasi:cli` stdio, `wasi:http/outgoing-handler` and `meshnode:kv/store`. The `meshnode:kv` WIT is master §7's, unchanged (`get`, `set`, `set-ordered`, `delete`, `list-keys`, `set-add`, `set-contains`, `set-members`, `node-id`). No filesystem, no preopened directories, no sockets. The linker also provides `wasi:cli/environment` (always empty), `wasi:cli/exit` and `wasi:cli/terminal-*` (always "not a terminal"), because every Rust `wasm32-wasip2` guest imports them *(amended during implementation)*.
 
-`load` rejects (with `RuntimeError::Invalid`) a component that does not export the incoming handler or imports anything outside the world; such a component is never served.
+`load` rejects (with `RuntimeError::Invalid`) a component that does not export the incoming handler or imports anything outside the world; such a component is never served. `load` accepts only binary components (`Component::from_binary`, no WAT text) *(amended during implementation)*.
 
 ### 3.3 Handling a request
 
+0. A request without a `Host` header gets `Host: <service>` before it reaches the guest *(amended during implementation)*.
 1. If the request body is larger than `max_body_bytes`: `413`, without instantiating.
 2. Acquire a slot from the in-flight semaphore (`max_in_flight` per node); waiting counts against the timeout.
-3. Create a fresh `Store` with `StoreLimits` (`memory_mb`) and an epoch deadline of `request_timeout_ms / 10` ticks (the engine ticks every 10 ms); instantiate from the cached `ProxyPre`; call the incoming handler.
+3. Create a fresh `Store` with a custom `ResourceLimiter`: `memory_mb` caps the **total** of all linear memories in the store (up to 16 memories; also 32 instances, 16 tables, 100 000 table elements), and the epoch deadline is the time remaining after the slot wait, in 10 ms ticks, so the CPU deadline and the wall timeout end together *(amended during implementation)*; instantiate from the cached `ProxyPre`; call the incoming handler.
 4. The whole call (including time awaiting host calls: KV, outbound HTTP) runs inside `tokio::time::timeout(request_timeout_ms)`.
 5. Collect the response body; if it exceeds `max_body_bytes`: `500`.
 
@@ -102,9 +103,9 @@ Status mapping, each logged with the service name:
 
 The KV WIT has no error results, so a backend error traps the guest with the mapped status recorded in the store's host state.
 
-**Outbound HTTP.** The `send_request` hook compares the URI's `host:port` (port defaulting to 443 for `https`, 80 for `http`) with the allowlist by exact, case-insensitive match. Denied → `ErrorCode::HttpRequestDenied` to the guest and a `warn` log with the destination. Allowed → wasmtime-wasi-http's default client.
+**Outbound HTTP.** The `send_request` hook compares the URI's `host:port` (port defaulting to 443 for `https`, 80 for `http`) with the allowlist by exact, case-insensitive match. Denied → `ErrorCode::HttpRequestDenied` to the guest and a `warn` log with the destination. Allowed → wasmtime-wasi-http's default client. An authority containing userinfo (`@`) is always denied; a trailing-dot host is a different host from the same name without the dot; IPv6 entries are written bracketed (`[::1]:443`) *(amended during implementation)*.
 
-**Stdio.** Guest stdout and stderr are line-buffered into `tracing` (§2.2).
+**Stdio.** Guest stdout and stderr are line-buffered into `tracing` (§2.2). At most 1000 lines per stream per request are logged; then one `warn` "output truncated" and the rest is dropped *(amended during implementation)*.
 
 **`node-id`** returns `ctx.node_id`'s 32 bytes.
 
@@ -141,7 +142,7 @@ Validation on decode and before every write: name pattern; `memory_mb` 1..=1024;
 
 All writes go through the gated `StoreHandle`.
 
-- **`deploy_wasm(name, bytes, opts)`**: `blobs.add_bytes(bytes)` → `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, nothing written) → write the manifest with `version = previous + 1` (1 if none).
+- **`deploy_wasm(name, bytes, opts)`**: `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, so a rejected deploy pins nothing) → `blobs.add_bytes(bytes)` → write the manifest *(amended during implementation)*. A deploy holds the GC lock's shared side from adding the blob until the manifest is written (§5.5) with `version = previous + 1` (1 if none).
 - **`deploy_static(name, dir, opts)`**: `blobs.add_path(dir)` (a collection) → write the manifest.
 - **`set_placement`, `set_outbound`, `set_limits`**: rewrite the manifest with `version + 1`. `NotFound` if undeployed.
 - **`undeploy(name)`**: delete the manifest. The data stays.
@@ -161,7 +162,7 @@ Concurrent writes to one manifest resolve by LWW (the later HLC wins); every nod
 
 One task, supervised and stopped by the node's cancel token.
 
-- **Triggers**: store `Change` events in `_mesh` for `service/*`, `service-gen/*`, `info/<me>`, `members`, `removed`; a full rescan every 60 s and on `Lagged`.
+- **Triggers**: store `Change` events in `_mesh` for `service/*`, `service-gen/*`, `info/<me>`, `members`, `removed`; the node's `MembersChanged` event (via `NodeHandle::subscribe`) for membership-driven placement changes *(amended during implementation)*; a full rescan every 60 s and on `Lagged`.
 - **Target** per service: the manifest if placed here, else none.
 - **Active table**: `RwLock<HashMap<String, Arc<Active>>>`, `Active { manifest, generation, payload: Wasm(Loaded) | Static(StaticSite) }`. Requests clone the `Arc`, so in-flight requests finish on the version they started with.
 - **Transitions**:
@@ -186,6 +187,7 @@ One task, supervised and stopped by the node's cancel token.
 
 ### 5.5 Blob GC (hourly)
 
+- GC considers every pinned blob on a node running `Services`. It holds the GC lock's exclusive side while deciding and removing, recomputes the referenced set right before removing, and skips while the node is not `Running` *(amended during implementation)*.
 - **Referenced** = the module or root of every live manifest, a collection root's children (known from `kind`), and everything in the active table. Placement does not matter: a node that deployed a service it does not run keeps the blob so others can fetch it.
 - A pinned hash that is not referenced gets its first-unreferenced time recorded in `<data>/services/gc.json` (atomic write); after 24 h unreferenced it is removed (unpinned and deleted). Becoming referenced again clears the entry.
 - `mesh-core` additions: `Blobs::pins() -> Vec<(Hash, BlobKind)>` and `Blobs::remove(hash)` (unpin and delete the data; the implementation picks the iroh-blobs mechanism).
@@ -222,9 +224,9 @@ pub struct DeployOpts { pub limits: Limits, pub placement: Placement, pub outbou
 pub enum ServicesError { InvalidName, InvalidManifest(String), InvalidComponent(String), NotFound, Node(NodeError), Runtime(RuntimeError), Io(std::io::Error) }
 ```
 
-- `Services` keeps a clone of the `Node` (add `Clone` to `Node` if missing; it wraps an `Arc`).
+- `Services` holds a non-owning `NodeHandle` (not `Node: Clone`) *(amended during implementation)*: `NodeHandle { node_id, mesh, store, blobs, members, status, subscribe, cancelled, data_dir, now_ms }`, obtained from `Node::handle()`.
 - **KV adapter**: `ServiceKv { store: StoreHandle, ns: String }` implements `KvBackend` over the gated writes and the read view; `NodeError::Store(Full)` → `KvError::Full`, `NodeError::Removed` → `Removed`, `NodeError::Rebootstrapping` → `Rebootstrapping`, others → `Other`. The namespace is fixed at construction, so a service cannot name another namespace.
-- `mesh-core` additions (small): `Node: Clone` if needed, a way for `Services` to tie its tasks to the node's cancel token (e.g. `Node::cancelled()` future), `Blobs::pins`, `Blobs::remove`.
+- `mesh-core` additions (small) *(amended during implementation)*: `Node::handle()` and `NodeHandle` (above, including `cancelled` for tying tasks to the node's cancel token), `Blobs::{pins, remove, collection_entries, size}`, `BlobKind`, `Timings::blob_gc_tick`.
 
 ## 8. Testing
 

@@ -306,13 +306,18 @@ impl Blobs {
     /// temp tag on. It takes about three `Timings::blob_gc_tick`s. Fails fast if the GC loop
     /// has stopped.
     pub async fn remove(&self, hash: Hash) -> Result<(), NodeError> {
-        let deleted = self
-            .api()
-            .tags()
-            .delete(pin_tag(&hash))
-            .await
-            .map_err(err)?;
-        if deleted == 0 && !self.root_complete(hash).await? {
+        self.remove_many(&[hash]).await
+    }
+
+    /// [`Blobs::remove`] for several hashes at once: drops every pin first, then lets a
+    /// single GC run sweep them all, so it takes about as long as one `remove`.
+    pub async fn remove_many(&self, hashes: &[Hash]) -> Result<(), NodeError> {
+        let mut sweep = false;
+        for hash in hashes {
+            let deleted = self.api().tags().delete(pin_tag(hash)).await.map_err(err)?;
+            sweep = sweep || deleted > 0 || self.root_complete(*hash).await?;
+        }
+        if !sweep {
             return Ok(());
         }
         self.sweep.run_sweep().await

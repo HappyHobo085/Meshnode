@@ -24,8 +24,16 @@ struct One {
 }
 
 async fn one(gc_every: Option<Duration>) -> One {
+    one_with(gc_every, None).await
+}
+
+/// [`one`] with another iroh-blobs GC tick (one blob removal takes about three ticks).
+async fn one_with(gc_every: Option<Duration>, blob_gc_tick: Option<Duration>) -> One {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_cfg(dir.path(), "n0");
+    if let Some(tick) = blob_gc_tick {
+        cfg.timings.blob_gc_tick = tick;
+    }
     let clock = ManualClock::new(1_700_000_000_000);
     cfg.wall = Arc::new(clock.clone());
     let node = Node::create_mesh(cfg).await.unwrap();
@@ -305,5 +313,38 @@ async fn gc_rechecks_manifests_before_removing() {
         gc.await.unwrap();
     }
     assert!(t.pinned(v1).await);
+    t.shutdown().await;
+}
+
+/// A pass removes all its doomed blobs with one sweep: three blobs take about as long as
+/// one removal (two to three blob-GC ticks), not three removals in a row (six or more).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_removes_many_blobs_in_one_sweep() {
+    let tick = Duration::from_secs(1);
+    let t = one_with(None, Some(tick)).await;
+    let mut old = Vec::new();
+    for (version, fixture_name) in ["counter", "echo", "outbound"].into_iter().enumerate() {
+        old.push(t.deploy("web", fixture_name, version as u64 + 1).await);
+    }
+    let current = t.deploy("web", "spin", 4).await;
+    t.svc.gc_now().await.unwrap(); // records the three old modules
+
+    t.clock.advance(25 * HOUR_MS);
+    let start = std::time::Instant::now();
+    t.svc.gc_now().await.unwrap();
+    let took = start.elapsed();
+    for h in &old {
+        assert!(!t.pinned(*h).await, "{h} still pinned");
+        assert!(
+            t.node.blobs().size(*h).await.unwrap().is_none(),
+            "{h} still stored"
+        );
+    }
+    assert!(t.pinned(current).await);
+    assert!(
+        took < tick * 5,
+        "removing three blobs took {took:?}; one removal takes at most about {:?}",
+        tick * 3
+    );
     t.shutdown().await;
 }

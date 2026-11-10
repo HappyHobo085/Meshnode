@@ -169,16 +169,18 @@ pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
         doomed.retain(|h| !keep.contains(h));
     }
     save_state(&path, &next)?;
-    for hash in doomed {
-        // Removal takes a few blob-GC ticks; re-check that nothing changed meanwhile.
-        if shared.node.status() != NodeStatus::Running {
-            info!("blob GC stopped: node is not running");
-            break;
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    // One sweep for all of them (a few blob-GC ticks), so the lock is held about as long
+    // as a single removal.
+    match shared.node.blobs().remove_many(&doomed).await {
+        Ok(()) => {
+            for hash in &doomed {
+                info!(hash = %hash.to_hex(), "removed unreferenced service blob");
+            }
         }
-        match shared.node.blobs().remove(hash).await {
-            Ok(()) => info!(hash = %hash.to_hex(), "removed unreferenced service blob"),
-            Err(e) => warn!(hash = %hash.to_hex(), error = %e, "blob removal failed"),
-        }
+        Err(e) => warn!(count = doomed.len(), error = %e, "blob removal failed"),
     }
     Ok(())
 }

@@ -190,7 +190,7 @@ One task, supervised and stopped by the node's cancel token.
 - GC considers every pinned blob on a node running `Services`. It holds the GC lock's exclusive side while deciding and removing, recomputes the referenced set right before removing, and skips while the node is not `Running` *(amended during implementation)*.
 - **Referenced** = the module or root of every live manifest, a collection root's children (known from `kind`), and everything in the active table. Placement does not matter: a node that deployed a service it does not run keeps the blob so others can fetch it.
 - A pinned hash that is not referenced gets its first-unreferenced time recorded in `<data>/services/gc.json` (atomic write); after 24 h unreferenced it is removed (unpinned and deleted). Becoming referenced again clears the entry.
-- `mesh-core` additions: `Blobs::pins() -> Vec<(Hash, BlobKind)>` and `Blobs::remove(hash)` (unpin and delete the data; the implementation picks the iroh-blobs mechanism).
+- `mesh-core` additions: `Blobs::pins() -> Vec<(Hash, BlobKind)>`, `Blobs::remove(hash)` (unpin and delete the data; the implementation picks the iroh-blobs mechanism) and `Blobs::remove_many(&[Hash])`, which drops every pin first and then runs one sweep. A pass removes all its doomed hashes with a single `remove_many`, so it holds the GC lock for about one removal, not one per blob *(amended in final review)*.
 
 ## 6. Static sites
 
@@ -226,7 +226,7 @@ pub enum ServicesError { InvalidName, InvalidManifest(String), InvalidComponent(
 
 - `Services` holds a non-owning `NodeHandle` (not `Node: Clone`) *(amended during implementation)*: `NodeHandle { node_id, mesh, store, blobs, members, status, subscribe, cancelled, data_dir, now_ms }`, obtained from `Node::handle()`.
 - **KV adapter**: `ServiceKv { store: StoreHandle, ns: String }` implements `KvBackend` over the gated writes and the read view; `NodeError::Store(Full)` → `KvError::Full`, `NodeError::Removed` → `Removed`, `NodeError::Rebootstrapping` → `Rebootstrapping`, others → `Other`. The namespace is fixed at construction, so a service cannot name another namespace.
-- `mesh-core` additions (small) *(amended during implementation)*: `Node::handle()` and `NodeHandle` (above, including `cancelled` for tying tasks to the node's cancel token), `Blobs::{pins, remove, collection_entries, size}`, `BlobKind`, `Timings::blob_gc_tick`.
+- `mesh-core` additions (small) *(amended during implementation)*: `Node::handle()` and `NodeHandle` (above, including `cancelled` for tying tasks to the node's cancel token), `Blobs::{pins, remove, remove_many, collection_entries, size}`, `BlobKind`, `Timings::blob_gc_tick` *(`remove_many` amended in final review)*.
 
 ## 8. Testing
 

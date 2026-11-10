@@ -10,6 +10,6 @@ mod status_page;
 
 pub use config::GatewayConfig;
 pub use error::GatewayError;
-pub use forward::Forwarder;
+pub use forward::{Forwarder, PingError, ping};
 pub use serve_httpfwd::{Activity, HttpFwdHandler, HttpFwdSlot};
 pub use server::Gateway;

@@ -188,6 +188,15 @@ fn remove_unknown_prefix_error() {
 }
 
 #[test]
+fn probe_unknown_node_errors() {
+    let dir = offline_dir();
+    let _daemon = start_daemon(dir.path());
+    let o = meshd(dir.path(), &["probe", "zzzz", "--count", "1"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("no member"), "{}", stderr(&o));
+}
+
+#[test]
 fn deploy_static_skips_symlinks() {
     let dir = offline_dir();
     let site = TempDir::new().unwrap();

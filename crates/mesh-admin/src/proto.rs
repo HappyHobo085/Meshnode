@@ -16,6 +16,8 @@ pub const MAX_UPLOAD_FILES: usize = 100_000;
 pub const MAX_UPLOAD_TOTAL: u64 = 1024 * 1024 * 1024;
 /// Largest frame: a 64 MiB file plus its envelope.
 pub const MAX_FRAME: usize = MAX_UPLOAD_FILE as usize + 1024;
+/// Most samples one `Probe` may ask for.
+pub const MAX_PROBE_COUNT: u32 = 1000;
 /// Most lines `LogsTail` may ask for.
 pub const MAX_LOG_LINES: u32 = 10_000;
 
@@ -137,6 +139,14 @@ pub enum AdminRequest {
     LogsTail {
         lines: u32,
         follow: bool,
+    },
+    /// Sends `count` `_ping` requests to the member whose id starts with `node`, one every
+    /// `interval_ms`. Answered by one `LogLines` frame per sample (`seq=<n> ms=<rtt>` or
+    /// `seq=<n> error=<reason>`), then `Ok` (or `Error`). Only while running.
+    Probe {
+        node: String,
+        count: u32,
+        interval_ms: u32,
     },
 }
 

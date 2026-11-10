@@ -768,3 +768,54 @@ async fn no_admin_socket_when_disabled() {
     assert!(!dir.path().join("admin.sock").exists());
     timeout(T, daemon.shutdown()).await.unwrap();
 }
+
+/// The id of `d`'s peer, as hex.
+async fn peer_hex(d: &D) -> String {
+    match d.req(AdminRequest::Members).await {
+        AdminResponse::Members(m) => {
+            let p = m.iter().find(|m| !m.is_self).expect("a peer");
+            hex::encode(p.id.0)
+        }
+        other => panic!("members: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_reports_samples() {
+    let (a, b) = pair().await;
+    let id = peer_hex(&a).await;
+    let mut c = a.client().await;
+    // A prefix is enough, in any case.
+    let prefix = id[..8].to_uppercase();
+    let lines: Vec<Vec<String>> = timeout(
+        T,
+        c.probe(prefix, 3, 100).map(|r| r.expect("probe")).collect(),
+    )
+    .await
+    .unwrap();
+    let lines = lines.concat();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for (i, l) in lines.iter().enumerate() {
+        assert!(l.starts_with(&format!("seq={} ms=", i + 1)), "{l}");
+    }
+    drop((a, b));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_unknown_node_errors() {
+    let (a, _b) = pair().await;
+    for (node, count, want) in [
+        ("zzzz", 1, ErrorCode::NotFound),
+        ("", 1, ErrorCode::InvalidArgument),
+        ("ab", 0, ErrorCode::InvalidArgument),
+    ] {
+        let mut c = a.client().await;
+        let got: Vec<_> = timeout(T, c.probe(node.into(), count, 10).collect())
+            .await
+            .unwrap();
+        match got.as_slice() {
+            [Err(mesh_admin::AdminError::Daemon { code, .. })] => assert_eq!(*code, want, "{node}"),
+            other => panic!("{node}: {other:?}"),
+        }
+    }
+}

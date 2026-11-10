@@ -248,9 +248,55 @@ pub fn qr_text(text: &str) -> Option<String> {
     )
 }
 
+/// The round-trip time of a probe line `seq=<n> ms=<rtt>`; `None` for an error line.
+pub fn probe_sample(line: &str) -> Option<f64> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("ms="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// The nearest-rank `pct`th percentile of `sorted` (ascending, not empty).
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    let rank = (pct / 100.0 * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// `p50=<ms> p95=<ms> max=<ms> failed=<k>/<total>` over the successful samples `ms`.
+pub fn probe_summary(ms: &[f64], total: usize) -> String {
+    let failed = total.saturating_sub(ms.len());
+    let mut sorted = ms.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    if sorted.is_empty() {
+        return format!("p50=- p95=- max=- failed={failed}/{total}");
+    }
+    format!(
+        "p50={:.1} p95={:.1} max={:.1} failed={failed}/{total}",
+        percentile(&sorted, 50.0),
+        percentile(&sorted, 95.0),
+        sorted[sorted.len() - 1],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percentiles_nearest_rank() {
+        let ms: Vec<f64> = (1..=20).rev().map(f64::from).collect();
+        // rank ceil(0.5*20)=10, ceil(0.95*20)=19.
+        assert_eq!(
+            probe_summary(&ms, 20),
+            "p50=10.0 p95=19.0 max=20.0 failed=0/20"
+        );
+        assert_eq!(
+            probe_summary(&[4.0], 3),
+            "p50=4.0 p95=4.0 max=4.0 failed=2/3"
+        );
+        assert_eq!(probe_summary(&[], 2), "p50=- p95=- max=- failed=2/2");
+        assert_eq!(probe_sample("seq=1 ms=12.5"), Some(12.5));
+        assert_eq!(probe_sample("seq=2 error=timed out after 30000 ms"), None);
+    }
 
     #[test]
     fn table_aligns_columns() {

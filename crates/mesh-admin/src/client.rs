@@ -47,7 +47,8 @@ impl AdminClient {
     pub async fn request(&mut self, req: AdminRequest) -> Result<AdminResponse, AdminError> {
         if crate::server::needs_own_method(&req) {
             return Err(AdminError::Protocol(
-                "DeployStatic and LogsTail go through deploy_static and logs_tail".into(),
+                "DeployStatic, LogsTail and Probe go through deploy_static, logs_tail and probe"
+                    .into(),
             ));
         }
         self.start(&req).await?;
@@ -105,30 +106,55 @@ impl AdminClient {
         lines: u32,
         follow: bool,
     ) -> impl Stream<Item = Result<Vec<String>, AdminError>> + '_ {
+        self.stream_lines(AdminRequest::LogsTail { lines, follow })
+    }
+
+    /// The lines of a line-streaming request (`Probe`), until the daemon ends it. Dropping
+    /// a stream before it ends leaves the connection unusable.
+    pub fn probe(
+        &mut self,
+        node: String,
+        count: u32,
+        interval_ms: u32,
+    ) -> impl Stream<Item = Result<Vec<String>, AdminError>> + '_ {
+        self.stream_lines(AdminRequest::Probe {
+            node,
+            count,
+            interval_ms,
+        })
+    }
+
+    fn stream_lines(
+        &mut self,
+        req: AdminRequest,
+    ) -> impl Stream<Item = Result<Vec<String>, AdminError>> + '_ {
         // State: the client, whether the request was sent, whether the stream ended.
-        futures_util::stream::unfold((self, false, false), move |(c, sent, done)| async move {
-            if done {
-                return None;
-            }
-            if !sent && let Err(e) = c.start(&AdminRequest::LogsTail { lines, follow }).await {
-                return Some((Err(e), (c, true, true)));
-            }
-            let item = match c.read_response().await {
-                Ok(AdminResponse::LogLines(l)) => return Some((Ok(l), (c, true, false))),
-                Ok(AdminResponse::Ok) => {
-                    c.broken = false;
+        futures_util::stream::unfold((self, false, false), move |(c, sent, done)| {
+            let req = req.clone();
+            async move {
+                if done {
                     return None;
                 }
-                Ok(AdminResponse::Error { code, message }) => {
-                    c.broken = false;
-                    Err(AdminError::Daemon { code, message })
+                if !sent && let Err(e) = c.start(&req).await {
+                    return Some((Err(e), (c, true, true)));
                 }
-                Ok(other) => Err(AdminError::Protocol(format!(
-                    "unexpected response to LogsTail: {other:?}"
-                ))),
-                Err(e) => Err(e),
-            };
-            Some((item, (c, true, true)))
+                let item = match c.read_response().await {
+                    Ok(AdminResponse::LogLines(l)) => return Some((Ok(l), (c, true, false))),
+                    Ok(AdminResponse::Ok) => {
+                        c.broken = false;
+                        return None;
+                    }
+                    Ok(AdminResponse::Error { code, message }) => {
+                        c.broken = false;
+                        Err(AdminError::Daemon { code, message })
+                    }
+                    Ok(other) => Err(AdminError::Protocol(format!(
+                        "unexpected response to a line stream: {other:?}"
+                    ))),
+                    Err(e) => Err(e),
+                };
+                Some((item, (c, true, true)))
+            }
         })
     }
 

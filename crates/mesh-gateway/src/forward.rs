@@ -14,7 +14,7 @@ use mesh_core::membership::MESH_NS;
 use mesh_core::{Connection, NodeHandle};
 use mesh_proto::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
-    MAX_HEADERS, MAX_PATH, NodeId, Role, ServiceManifest, decode_raw,
+    MAX_HEADERS, MAX_PATH, NodeId, PING_SERVICE, Role, ServiceManifest, decode_raw,
 };
 use mesh_services::{LocalState, Services, manifest_key, placed_hosts};
 use tokio::sync::Semaphore;
@@ -248,6 +248,42 @@ impl Inner {
         }
         conn.close(DROPPED, b"httpfwd error");
     }
+}
+
+/// A `_ping` to a peer failed; the message says why (one line).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PingError(String);
+
+/// Sends one `_ping` `httpfwd` request straight to `peer` and returns the round-trip time,
+/// connection setup included, or an error after `limit`. The peer answers `204` without
+/// consulting its services, whatever its state. Uses the forwarder's frame helpers but
+/// not its connection cache or its host selection.
+pub async fn ping(node: &NodeHandle, peer: NodeId, limit: Duration) -> Result<Duration, PingError> {
+    let req = Request::get("/")
+        .body(Bytes::new())
+        .map_err(|e| PingError(e.to_string()))?;
+    let frame = encode_request(PING_SERVICE, req).map_err(|e| PingError(e.to_string()))?;
+    let start = Instant::now();
+    let run = async {
+        let conn = node.connect(peer, ALPN_HTTPFWD).await?;
+        let result = exchange(&conn, &frame).await;
+        conn.close(DROPPED, b"ping done");
+        result
+    };
+    let fr = match timeout_at(start + limit, run).await {
+        Ok(r) => r.map_err(|e| PingError(e.to_string()))?,
+        Err(_) => {
+            return Err(PingError(format!(
+                "timed out after {} ms",
+                limit.as_millis()
+            )));
+        }
+    };
+    if fr.status != 204 {
+        return Err(PingError(format!("unexpected status {}", fr.status)));
+    }
+    Ok(start.elapsed())
 }
 
 /// Sends one request frame on a new stream and reads the response frame (at most

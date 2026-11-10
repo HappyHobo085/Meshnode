@@ -22,6 +22,9 @@ use super::{
 use crate::config::{ConfigError, HostConfig};
 use crate::paths::{logs_dir, tmp_dir};
 
+/// How long one probe sample may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[async_trait]
 impl AdminBackend for Daemon {
     fn state(&self) -> DaemonState {
@@ -295,6 +298,14 @@ impl Daemon {
                     .map_err(node_error)?;
                 AdminResponse::Ticket { text: t.to_text() }
             }
+            R::Probe {
+                node: prefix,
+                count,
+                interval_ms,
+            } => {
+                let peer = resolve_member(node, &prefix)?;
+                probe(node, peer, count, interval_ms, io).await
+            }
             R::Remove { id } => {
                 is_member(node, id)?;
                 node.remove(id).await.map_err(node_error)?;
@@ -458,6 +469,74 @@ pub(super) fn wipe(dir: &Path) -> io::Result<()> {
             r => return r,
         }
     }
+}
+
+/// The one member whose id (lowercase hex) starts with `prefix`; the rule of
+/// `meshd remove`.
+fn resolve_member(node: &Node, prefix: &str) -> Result<NodeId, Fail> {
+    let p = prefix.trim().to_ascii_lowercase();
+    let bad = |m: String| Fail(ErrorCode::InvalidArgument, m);
+    if p.is_empty() {
+        return Err(bad(
+            "give a member id or a prefix of one (see \"meshd members\")".into(),
+        ));
+    }
+    let members = node.members();
+    let hits: Vec<_> = members
+        .iter()
+        .filter(|m| hex::encode(m.id.0).starts_with(&p))
+        .collect();
+    match hits.as_slice() {
+        [] => Err(Fail(
+            ErrorCode::NotFound,
+            format!("no member has an id starting with {prefix:?}"),
+        )),
+        [one] => Ok(one.id),
+        many => {
+            let list: Vec<String> = many
+                .iter()
+                .map(|m| {
+                    let name = m.info.as_ref().map_or("", |i| i.name.as_str());
+                    format!("{} ({name})", m.id.short())
+                })
+                .collect();
+            Err(bad(format!(
+                "{prefix:?} is ambiguous, it matches {}; give more characters",
+                list.join(", ")
+            )))
+        }
+    }
+}
+
+/// Answers `Probe`: `count` pings to `peer`, one line each, until the client leaves.
+async fn probe(
+    node: &Node,
+    peer: NodeId,
+    count: u32,
+    interval_ms: u32,
+    io: &mut RequestIo<'_>,
+) -> AdminResponse {
+    let handle = node.handle();
+    for seq in 1..=count {
+        if seq > 1 {
+            tokio::select! {
+                _ = io.client_gone() => return AdminResponse::Ok,
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms.into())) => {}
+            }
+        }
+        let sample = tokio::select! {
+            _ = io.client_gone() => return AdminResponse::Ok,
+            r = mesh_gateway::ping(&handle, peer, PROBE_TIMEOUT) => r,
+        };
+        let line = match sample {
+            Ok(rtt) => format!("seq={seq} ms={:.1}", rtt.as_secs_f64() * 1000.0),
+            Err(e) => format!("seq={seq} error={e}"),
+        };
+        if io.send_lines(vec![line]).await.is_err() {
+            return AdminResponse::Ok;
+        }
+    }
+    AdminResponse::Ok
 }
 
 fn is_member(node: &Node, id: NodeId) -> Result<(), Fail> {

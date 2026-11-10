@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 use crate::AdminError;
 use crate::proto::{
     AdminRequest, AdminResponse, DaemonState, ErrorCode, FileData, FileMeta, Hello, MAX_FRAME,
-    MAX_LOG_LINES, PROTOCOL_VERSION, validate_upload,
+    MAX_LOG_LINES, MAX_PROBE_COUNT, PROTOCOL_VERSION, validate_upload,
 };
 use crate::transport::{self, Access, AdminIo, AdminStream, Endpoint, Listener};
 
@@ -487,12 +487,14 @@ async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend, timeouts: Serv
 }
 
 /// Requests that carry an upload or stream lines, so a plain `request` call cannot serve
-/// them. Both clients refuse them through this one predicate; `Probe` (Task 6) streams
-/// lines like `LogsTail` and joins this set.
+/// them. Both clients refuse them through this one predicate; `Probe` streams lines
+/// like `LogsTail`.
 pub(crate) fn needs_own_method(req: &AdminRequest) -> bool {
     matches!(
         req,
-        AdminRequest::DeployStatic { .. } | AdminRequest::LogsTail { .. }
+        AdminRequest::DeployStatic { .. }
+            | AdminRequest::LogsTail { .. }
+            | AdminRequest::Probe { .. }
     )
 }
 
@@ -539,6 +541,9 @@ fn check(state: DaemonState, req: &AdminRequest) -> Result<(), (ErrorCode, Strin
             return invalid(format!(
                 "at most {MAX_LOG_LINES} log lines can be asked for"
             ));
+        }
+        R::Probe { count, .. } if !(1..=MAX_PROBE_COUNT).contains(count) => {
+            return invalid(format!("count must be between 1 and {MAX_PROBE_COUNT}"));
         }
         R::DeployStatic { files, .. } => validate_upload(files).or_else(invalid)?,
         _ => {}

@@ -56,7 +56,7 @@ impl InProcessAdmin {
         if needs_own_method(&req) {
             return AdminResponse::error(
                 ErrorCode::InvalidArgument,
-                "DeployStatic and LogsTail go through deploy_static and logs_tail",
+                "DeployStatic, LogsTail and Probe go through deploy_static and logs_tail",
             );
         }
         self.run(req, Vec::new()).await

@@ -4,6 +4,7 @@
 
 pub mod config;
 mod daemon;
+pub mod lock;
 pub mod logging;
 pub mod paths;
 

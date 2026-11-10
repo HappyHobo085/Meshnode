@@ -13,6 +13,7 @@ use mesh_proto::{InviteTicket, Limits, NodeId, Placement, Role};
 use serde::Serialize;
 
 use crate::cli::{Cli, Command, ConfigCmd, Deploy, LimitArgs, PlacementArgs};
+use crate::output::{say, say_raw};
 use crate::{local, output};
 
 /// A failed command: the message for stderr and the process exit code (1 daemon-reported
@@ -95,7 +96,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             let id =
                 resolve_member(&members(&data).await?, &id_prefix).map_err(CliError::failed)?;
             call(&data, AdminRequest::Remove { id }).await?;
-            println!("Removed {}.", id.short());
+            say!("Removed {}.", id.short());
             Ok(())
         }
         Command::Deploy(d) => deploy(&data, d).await,
@@ -126,10 +127,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Undeploy { name } => {
             call(&data, AdminRequest::Undeploy { name: name.clone() }).await?;
-            println!("Undeployed {name}.");
+            say!("Undeployed {name}.");
             Ok(())
         }
         Command::Purge { name, yes } => {
+            // Fail on an unreachable daemon before asking anything; the connection is not
+            // held across the prompt.
+            drop(connect(&data).await?);
             if !yes
                 && !confirm(&format!(
                     "Delete all data of {name:?} on every node? This cannot be undone."
@@ -138,7 +142,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::failed("not confirmed; nothing was purged"));
             }
             call(&data, AdminRequest::Purge { name: name.clone() }).await?;
-            println!("Purged {name}.");
+            say!("Purged {name}.");
             Ok(())
         }
         Command::Config(ConfigCmd::Get { key, json }) => {
@@ -157,9 +161,9 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
                 return Err(unexpected(&r));
             };
             if restart_required {
-                println!("Saved. Restart meshd for this to take effect.");
+                say!("Saved. Restart meshd for this to take effect.");
             } else {
-                println!("Saved.");
+                say!("Saved.");
             }
             Ok(())
         }
@@ -210,18 +214,18 @@ async fn services(data: &Path) -> Result<Vec<ServiceInfoView>, CliError> {
 fn print_view<T: Serialize + ?Sized>(json: bool, view: &T, text: impl FnOnce(&T) -> String) {
     if json {
         match serde_json::to_string_pretty(view) {
-            Ok(s) => println!("{s}"),
+            Ok(s) => say!("{s}"),
             Err(e) => eprintln!("cannot render JSON: {e}"),
         }
     } else {
-        print!("{}", text(view));
+        say_raw!("{}", text(view));
     }
 }
 
 fn show_manifest(r: AdminResponse) -> Result<(), CliError> {
     match r {
         AdminResponse::Manifest(m) => {
-            println!(
+            say!(
                 "{} is now version {} ({}).",
                 m.name,
                 m.version,
@@ -243,7 +247,7 @@ async fn init(data: &Path, name: String, ticket: Option<String>) -> Result<(), C
                 None => AdminRequest::Init { name },
             };
             ok_answer(client.request(req).await?)?;
-            println!("Done.");
+            say!("Done.");
             Ok(())
         }
         Err(AdminError::NotRunning) => match ticket {
@@ -276,7 +280,7 @@ async fn reset_identity(data: &Path, yes: bool) -> Result<(), CliError> {
         return Err(CliError::failed("not confirmed; nothing was reset"));
     }
     call(data, AdminRequest::ResetIdentity { confirm: true }).await?;
-    println!("Identity reset. Run \"meshd init\" or \"meshd join\" to start over.");
+    say!("Identity reset. Run \"meshd init\" or \"meshd join\" to start over.");
     Ok(())
 }
 
@@ -306,9 +310,9 @@ async fn invite(data: &Path, client: bool, ttl: u32) -> Result<(), CliError> {
     let AdminResponse::Ticket { text } = r else {
         return Err(unexpected(&r));
     };
-    println!("{text}");
+    say!("{text}");
     match output::qr_text(&text) {
-        Some(qr) => println!("\n{qr}"),
+        Some(qr) => say!("\n{qr}"),
         None => eprintln!("(the ticket is too long for a QR code)"),
     }
     Ok(())
@@ -415,7 +419,7 @@ async fn deploy(data: &Path, d: Deploy) -> Result<(), CliError> {
 fn show_deployed(r: AdminResponse) -> Result<(), CliError> {
     match r {
         AdminResponse::Manifest(m) => {
-            println!(
+            say!(
                 "Deployed {} version {} ({}).",
                 m.name,
                 m.version,
@@ -459,12 +463,14 @@ fn walk(
     for entry in std::fs::read_dir(dir).map_err(|e| read_err(dir, e))? {
         let entry = entry.map_err(|e| read_err(dir, e))?;
         let path = entry.path();
-        let name = entry.file_name().into_string().map_err(|_| {
-            CliError::failed(format!(
-                "{} has a name that is not valid UTF-8",
-                path.display()
-            ))
-        })?;
+        let Ok(name) = entry.file_name().into_string() else {
+            warn(format!(
+                "skipping {}{}: its name is not valid UTF-8",
+                prefix,
+                entry.file_name().to_string_lossy()
+            ));
+            continue;
+        };
         let rel = format!("{prefix}{name}");
         // `file_type` does not follow symbolic links.
         let ty = entry.file_type().map_err(|e| read_err(&path, e))?;
@@ -493,11 +499,9 @@ async fn logs(data: &Path, lines: u32, follow: bool) -> Result<(), CliError> {
         tokio::select! {
             item = stream.next() => match item {
                 Some(Ok(batch)) => {
-                    let mut out = io::stdout().lock();
                     for l in batch {
-                        let _ = writeln!(out, "{l}");
+                        say!("{l}");
                     }
-                    let _ = out.flush();
                 }
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
@@ -583,5 +587,43 @@ mod tests {
         let listed: Vec<&str> = files.iter().map(|(m, _)| m.path.as_str()).collect();
         assert_eq!(listed, ["real.txt"]);
         assert_eq!(warnings, ["skipping symlink link.txt"]);
+    }
+
+    #[test]
+    fn collect_files_skips_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("a.txt"), "a").unwrap();
+        let link = dir.path().join("linkdir");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&real, &link);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        if let Err(e) = made {
+            eprintln!("SKIPPED: cannot create a symlink here ({e})");
+            return;
+        }
+        let mut warnings = Vec::new();
+        let files = collect_files(dir.path(), &mut |w| warnings.push(w)).unwrap();
+        let listed: Vec<&str> = files.iter().map(|(m, _)| m.path.as_str()).collect();
+        assert_eq!(listed, ["real/a.txt"]);
+        assert_eq!(warnings, ["skipping symlink linkdir"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_non_utf8_names_with_a_warning() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "x").unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        if std::fs::write(dir.path().join(bad), "x").is_err() {
+            return;
+        }
+        let mut warnings = Vec::new();
+        let files = collect_files(dir.path(), &mut |w| warnings.push(w)).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(warnings[0].contains("not valid UTF-8"), "{warnings:?}");
     }
 }

@@ -549,10 +549,10 @@ async fn reset_identity_only_when_removed() {
     let s = b.status().await;
     assert_eq!((s.state, s.node_id), (DaemonState::Uninitialised, None));
     assert!(b.daemon.gateway_addr().is_none());
-    // Only meshd.toml, the logs and the admin socket are left.
+    // Only meshd.toml, the logs, the admin socket and the lock file are left.
     for e in entries(b.data()) {
         assert!(
-            ["meshd.toml", "logs", "admin.sock"].contains(&e.as_str()),
+            ["meshd.toml", "logs", "admin.sock", "meshd.lock"].contains(&e.as_str()),
             "{e} survived the reset"
         );
     }

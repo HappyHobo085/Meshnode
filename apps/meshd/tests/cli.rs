@@ -216,3 +216,145 @@ fn deploy_static_skips_symlinks() {
     let o = meshd(dir.path(), &["services", "--json"]);
     assert!(stdout(&o).contains("\"site\""), "{}", stdout(&o));
 }
+
+#[test]
+fn purge_checks_the_daemon_before_asking() {
+    let dir = TempDir::new().unwrap();
+    let o = meshd(dir.path(), &["purge", "site"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert_eq!(stderr(&o).trim(), NOT_RUNNING);
+}
+
+#[test]
+fn local_reset_identity_refuses_a_foreign_directory() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("precious.txt"), "keep").unwrap();
+    let o = meshd(dir.path(), &["reset-identity", "--yes"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("not a meshd data directory"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(dir.path().join("precious.txt").exists());
+}
+
+#[test]
+fn local_reset_identity_without_a_mesh_does_nothing() {
+    let dir = offline_dir();
+    std::fs::write(dir.path().join("other.txt"), "x").unwrap();
+    let o = meshd(dir.path(), &["reset-identity", "--yes"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).contains("Nothing to reset"), "{}", stdout(&o));
+    assert!(dir.path().join("other.txt").exists());
+    assert!(dir.path().join("meshd.toml").exists());
+}
+
+#[test]
+fn local_reset_identity_refuses_a_node_that_was_not_removed() {
+    let dir = offline_dir();
+    assert!(
+        meshd(dir.path(), &["init", "--name", "pc"])
+            .status
+            .success()
+    );
+    let o = meshd(dir.path(), &["reset-identity", "--yes"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("not removed"), "{}", stderr(&o));
+    assert!(dir.path().join("mesh.json").exists());
+}
+
+#[test]
+fn held_data_lock_refuses_local_operations() {
+    let dir = offline_dir();
+    std::fs::write(dir.path().join("node.key"), [0u8; 32]).unwrap();
+    let _held = meshd::lock::DataLock::acquire(dir.path()).unwrap();
+    for cmd in [&["init", "--name", "pc"][..], &["reset-identity", "--yes"]] {
+        let o = meshd(dir.path(), cmd);
+        assert_eq!(o.status.code(), Some(1), "{cmd:?}");
+        assert!(
+            stderr(&o).contains("another meshd is already running for"),
+            "{cmd:?}: {}",
+            stderr(&o)
+        );
+    }
+    assert!(!dir.path().join("mesh.json").exists());
+    assert!(dir.path().join("node.key").exists());
+}
+
+#[test]
+fn second_daemon_on_one_data_dir_fails() {
+    let dir = offline_dir();
+    let _daemon = start_daemon(dir.path());
+    let o = meshd(dir.path(), &["run"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("another meshd is already running for"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn reset_wipe_keeps_config_logs_and_lock() {
+    let dir = TempDir::new().unwrap();
+    for f in ["meshd.toml", "meshd.lock", "mesh.json", "node.key"] {
+        std::fs::write(dir.path().join(f), "x").unwrap();
+    }
+    std::fs::create_dir(dir.path().join("logs")).unwrap();
+    std::fs::create_dir(dir.path().join("store")).unwrap();
+    meshd::wipe_identity(dir.path()).unwrap();
+    for kept in ["meshd.toml", "meshd.lock", "logs"] {
+        assert!(dir.path().join(kept).exists(), "{kept}");
+    }
+    for gone in ["mesh.json", "node.key", "store"] {
+        assert!(!dir.path().join(gone).exists(), "{gone}");
+    }
+}
+
+#[test]
+fn closed_stdout_pipe_does_not_panic() {
+    let dir = offline_dir();
+    let _daemon = start_daemon(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meshd"))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["members", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let o = child.wait_with_output().unwrap();
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    assert_ne!(o.status.code(), Some(101));
+}
+
+/// A node that joins a running daemon's mesh through a local `join`; a bad join leaves the
+/// directory reusable.
+#[test]
+fn local_join_success_and_failure_leave_a_reusable_dir() {
+    let host_dir = offline_dir();
+    let host = start_daemon(host_dir.path());
+    let o = meshd(host_dir.path(), &["invite", "--ttl", "10m"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let ticket = stdout(&o).lines().next().unwrap().trim().to_string();
+
+    let joiner = offline_dir();
+    let o = meshd(joiner.path(), &["join", &ticket, "--name", "laptop"]);
+    assert_eq!(o.status.code(), Some(0), "{} {}", stdout(&o), stderr(&o));
+    assert!(joiner.path().join("mesh.json").exists());
+    let cfg = std::fs::read_to_string(joiner.path().join("meshd.toml")).unwrap();
+    assert!(cfg.contains("laptop"), "{cfg}");
+
+    // The ticket was single-use: a second joiner is refused and its directory stays clean.
+    let again = offline_dir();
+    let o = meshd(again.path(), &["join", &ticket, "--name", "third"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    assert!(!again.path().join("mesh.json").exists());
+    let o = meshd(again.path(), &["init", "--name", "solo"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    drop(host);
+}

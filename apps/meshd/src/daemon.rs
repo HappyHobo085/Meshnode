@@ -23,6 +23,7 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::{error, info, warn};
 
 use crate::config::{CONFIG_FILE, ConfigError, MeshdConfig};
+use crate::lock::{DataLock, LOCK_FILE, LockError};
 use crate::paths::{logs_dir, tmp_dir};
 
 mod requests;
@@ -38,7 +39,7 @@ const GATEWAY_STOP: Duration = Duration::from_secs(6);
 const SERVICES_RELEASE: Duration = Duration::from_secs(3);
 const SERVICES_STOP: Duration = Duration::from_secs(3);
 /// Entries of the data directory that `ResetIdentity` keeps.
-const KEPT_ON_RESET: [&str; 3] = [CONFIG_FILE, "logs", "admin.sock"];
+const KEPT_ON_RESET: [&str; 4] = [CONFIG_FILE, "logs", "admin.sock", LOCK_FILE];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -98,6 +99,8 @@ pub struct Daemon {
 }
 
 struct Inner {
+    /// Held for the daemon's lifetime (taken first in `start`).
+    _lock: DataLock,
     data_dir: PathBuf,
     endpoint: Endpoint,
     opts: StartOptions,
@@ -163,6 +166,10 @@ impl Daemon {
         // The directory exists before its endpoint is named (Windows names the pipe after
         // the resolved path).
         std::fs::create_dir_all(&data_dir).map_err(|e| dir_error(&data_dir, e))?;
+        let data_lock = DataLock::acquire(&data_dir).map_err(|e| match e {
+            LockError::Held(_) => DaemonError::AlreadyRunning(data_dir.clone()),
+            LockError::Io { path, source } => DaemonError::DataDir { path, source },
+        })?;
         let endpoint = endpoint_for(&data_dir);
         // Before touching any file: another daemon may be using them.
         if served(&endpoint).await {
@@ -172,6 +179,7 @@ impl Daemon {
         let access = access_for(&cfg);
         let initialised = read_genesis(&data_dir)?.is_some();
         let inner = Arc::new(Inner {
+            _lock: data_lock,
             data_dir,
             endpoint,
             opts,

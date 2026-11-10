@@ -1,9 +1,42 @@
 //! Plain-text output: aligned tables and the views' one-line forms.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
+use std::io::{self, Write as _};
 
 use mesh_admin::{LocalStateView, MemberInfoView, ServiceInfoView, ServiceKindView, StatusInfo};
 use mesh_proto::{NodeId, Placement, Role};
+
+/// Writes to stdout; a closed pipe (`meshd members | head -0`) ends the process quietly
+/// instead of panicking.
+pub fn write_stdout(args: fmt::Arguments<'_>, newline: bool) {
+    let mut out = io::stdout().lock();
+    let mut r = out.write_fmt(args);
+    if r.is_ok() && newline {
+        r = out.write_all(
+            b"
+",
+        );
+    }
+    if let Err(e) = r.and_then(|()| out.flush()) {
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            eprintln!("cannot write output: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+}
+
+/// `println!` that survives a closed pipe.
+macro_rules! say {
+    ($($arg:tt)*) => { $crate::output::write_stdout(format_args!($($arg)*), true) };
+}
+
+/// `print!` that survives a closed pipe.
+macro_rules! say_raw {
+    ($($arg:tt)*) => { $crate::output::write_stdout(format_args!($($arg)*), false) };
+}
+
+pub(crate) use {say, say_raw};
 
 /// Full lowercase hex of a node id (what `remove` and `--nodes` match prefixes of).
 pub fn node_hex(id: &NodeId) -> String {

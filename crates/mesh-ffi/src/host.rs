@@ -81,7 +81,7 @@ pub struct FfiStatus {
     /// Why the last start failed, why `initAndroid` failed, or the last panic; cleared
     /// by a successful start.
     pub last_error: Option<String>,
-    /// The power policy in force (from `meshd.toml`, changed by [`set_power`]); `None`
+    /// The power policy in force (from `meshd.toml`, changed by [`set_power_policy`]); `None`
     /// when stopped.
     pub power_policy: Option<FfiPowerPolicy>,
 }
@@ -222,8 +222,9 @@ struct Host {
     /// Bumped by every [`stop`]: a start asked for before a stop does not start after it,
     /// and `admin_logs` streams end.
     stops: tokio::sync::watch::Sender<u64>,
-    /// The last power state reported (applied to every daemon started).
-    power: Mutex<Option<PowerState>>,
+    /// The platform's last charging and screen report (applied to every daemon started).
+    /// Also serialises [`set_power_state`] and [`set_power_policy`].
+    power: Mutex<Option<PlatformPower>>,
     sink: Arc<SinkSlot>,
     control: Mutex<Option<Arc<dyn FfiServiceControl>>>,
     /// The global log subscriber's file writer, once installed (first start).
@@ -396,17 +397,12 @@ impl Host {
             if self.test.panic_next.swap(false, Ordering::SeqCst) {
                 panic!("test panic in start");
             }
-            // Under the power lock, so that a concurrent `set_power` is not lost. The
-            // policy is the one in meshd.toml (the daemon loaded it); charging and screen
-            // are the platform's last report.
-            let mut power = lock(&self.power);
+            // Under the power lock, so that a concurrent `set_power_state` is not lost.
+            // The policy is the one in meshd.toml (the daemon loaded it); charging and
+            // screen are the platform's last report.
+            let power = lock(&self.power);
             if let Some(reported) = *power {
-                let state = PowerState {
-                    policy: daemon.power_state().policy,
-                    ..reported
-                };
-                daemon.set_power(state);
-                *power = Some(state);
+                daemon.set_power(reported.with_policy(daemon.power_state().policy));
             }
             let mut live = lock(&self.live);
             *live = Some(daemon.clone());
@@ -564,8 +560,8 @@ fn encode(resp: &AdminResponse) -> Result<Vec<u8>, FfiError> {
 /// socket; periodic work driven by the platform; wake locks through the registered sink).
 /// Idempotent: while running (with the same directory) it returns the status; concurrent
 /// calls start one daemon. A [`stop`] called after this start was called wins: then this
-/// returns `Ok` with state `Stopped`. The power policy is the one in `meshd.toml`; a
-/// [`set_power`] before the start only contributes charging and screen state.
+/// returns `Ok` with state `Stopped`. The power policy is the one in `meshd.toml`; the
+/// charging and screen state last reported by [`set_power_state`] is applied to it.
 #[uniffi::export]
 pub async fn start(data_dir: String) -> Result<FfiStatus, FfiError> {
     on_host(move |h| {
@@ -627,28 +623,65 @@ pub fn network_changed() {
     )
 }
 
-/// Reports the power state. While running, it is applied, and a policy change is saved
-/// to `meshd.toml`. Before a start, only charging and screen are kept for it (the policy
-/// in `meshd.toml` wins).
+/// The platform's charging and screen state, as last reported.
+#[derive(Clone, Copy, Debug)]
+struct PlatformPower {
+    charging: bool,
+    screen_on: bool,
+}
+
+impl PlatformPower {
+    fn with_policy(self, policy: PowerPolicy) -> PowerState {
+        PowerState {
+            policy,
+            charging: self.charging,
+            screen_on: self.screen_on,
+        }
+    }
+}
+
+/// Reports charging and screen state. It is kept for later starts and, while running,
+/// applied with the policy in force; it never changes the policy (nor `meshd.toml`).
 #[uniffi::export]
-pub fn set_power(policy: FfiPowerPolicy, charging: bool, screen_on: bool) {
+pub fn set_power_state(charging: bool, screen_on: bool) {
     guarded(
-        "set_power",
+        "set_power_state",
         || {
             let h = host();
-            let state = PowerState {
-                policy: policy.into(),
+            let reported = PlatformPower {
                 charging,
                 screen_on,
             };
             let mut power = lock(&h.power);
-            *power = Some(state);
+            *power = Some(reported);
             let daemon = lock(&h.live).clone();
             if let Some(d) = daemon {
-                d.set_power(state);
+                d.set_power(reported.with_policy(d.power_state().policy));
             }
         },
         drop,
+    )
+}
+
+/// Changes the power policy of the running node and saves it to `meshd.toml` (the user
+/// picked a new one). `NotRunning` while stopped.
+#[uniffi::export]
+pub fn set_power_policy(policy: FfiPowerPolicy) -> Result<(), FfiError> {
+    guarded(
+        "set_power_policy",
+        || {
+            let h = host();
+            // Serialised with `set_power_state`, so neither overwrites the other's field.
+            let _power = lock(&h.power);
+            let daemon = lock(&h.live).clone().ok_or(FfiError::NotRunning)?;
+            let state = PowerState {
+                policy: policy.into(),
+                ..daemon.power_state()
+            };
+            daemon.set_power(state);
+            Ok(())
+        },
+        |msg| Err(FfiError::Panic { message: msg }),
     )
 }
 

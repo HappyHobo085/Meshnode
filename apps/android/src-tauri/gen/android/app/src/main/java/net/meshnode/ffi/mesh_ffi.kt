@@ -839,6 +839,8 @@ internal open class UniffiVTableCallbackInterfaceFfiWakeLockSink(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -862,7 +864,9 @@ fun uniffi_mesh_ffi_checksum_func_admin_logs(
 ): Short
 fun uniffi_mesh_ffi_checksum_func_network_changed(
 ): Short
-fun uniffi_mesh_ffi_checksum_func_set_power(
+fun uniffi_mesh_ffi_checksum_func_set_power_policy(
+): Short
+fun uniffi_mesh_ffi_checksum_func_set_power_state(
 ): Short
 fun uniffi_mesh_ffi_checksum_func_set_service_control(
 ): Short
@@ -978,7 +982,9 @@ fun uniffi_mesh_ffi_fn_func_admin_logs(`request`: RustBuffer.ByValue,`sink`: Poi
 ): Unit
 fun uniffi_mesh_ffi_fn_func_network_changed(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_mesh_ffi_fn_func_set_power(`policy`: RustBuffer.ByValue,`charging`: Byte,`screenOn`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_mesh_ffi_fn_func_set_power_policy(`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_mesh_ffi_fn_func_set_power_state(`charging`: Byte,`screenOn`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_mesh_ffi_fn_func_set_service_control(`ctl`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1130,7 +1136,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mesh_ffi_checksum_func_network_changed() != 21280.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_mesh_ffi_checksum_func_set_power() != 47452.toShort()) {
+    if (lib.uniffi_mesh_ffi_checksum_func_set_power_policy() != 8507.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_mesh_ffi_checksum_func_set_power_state() != 1681.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_ffi_checksum_func_set_service_control() != 12447.toShort()) {
@@ -1139,7 +1148,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mesh_ffi_checksum_func_set_wake_lock_sink() != 394.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_mesh_ffi_checksum_func_start() != 24462.toShort()) {
+    if (lib.uniffi_mesh_ffi_checksum_func_start() != 26265.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_ffi_checksum_func_status() != 45279.toShort()) {
@@ -2529,7 +2538,7 @@ data class FfiStatus (
      */
     var `lastError`: kotlin.String?, 
     /**
-     * The power policy in force (from `meshd.toml`, changed by [`set_power`]); `None`
+     * The power policy in force (from `meshd.toml`, changed by [`set_power_policy`]); `None`
      * when stopped.
      */
     var `powerPolicy`: FfiPowerPolicy?
@@ -2957,14 +2966,26 @@ public object FfiConverterSequenceTypeFfiFile: FfiConverterRustBuffer<List<FfiFi
     
 
         /**
-         * Reports the power state. While running, it is applied, and a policy change is saved
-         * to `meshd.toml`. Before a start, only charging and screen are kept for it (the policy
-         * in `meshd.toml` wins).
-         */ fun `setPower`(`policy`: FfiPowerPolicy, `charging`: kotlin.Boolean, `screenOn`: kotlin.Boolean)
+         * Changes the power policy of the running node and saves it to `meshd.toml` (the user
+         * picked a new one). `NotRunning` while stopped.
+         */
+    @Throws(FfiException::class) fun `setPowerPolicy`(`policy`: FfiPowerPolicy)
+        = 
+    uniffiRustCallWithError(FfiException) { _status ->
+    UniffiLib.INSTANCE.uniffi_mesh_ffi_fn_func_set_power_policy(
+        FfiConverterTypeFfiPowerPolicy.lower(`policy`),_status)
+}
+    
+    
+
+        /**
+         * Reports charging and screen state. It is kept for later starts and, while running,
+         * applied with the policy in force; it never changes the policy (nor `meshd.toml`).
+         */ fun `setPowerState`(`charging`: kotlin.Boolean, `screenOn`: kotlin.Boolean)
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_mesh_ffi_fn_func_set_power(
-        FfiConverterTypeFfiPowerPolicy.lower(`policy`),FfiConverterBoolean.lower(`charging`),FfiConverterBoolean.lower(`screenOn`),_status)
+    UniffiLib.INSTANCE.uniffi_mesh_ffi_fn_func_set_power_state(
+        FfiConverterBoolean.lower(`charging`),FfiConverterBoolean.lower(`screenOn`),_status)
 }
     
     
@@ -2997,8 +3018,8 @@ public object FfiConverterSequenceTypeFfiFile: FfiConverterRustBuffer<List<FfiFi
          * socket; periodic work driven by the platform; wake locks through the registered sink).
          * Idempotent: while running (with the same directory) it returns the status; concurrent
          * calls start one daemon. A [`stop`] called after this start was called wins: then this
-         * returns `Ok` with state `Stopped`. The power policy is the one in `meshd.toml`; a
-         * [`set_power`] before the start only contributes charging and screen state.
+         * returns `Ok` with state `Stopped`. The power policy is the one in `meshd.toml`; the
+         * charging and screen state last reported by [`set_power_state`] is applied to it.
          */
     @Throws(FfiException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")

@@ -1,5 +1,7 @@
 package net.meshnode.app
 
+import android.app.AlarmManager
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -33,13 +35,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import net.meshnode.ffi.FfiException
-import net.meshnode.ffi.FfiPowerPolicy
 import net.meshnode.ffi.FfiServiceControl
 import net.meshnode.ffi.FfiState
 import net.meshnode.ffi.FfiStatus
 import net.meshnode.ffi.FfiWakeReason
 import net.meshnode.ffi.networkChanged
-import net.meshnode.ffi.setPower
+import net.meshnode.ffi.setPowerState
 import net.meshnode.ffi.setServiceControl
 import net.meshnode.ffi.setWakeLockSink
 import net.meshnode.ffi.start
@@ -73,6 +74,11 @@ class MeshService : Service() {
   private var networkDebounce: Job? = null
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
   private var powerReceiverRegistered = false
+  private var setUpDone = false
+  private var lastStartId = 0
+
+  /** Whether a stop() ran (or runs) for this instance; onDestroy stops the node otherwise. */
+  private var stopRan = false
 
   private val powerReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -99,7 +105,14 @@ class MeshService : Service() {
       Log.e(TAG, "initAndroid failed", t)
     }
     instance = this
+    // Only what startForeground needs; the rest waits for the foreground (setUp).
     createChannel()
+  }
+
+  /** Once, after the first successful startForeground: callbacks, receivers, scheduling. */
+  private fun setUp() {
+    if (setUpDone) return
+    setUpDone = true
     try {
       setWakeLockSink(WakeLocks.get(this))
       setServiceControl(ServiceControl(this))
@@ -121,21 +134,36 @@ class MeshService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    if (intent?.action == ACTION_STOP) {
+    lastStartId = startId
+    val action = intent?.action
+    if (action == ACTION_STOP) {
       userStop()
       return START_NOT_STICKY
     }
-    if (intent == null && Prefs(this).userStopped) {
-      // A sticky restart after the user stopped it: stay stopped.
-      stopSelf()
+    val userStopped = Prefs(this).userStopped
+    if (intent == null && userStopped) {
+      // A sticky restart after the user stopped it (not a startForegroundService): stay
+      // stopped.
+      stopSelfResult(lastStartId)
       return START_NOT_STICKY
     }
     // Every startForegroundService must be answered by startForeground, also when already
-    // in the foreground.
+    // in the foreground, and also when it is about to stop again.
     if (!enterForeground()) {
-      stopSelf()
+      // Android refused the background start: tell the user instead of failing silently.
+      if (!userStopped) Alerts.restartNeeded(this)
+      stopSelfResult(lastStartId)
       return START_NOT_STICKY
     }
+    if (userStopped && action != ACTION_START) {
+      // Only the user's Start (ACTION_START) overrides a Stop.
+      if (!stopping) {
+        leaveForeground()
+        stopSelfResult(lastStartId)
+      }
+      return START_NOT_STICKY
+    }
+    setUp()
     startNode()
     return START_STICKY
   }
@@ -162,6 +190,20 @@ class MeshService : Service() {
       unregisterReceiver(powerReceiver)
       powerReceiverRegistered = false
     }
+    // No wake lock outlives the service, and no node runs without it.
+    WakeLocks.get(this).releaseAll()
+    if (!stopRan) {
+      stopRan = true
+      scope.launch {
+        try {
+          stop()
+        } catch (e: CancellationException) {
+          throw e
+        } catch (t: Throwable) {
+          Log.e(TAG, "stop on destroy failed", t)
+        }
+      }
+    }
     super.onDestroy()
   }
 
@@ -182,6 +224,7 @@ class MeshService : Service() {
     if (startInFlight) return
     startInFlight = true
     starting = true
+    stopRan = false // a new node: onDestroy must stop it unless a Stop does
     if (!nodeUp) post(NotificationText.starting())
     val dir = dataDir(this)
     scope.launch {
@@ -196,7 +239,6 @@ class MeshService : Service() {
           nodeUp = false
         } else {
           text = textFor(s)
-          reportPower() // now with the policy from meshd.toml
         }
       } catch (e: CancellationException) {
         throw e
@@ -226,6 +268,7 @@ class MeshService : Service() {
     pendingStart = false
     if (stopping) return
     stopping = true
+    stopRan = true
     scope.launch {
       try {
         stop()
@@ -247,9 +290,13 @@ class MeshService : Service() {
       startNode()
       return
     }
+    leaveForeground()
+    stopSelfResult(lastStartId)
+  }
+
+  private fun leaveForeground() {
     foreground = false
     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-    stopSelf()
   }
 
   /** Re-reads the status and updates the notification (any thread). */
@@ -298,6 +345,7 @@ class MeshService : Service() {
         startForeground(NOTIFICATION_ID, n)
       }
       foreground = true
+      Alerts.clearRestartNeeded(this)
       true
     } catch (e: RuntimeException) {
       // ForegroundServiceStartNotAllowedException (a background start) or a SecurityException.
@@ -363,17 +411,16 @@ class MeshService : Service() {
   }
 
   /**
-   * Reports charging and screen state with the policy in force (`status().powerPolicy`,
-   * from meshd.toml), so it is never changed here. Before a start the policy is ignored.
-   * Serialised, so the last report carries the latest state.
+   * Reports charging and screen state; it never touches the policy (meshd.toml's, changed
+   * only by `setPowerPolicy` when the user picks one). Serialised, so the last report
+   * carries the latest state.
    */
   private fun reportPower() {
     powerExecutor.execute {
       try {
-        val policy = status().powerPolicy ?: FfiPowerPolicy.BALANCED
-        setPower(policy, charging, screenOn)
+        setPowerState(charging, screenOn)
       } catch (t: Throwable) {
-        Log.w(TAG, "setPower failed", t)
+        Log.w(TAG, "setPowerState failed", t)
       }
     }
   }
@@ -418,6 +465,9 @@ class MeshService : Service() {
 
   companion object {
     const val ACTION_STOP = "net.meshnode.app.action.STOP"
+
+    /** The user's Start: the only start that overrides `user_stopped`. */
+    const val ACTION_START = "net.meshnode.app.action.START"
     private const val TAG = "Meshnode"
     private const val CHANNEL_ID = "meshnode"
     private const val NOTIFICATION_ID = 1
@@ -446,16 +496,50 @@ class MeshService : Service() {
       if (RestartPolicy.clearsUserStopped(trigger)) prefs.userStopped = false
       val running = instance?.isNodeRunning() ?: false
       if (!RestartPolicy.shouldStart(trigger, prefs.userStopped, running)) return false
+      if (instance == null && backgroundStartRefused(app, trigger)) {
+        // Android would refuse it: say so instead of trying.
+        Log.w(TAG, "$trigger: a background start would be refused; posting the alert")
+        Alerts.restartNeeded(app)
+        return false
+      }
       return launch(app)
     }
 
-    /** `startForegroundService`; false when Android refuses it (e.g. a background start). */
-    fun launch(context: Context): Boolean =
+    /**
+     * Whether Android 12+ will refuse a foreground-service start for [trigger] while the app
+     * has no foreground service: the watchdog always, the restart alarm when it could only
+     * be inexact (an exact alarm is exempt). The battery exemption lifts both.
+     */
+    private fun backgroundStartRefused(context: Context, trigger: RestartPolicy.Trigger): Boolean {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+      val exempt = context.getSystemService(PowerManager::class.java)
+        ?.isIgnoringBatteryOptimizations(context.packageName) == true
+      if (exempt) return false
+      return when (trigger) {
+        RestartPolicy.Trigger.WATCHDOG -> true
+        RestartPolicy.Trigger.TASK_REMOVED_ALARM ->
+          context.getSystemService(AlarmManager::class.java)?.canScheduleExactAlarms() != true
+        else -> false
+      }
+    }
+
+    /**
+     * `startForegroundService` (with [action], e.g. [ACTION_START]); false when Android
+     * refuses it, in which case a background refusal posts the restart alert.
+     */
+    fun launch(context: Context, action: String? = null): Boolean =
       try {
-        ContextCompat.startForegroundService(context, Intent(context, MeshService::class.java))
+        val intent = Intent(context, MeshService::class.java)
+        if (action != null) intent.action = action
+        ContextCompat.startForegroundService(context, intent)
         true
       } catch (e: RuntimeException) {
         Log.w(TAG, "startForegroundService refused", e)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+          e is ForegroundServiceStartNotAllowedException
+        ) {
+          Alerts.restartNeeded(context)
+        }
         false
       }
   }
@@ -473,7 +557,7 @@ class ServiceControl(context: Context) : FfiServiceControl {
   override fun startService() {
     try {
       Prefs(app).userStopped = false
-      MeshService.launch(app)
+      MeshService.launch(app, MeshService.ACTION_START)
     } catch (t: Throwable) {
       Log.e("Meshnode", "service_start failed", t)
     }

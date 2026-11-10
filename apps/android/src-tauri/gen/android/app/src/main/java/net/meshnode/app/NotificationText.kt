@@ -12,6 +12,15 @@ object NotificationText {
 
   fun uninitialised(): String = "Meshnode: not set up — tap to open"
 
+  /**
+   * The alert (an ordinary notification) when Android refused to restart the service from
+   * the background; tapping it opens the app, which may start it.
+   */
+  fun restartNeeded(): String = "Meshnode stopped in the background — tap to restart"
+
+  /** The onboarding note under the battery-exemption line. */
+  fun batteryExemptionWhy(): String = "Needed for automatic restart after the system stops Meshnode"
+
   /** Shown from `startForeground` until the first `start()` returns. */
   fun starting(): String = "Meshnode: starting…"
 

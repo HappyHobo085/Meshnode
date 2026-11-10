@@ -36,7 +36,10 @@ class OnboardingActivity : AppCompatActivity() {
   private lateinit var batteryButton: Button
 
   private val askNotifications =
-    registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+    registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+      if (!granted) Prefs(this).notificationDenials += 1
+      refresh()
+    }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -55,7 +58,13 @@ class OnboardingActivity : AppCompatActivity() {
 
     notificationsLine = text("")
     notificationsButton = button("Allow notifications") {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      if (Prefs(this).notificationDenials >= 2) {
+        // Android no longer shows the request after two denials: open the app's settings.
+        open(
+          Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+        )
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
       }
     }
@@ -74,7 +83,7 @@ class OnboardingActivity : AppCompatActivity() {
     for (v in listOf(
       notificationsLine, notificationsButton,
       alarmsLine, alarmsButton,
-      batteryLine, batteryButton,
+      batteryLine, text(NotificationText.batteryExemptionWhy(), 14f), batteryButton,
     )) {
       column.addView(v)
     }
@@ -88,8 +97,7 @@ class OnboardingActivity : AppCompatActivity() {
     column.addView(
       button("Continue") {
         Prefs(this).onboarded = true
-        startActivity(Intent(this, MainActivity::class.java))
-        finish()
+        finish() // back to MainActivity, which opened this over itself
       },
     )
 

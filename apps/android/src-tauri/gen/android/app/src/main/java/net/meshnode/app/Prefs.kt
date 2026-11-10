@@ -17,9 +17,15 @@ class Prefs(context: Context) {
     get() = sp.getBoolean(KEY_ONBOARDED, false)
     set(value) = sp.edit { putBoolean(KEY_ONBOARDED, value) }
 
+  /** How often the notification permission request was denied (onboarding). */
+  var notificationDenials: Int
+    get() = sp.getInt(KEY_NOTIFICATION_DENIALS, 0)
+    set(value) = sp.edit { putInt(KEY_NOTIFICATION_DENIALS, value) }
+
   private companion object {
     const val FILE = "meshnode"
     const val KEY_USER_STOPPED = "user_stopped"
     const val KEY_ONBOARDED = "onboarded"
+    const val KEY_NOTIFICATION_DENIALS = "notification_denials"
   }
 }

@@ -157,10 +157,10 @@ async fn wake_lock_sink_receives_always_on() {
     let dir = TempDir::new().unwrap();
     let rec = Arc::new(Rec::default());
     mesh_ffi::set_wake_lock_sink(rec.clone());
-    mesh_ffi::set_power(FfiPowerPolicy::Balanced, false, true);
+    mesh_ffi::set_power_state(false, true);
     mesh_ffi::start(dir_str(&dir)).await.unwrap();
     assert!(rec.take().is_empty());
-    mesh_ffi::set_power(FfiPowerPolicy::AlwaysOn, false, true);
+    mesh_ffi::set_power_policy(FfiPowerPolicy::AlwaysOn).unwrap();
     assert_eq!(rec.take(), [format!("+always:{}", u64::MAX)]);
     // A wake without a node does nothing (and does not fail).
     mesh_ffi::wake(FfiWakeReason::Alarm).await;
@@ -170,7 +170,11 @@ async fn wake_lock_sink_receives_always_on() {
     // The policy was persisted to meshd.toml.
     let toml = std::fs::read_to_string(dir.path().join("meshd.toml")).unwrap();
     assert!(toml.contains("always_on"), "{toml}");
-    mesh_ffi::set_power(FfiPowerPolicy::Balanced, false, true);
+    // Without a node there is no policy to change.
+    assert!(matches!(
+        mesh_ffi::set_power_policy(FfiPowerPolicy::Balanced),
+        Err(FfiError::NotRunning)
+    ));
 }
 
 #[tokio::test]
@@ -180,7 +184,7 @@ async fn wake_lock_sink_set_after_start_gets_held_locks() {
     let early = Arc::new(Rec::default());
     mesh_ffi::set_wake_lock_sink(early.clone());
     mesh_ffi::start(dir_str(&dir)).await.unwrap();
-    mesh_ffi::set_power(FfiPowerPolicy::AlwaysOn, false, true);
+    mesh_ffi::set_power_policy(FfiPowerPolicy::AlwaysOn).unwrap();
     assert_eq!(early.take(), [format!("+always:{}", u64::MAX)]);
     // A sink registered later (the service restarted) takes the locks held and gets the
     // later events; the old one lets go of them and gets nothing more.
@@ -188,7 +192,7 @@ async fn wake_lock_sink_set_after_start_gets_held_locks() {
     mesh_ffi::set_wake_lock_sink(late.clone());
     assert_eq!(early.take(), ["-always"]);
     assert_eq!(late.take(), [format!("+always:{}", u64::MAX)]);
-    mesh_ffi::set_power(FfiPowerPolicy::Balanced, false, true);
+    mesh_ffi::set_power_policy(FfiPowerPolicy::Balanced).unwrap();
     assert_eq!(late.take(), ["-always"]);
     assert!(early.take().is_empty());
     mesh_ffi::stop().await;
@@ -274,18 +278,22 @@ async fn policy_comes_from_meshd_toml() {
 power = \"saver\"
 ";
     std::fs::write(dir.path().join("meshd.toml"), toml).unwrap();
-    // Reported before the start: only charging and screen count.
-    mesh_ffi::set_power(FfiPowerPolicy::Balanced, true, false);
+    // Reported before the start: only charging and screen exist to report.
+    mesh_ffi::set_power_state(true, false);
     assert_eq!(mesh_ffi::status().power_policy, None);
     let st = mesh_ffi::start(dir_str(&dir)).await.unwrap();
     assert_eq!(st.power_policy, Some(FfiPowerPolicy::Saver));
+    assert_eq!(mesh_ffi::status().power_policy, Some(FfiPowerPolicy::Saver));
+    // Charging and screen reports while running never touch the policy.
+    mesh_ffi::set_power_state(false, true);
+    mesh_ffi::set_power_state(true, true);
     assert_eq!(mesh_ffi::status().power_policy, Some(FfiPowerPolicy::Saver));
     mesh_ffi::stop().await;
     assert_eq!(
         std::fs::read_to_string(dir.path().join("meshd.toml")).unwrap(),
         toml
     );
-    mesh_ffi::set_power(FfiPowerPolicy::Balanced, false, true);
+    mesh_ffi::set_power_state(false, true);
 }
 
 #[tokio::test]

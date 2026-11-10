@@ -25,8 +25,9 @@ class AlarmReceiver : BroadcastReceiver() {
       }
     MeshService.scope.launch {
       try {
-        // wake returns within 10 s by itself (a no-op while stopped); this bounds it anyway.
-        withTimeoutOrNull(WAKE_LOCK_MS) { wake(FfiWakeReason.ALARM) }
+        // wake returns within 10 s by itself (a no-op while stopped); 8 s here leaves room
+        // for the refresh and finish() inside the 10 s lock.
+        withTimeoutOrNull(WAKE_BOUND_MS) { wake(FfiWakeReason.ALARM) }
         MeshService.instance?.refreshNotification()
       } catch (t: Throwable) {
         Log.w("Meshnode", "alarm wake failed", t)
@@ -42,5 +43,6 @@ class AlarmReceiver : BroadcastReceiver() {
 
   private companion object {
     const val WAKE_LOCK_MS = 10_000L
+    const val WAKE_BOUND_MS = 8_000L
   }
 }

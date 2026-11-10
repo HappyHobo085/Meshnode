@@ -59,7 +59,8 @@ Defaults reproduce desktop behaviour exactly.
 | `status() -> Status` | `{ state: Stopped/Uninitialised/Running/Removed, node_id, mesh_name, services_hosted, peers_online, gateway_ports, last_error }`. |
 | `wake(reason) -> ()` | `reason ∈ {Alarm, Network, Boot, Incoming}`. Runs catch-up + address refresh now; returns when done or after 10 s. |
 | `network_changed()` | Calls iroh `Endpoint::network_change()`. |
-| `set_power(policy, charging, screen_on)` | Updates the power state (§5.3). |
+| `set_power_state(charging, screen_on)` | Reports charging and screen state (§5.3); never changes the policy. |
+| `set_power_policy(policy)` | Changes the policy of the running node and saves it to `meshd.toml`; `NotRunning` while stopped. |
 | `set_wake_lock_sink(sink)` | Kotlin callback interface `{ acquire(tag, max_ms), release(tag) }`. |
 | `admin(request: bytes) -> bytes` | postcard `AdminRequest` → `AdminResponse` over the in-process transport. |
 | `admin_upload(...)`, `admin_logs(...)` | Streaming variants for `DeployStatic` and `LogsTail` (callback interface for log lines). |
@@ -88,7 +89,7 @@ in-memory implementation. Tests mirror the socket tests (§8.1).
   watchdog / package-replaced do **not** start the service. Opening the app and pressing Start clears it.
 - `onTaskRemoved`: schedule the restart alarm (§5.2).
 - `ConnectivityManager.NetworkCallback` → `network_changed()` and `wake(Network)`.
-- `ACTION_POWER_CONNECTED/DISCONNECTED`, `ACTION_SCREEN_ON/OFF` → `set_power(...)`.
+- `ACTION_POWER_CONNECTED/DISCONNECTED`, `ACTION_SCREEN_ON/OFF` → `set_power_state(...)`.
 - Data dir: `context.filesDir/meshnode` (app-private).
 
 ### 5.2 Starting, restarting and wall-clock work

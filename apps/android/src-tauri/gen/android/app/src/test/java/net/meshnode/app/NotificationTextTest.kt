@@ -24,6 +24,22 @@ class NotificationTextTest {
   }
 
   @Test
+  fun restartNeeded() {
+    assertEquals(
+      "Meshnode stopped in the background — tap to restart",
+      NotificationText.restartNeeded(),
+    )
+  }
+
+  @Test
+  fun batteryExemptionWhy() {
+    assertEquals(
+      "Needed for automatic restart after the system stops Meshnode",
+      NotificationText.batteryExemptionWhy(),
+    )
+  }
+
+  @Test
   fun starting() {
     assertEquals("Meshnode: starting…", NotificationText.starting())
   }

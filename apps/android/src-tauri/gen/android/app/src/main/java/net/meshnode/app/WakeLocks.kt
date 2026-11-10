@@ -42,6 +42,11 @@ class WakeLocks private constructor(context: Context) : FfiWakeLockSink {
     }
   }
 
+  /** Releases every lock held (the service is going away). */
+  fun releaseAll() {
+    for (tag in locks.keys) release(tag)
+  }
+
   companion object {
     private const val TAG = "Meshnode"
 

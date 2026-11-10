@@ -2,6 +2,7 @@ package net.meshnode.app
 
 import net.meshnode.app.RestartPolicy.Trigger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RestartPolicyTest {
@@ -52,9 +53,10 @@ class RestartPolicyTest {
     for (t in Trigger.entries) {
       for (userStopped in listOf(false, true)) {
         for (running in listOf(false, true)) {
-          assert(table.any { it.first == t && it.second == (userStopped to running) }) {
-            "missing $t $userStopped $running"
-          }
+          assertTrue(
+            "missing $t $userStopped $running",
+            table.any { it.first == t && it.second == (userStopped to running) },
+          )
         }
       }
     }

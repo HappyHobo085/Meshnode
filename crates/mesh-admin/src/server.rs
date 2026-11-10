@@ -33,8 +33,30 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HELLO_FRAME: usize = 1024;
 /// Pause after a failed accept, so a persistent failure does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// A connection with no request for this long is closed (a following `LogsTail` is not
+/// idle: it ends when the client leaves).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// While a static upload is received, each `FileData` frame must arrive within this time.
+const UPLOAD_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// A `FileData` frame's bytes beyond the file itself (version byte and length varint).
 const FILE_FRAME_ENVELOPE: usize = 16;
+
+/// How long a connection may sit idle between requests, and how long each upload frame
+/// may take. Only the test-hooks constructor changes them.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerTimeouts {
+    pub idle: Duration,
+    pub upload_frame: Duration,
+}
+
+impl Default for ServerTimeouts {
+    fn default() -> Self {
+        ServerTimeouts {
+            idle: IDLE_TIMEOUT,
+            upload_frame: UPLOAD_FRAME_TIMEOUT,
+        }
+    }
+}
 
 /// What the daemon does with each request.
 #[async_trait]
@@ -70,6 +92,7 @@ pub struct RequestIo<'a> {
     failed: Option<UploadError>,
     /// The client left, or sent bytes it should not have: close without answering.
     gone: bool,
+    upload_frame_timeout: Duration,
 }
 
 impl RequestIo<'_> {
@@ -83,7 +106,16 @@ impl RequestIo<'_> {
             return Ok(None);
         };
         let max = meta.size as usize + FILE_FRAME_ENVELOPE;
-        let err = match read_frame::<_, FileData>(&mut self.conn, max).await {
+        let read = timeout(
+            self.upload_frame_timeout,
+            read_frame::<_, FileData>(&mut self.conn, max),
+        );
+        let Ok(read) = read.await else {
+            let err = UploadError::Connection(format!("no data for {:?} in time", meta.path));
+            self.failed = Some(err.clone());
+            return Err(err);
+        };
+        let err = match read {
             Ok(Some(d)) if d.bytes.len() as u64 == meta.size => return Ok(Some((meta, d.bytes))),
             Ok(Some(d)) => UploadError::Invalid(format!(
                 "file {:?} was declared as {} bytes but {} arrived",
@@ -215,12 +247,33 @@ impl AdminServer {
         access: Access,
         backend: Arc<dyn AdminBackend>,
     ) -> Result<AdminServer, AdminError> {
+        Self::start(endpoint, access, backend, ServerTimeouts::default())
+    }
+
+    /// [`AdminServer::bind`] with other timeouts.
+    #[cfg(feature = "test-hooks")]
+    pub fn bind_with_timeouts(
+        endpoint: &Endpoint,
+        access: Access,
+        backend: Arc<dyn AdminBackend>,
+        timeouts: ServerTimeouts,
+    ) -> Result<AdminServer, AdminError> {
+        Self::start(endpoint, access, backend, timeouts)
+    }
+
+    fn start(
+        endpoint: &Endpoint,
+        access: Access,
+        backend: Arc<dyn AdminBackend>,
+        timeouts: ServerTimeouts,
+    ) -> Result<AdminServer, AdminError> {
         let listener = transport::bind(endpoint, &access)?;
         let cancel = CancellationToken::new();
         let tasks = TaskTracker::new();
         let accept = tokio::spawn(accept_loop(
             listener,
             backend,
+            timeouts,
             cancel.clone(),
             tasks.clone(),
         ));
@@ -251,6 +304,7 @@ impl Drop for AdminServer {
 async fn accept_loop(
     mut listener: Listener,
     backend: Arc<dyn AdminBackend>,
+    timeouts: ServerTimeouts,
     cancel: CancellationToken,
     tasks: TaskTracker,
 ) {
@@ -276,7 +330,7 @@ async fn accept_loop(
                 tasks.spawn(async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {}
-                        _ = serve(conn, &*backend) => {}
+                        _ = serve(conn, &*backend, timeouts) => {}
                     }
                     drop(permit);
                 });
@@ -294,7 +348,7 @@ async fn accept_loop(
 
 /// One connection: `Hello`, then requests in order until the client leaves or breaks the
 /// protocol. Nothing here affects other connections.
-async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend) {
+async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend, timeouts: ServerTimeouts) {
     let hello = match timeout(
         HELLO_TIMEOUT,
         read_frame::<_, Hello>(&mut conn, MAX_HELLO_FRAME),
@@ -323,15 +377,23 @@ async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend) {
         return;
     }
     loop {
-        let req = match read_frame::<_, AdminRequest>(&mut conn, MAX_FRAME).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return,
-            Err(e) => {
+        let next = timeout(
+            timeouts.idle,
+            read_frame::<_, AdminRequest>(&mut conn, MAX_FRAME),
+        );
+        let req = match next.await {
+            Ok(Ok(Some(r))) => r,
+            Ok(Ok(None)) => return,
+            Ok(Err(e)) => {
                 debug!("closing admin connection: {e}");
                 return;
             }
+            Err(_) => {
+                debug!("closing idle admin connection");
+                return;
+            }
         };
-        let (resp, close) = match handle_one(&mut conn, backend, req).await {
+        let (resp, close) = match handle_one(&mut conn, backend, req, timeouts).await {
             Outcome::Reply(r) => (r, false),
             Outcome::ReplyAndClose(r) => (r, true),
             Outcome::Close => return,
@@ -346,6 +408,7 @@ async fn handle_one(
     conn: &mut AdminStream,
     backend: &dyn AdminBackend,
     req: AdminRequest,
+    timeouts: ServerTimeouts,
 ) -> Outcome {
     if let Err((code, message)) = check(backend.state(), &req) {
         let resp = AdminResponse::Error { code, message };
@@ -365,6 +428,7 @@ async fn handle_one(
         files,
         failed: None,
         gone: false,
+        upload_frame_timeout: timeouts.upload_frame,
     };
     let resp = backend.handle(req, &mut io).await;
     io.finish(resp).await

@@ -18,11 +18,13 @@ use mesh_core::frame::FrameError;
 pub use client::AdminClient;
 pub use proto::{
     AdminRequest, AdminResponse, DaemonState, DeployOpts, ErrorCode, FileData, FileMeta, Hello,
-    LocalStateView, MAX_FRAME, MAX_LOG_LINES, MAX_UPLOAD_FILE, MAX_UPLOAD_TOTAL, MemberInfoView,
-    PROTOCOL_VERSION, ServiceInfoView, ServiceKindView, StatusInfo, valid_upload_path,
-    validate_upload,
+    LocalStateView, MAX_FRAME, MAX_LOG_LINES, MAX_UPLOAD_FILE, MAX_UPLOAD_FILES, MAX_UPLOAD_TOTAL,
+    MemberInfoView, PROTOCOL_VERSION, ServiceInfoView, ServiceKindView, StatusInfo,
+    valid_upload_path, validate_upload,
 };
-pub use server::{AdminBackend, AdminServer, MAX_CONNECTIONS, RequestIo, UploadError};
+pub use server::{
+    AdminBackend, AdminServer, MAX_CONNECTIONS, RequestIo, ServerTimeouts, UploadError,
+};
 pub use transport::{
     Access, AdminIo, AdminStream, Endpoint, connect_raw, default_data_dir, endpoint_for,
 };
@@ -35,6 +37,11 @@ pub enum AdminError {
     VersionMismatch { cli: u32, daemon: u32 },
     #[error("another meshd is already serving the admin endpoint {0}")]
     InUse(String),
+    #[error(
+        "refusing the admin endpoint {endpoint}: it is served by account {account}, not by \
+         LocalService, LocalSystem or the current user"
+    )]
+    Untrusted { endpoint: String, account: String },
     #[error("the daemon has too many admin connections; try again")]
     Busy,
     #[error("{code}: {message}")]

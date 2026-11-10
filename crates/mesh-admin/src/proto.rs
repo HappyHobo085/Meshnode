@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Largest file in a static upload (one [`FileData`] frame).
 pub const MAX_UPLOAD_FILE: u64 = 64 * 1024 * 1024;
+/// Most files in a static upload.
+pub const MAX_UPLOAD_FILES: usize = 100_000;
 /// Largest total of a static upload.
 pub const MAX_UPLOAD_TOTAL: u64 = 1024 * 1024 * 1024;
 /// Largest frame: a 64 MiB file plus its envelope.
@@ -46,8 +48,8 @@ impl fmt::Display for DaemonState {
     }
 }
 
-/// What a deploy sets on a new manifest: the serializable mirror of
-/// `mesh_services::DeployOpts` (which is not serde).
+/// What a deploy sets on a new manifest: the serializable form of
+/// `mesh_services::DeployOpts` (which is not serde). `Default` is the spec defaults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployOpts {
     pub limits: Limits,
@@ -57,26 +59,10 @@ pub struct DeployOpts {
 
 impl Default for DeployOpts {
     fn default() -> Self {
-        mesh_services::DeployOpts::default().into()
-    }
-}
-
-impl From<mesh_services::DeployOpts> for DeployOpts {
-    fn from(o: mesh_services::DeployOpts) -> Self {
         DeployOpts {
-            limits: o.limits,
-            placement: o.placement,
-            outbound: o.outbound,
-        }
-    }
-}
-
-impl From<DeployOpts> for mesh_services::DeployOpts {
-    fn from(o: DeployOpts) -> Self {
-        mesh_services::DeployOpts {
-            limits: o.limits,
-            placement: o.placement,
-            outbound: o.outbound,
+            limits: Limits::default(),
+            placement: Placement::AllHosts,
+            outbound: Vec::new(),
         }
     }
 }
@@ -293,22 +279,21 @@ pub enum LocalStateView {
 }
 
 /// A static-upload path: relative and `/`-separated, with no empty, `.` or `..` segments,
-/// no backslash or NUL, not absolute and not starting with a drive (`C:`).
+/// no backslash, NUL or `:` (drives, NTFS streams), not absolute — the rules of
+/// mesh-core's blob paths.
 pub fn valid_upload_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') {
-        return false;
-    }
-    let first = path.split('/').next().unwrap_or_default();
-    if first.len() == 2 && first.ends_with(':') {
-        return false;
-    }
-    path.split('/')
-        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', '\0']))
+    !path.is_empty()
+        && path.split('/').all(|seg| {
+            !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', '\0', ':'])
+        })
 }
 
-/// Checks a `DeployStatic` file list: valid, distinct paths, each file ≤ 64 MiB and the
-/// total ≤ 1 GiB. The error is a readable message.
+/// Checks a `DeployStatic` file list: at most 100 000 files with valid, distinct paths,
+/// each ≤ 64 MiB and together ≤ 1 GiB. The error is a readable message.
 pub fn validate_upload(files: &[FileMeta]) -> Result<(), String> {
+    if files.len() > MAX_UPLOAD_FILES {
+        return Err(format!("an upload has at most {MAX_UPLOAD_FILES} files"));
+    }
     let mut seen = HashSet::new();
     let mut total = 0u64;
     for f in files {
@@ -345,8 +330,22 @@ mod tests {
             assert!(valid_upload_path(ok), "{ok}");
         }
         for bad in [
-            "", "/x", "../x", "a/../x", "./x", "a/./x", "a//b", "a/", "a\\b", "a\0b", "C:", "c:/x",
+            "",
+            "/x",
+            "../x",
+            "a/../x",
+            "./x",
+            "a/./x",
+            "a//b",
+            "a/",
+            "a\\b",
+            "a\0b",
+            "C:",
+            "c:/x",
             "..",
+            "a/b:c",
+            "a:b/c",
+            "x/s::$DATA",
         ] {
             assert!(!valid_upload_path(bad), "{bad:?}");
         }
@@ -367,16 +366,18 @@ mod tests {
         assert!(validate_upload(&full).is_ok());
         full.push(f("one-more", 1));
         assert!(validate_upload(&full).is_err());
+        let many: Vec<_> = (0..=MAX_UPLOAD_FILES)
+            .map(|i| f(&format!("f{i}"), 0))
+            .collect();
+        assert!(validate_upload(&many[..MAX_UPLOAD_FILES]).is_ok());
+        assert!(validate_upload(&many).is_err());
     }
 
     #[test]
-    fn deploy_opts_convert_both_ways() {
-        let o = DeployOpts {
-            limits: Limits::default(),
-            placement: Placement::Tags(vec!["x".into()]),
-            outbound: vec!["h:1".into()],
-        };
-        let s: mesh_services::DeployOpts = o.clone().into();
-        assert_eq!(DeployOpts::from(s), o);
+    fn deploy_opts_default_is_spec_default() {
+        let o = DeployOpts::default();
+        assert_eq!(o.limits, Limits::default());
+        assert_eq!(o.placement, Placement::AllHosts);
+        assert!(o.outbound.is_empty());
     }
 }

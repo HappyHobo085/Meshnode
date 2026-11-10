@@ -10,8 +10,9 @@ use futures_util::StreamExt;
 use mesh_admin::{
     Access, AdminBackend, AdminClient, AdminError, AdminRequest, AdminResponse, AdminServer,
     AdminStream, DaemonState, DeployOpts, ErrorCode, FileData, FileMeta, Hello, LocalStateView,
-    MAX_CONNECTIONS, MAX_UPLOAD_FILE, MemberInfoView, PROTOCOL_VERSION, RequestIo, ServiceInfoView,
-    ServiceKindView, StatusInfo, connect_raw, endpoint_for,
+    MAX_CONNECTIONS, MAX_UPLOAD_FILE, MAX_UPLOAD_FILES, MemberInfoView, PROTOCOL_VERSION,
+    RequestIo, ServerTimeouts, ServiceInfoView, ServiceKindView, StatusInfo, connect_raw,
+    endpoint_for,
 };
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_proto::{Limits, NodeId, Placement, RefuseReason, Role, ServiceKind, ServiceManifest};
@@ -289,13 +290,18 @@ impl Daemon {
 }
 
 async fn daemon() -> Daemon {
+    daemon_with(ServerTimeouts::default()).await
+}
+
+async fn daemon_with(timeouts: ServerTimeouts) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let save = dir.path().join("saved");
     let fake = Fake::new(&save);
-    let server = AdminServer::bind(
+    let server = AdminServer::bind_with_timeouts(
         &endpoint_for(dir.path()),
         Access::CurrentUserOnly,
         fake.clone(),
+        timeouts,
     )
     .expect("bind");
     Daemon {
@@ -651,6 +657,13 @@ async fn deploy_static_upload() {
         .collect();
     total.push(meta("one-more", 1));
     expect_rejected(&d, total, vec![]).await;
+    // More than 100 000 files (declared only).
+    let many: Vec<_> = (0..=MAX_UPLOAD_FILES)
+        .map(|i| meta(&format!("f{i}"), 0))
+        .collect();
+    expect_rejected(&d, many, vec![]).await;
+    // A colon in any segment.
+    expect_rejected(&d, vec![meta("a/b:c", 1)], vec![vec![1]]).await;
     assert_eq!(
         d.fake.uploads.lock().unwrap().len(),
         1,
@@ -969,4 +982,78 @@ fn endpoint_for_is_per_data_dir() {
             mesh_admin::Endpoint::Pipe(r"\\.\pipe\meshnode-admin".into())
         );
     }
+}
+
+const SHORT: Duration = Duration::from_millis(300);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_connection_is_closed() {
+    let d = daemon_with(ServerTimeouts {
+        idle: SHORT,
+        upload_frame: Duration::from_secs(30),
+    })
+    .await;
+    let mut busy = d.client().await;
+    let mut idle = d.client().await;
+    // Requests within the idle time keep a connection open.
+    for _ in 0..4 {
+        tokio::time::sleep(SHORT / 3).await;
+        assert!(busy.request(AdminRequest::Status).await.is_ok());
+    }
+    tokio::time::sleep(SHORT * 3).await;
+    assert!(idle.request(AdminRequest::Status).await.is_err());
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_upload_is_closed() {
+    let d = daemon_with(ServerTimeouts {
+        idle: Duration::from_secs(30),
+        upload_frame: SHORT,
+    })
+    .await;
+    let mut s = raw_hello(&d).await;
+    let files = vec![FileMeta {
+        path: "a".into(),
+        size: 10,
+    }];
+    write_frame(
+        &mut s,
+        &AdminRequest::DeployStatic {
+            name: "site".into(),
+            opts: DeployOpts::default(),
+            files,
+        },
+    )
+    .await
+    .unwrap();
+    // No FileData follows: the daemon gives up and closes without an answer.
+    let started = std::time::Instant::now();
+    assert_eq!(next_response(&mut s).await, None);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follow_stream_is_not_idle() {
+    let d = daemon_with(ServerTimeouts {
+        idle: SHORT,
+        upload_frame: SHORT,
+    })
+    .await;
+    let mut c = d.client().await;
+    let mut s = Box::pin(c.logs_tail(1, true));
+    let first = timeout(WAIT, s.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(first, vec!["line 0"]);
+    tokio::time::sleep(SHORT * 3).await;
+    d.fake.push_log.notify_one();
+    let next = timeout(WAIT, s.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(next, vec!["new 1"]);
+    drop(s);
+    drop(c);
+    d.stop().await;
 }

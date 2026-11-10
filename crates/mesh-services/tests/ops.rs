@@ -38,7 +38,7 @@ async fn manifest(node: &Node, name: &str) -> Option<ServiceManifest> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deploy_wasm_writes_manifest_v1_then_v2() {
-    let (node, svc, _d) = solo().await;
+    let (node, svc, d) = solo().await;
     let wasm = Bytes::from(fixture("echo"));
     let m1 = svc
         .deploy_wasm("web", wasm.clone(), DeployOpts::default())
@@ -53,6 +53,12 @@ async fn deploy_wasm_writes_manifest_v1_then_v2() {
     assert_eq!(module, *blake3::hash(&wasm).as_bytes());
     assert_eq!(manifest(&node, "web").await, Some(m1));
     assert!(node.blobs().has(module.into()).await.unwrap());
+    // The default config caches compiled components under `<data>/services/cache`.
+    let cached = std::fs::read_dir(d.path().join("services").join("cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.path().extension().is_some_and(|x| x == "cwasm"));
+    assert!(cached, "no compiled component in the default code cache");
 
     let opts = DeployOpts {
         placement: Placement::Tags(vec!["edge".into()]),

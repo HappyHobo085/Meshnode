@@ -79,7 +79,7 @@ Run on **one desktop node (Linux or Windows) and one Android phone**, on differe
 | `crates/mesh-store` | Replicated store: ordered LWW registers + grow-only sets on `redb`; merge function; per-origin op log; tombstone GC | `mesh-hlc` |
 | `crates/mesh-proto` | Wire types for every ALPN (serde + postcard), invite tickets, signatures | `mesh-hlc` |
 | `crates/mesh-core` | `Node`: transport, membership, replicator, blob fetch; stores and replicates member tags. The deployer and placement live in `mesh-services` *(back-ported from sub-spec 3)* | store, proto, `iroh`, `iroh-blobs` |
-| `crates/mesh-runtime` | Pure wasmtime host with no `mesh-core` or `mesh-store` dependency: the `wasi:http` incoming handler, `meshnode:kv` (through a trait the embedder implements), the outgoing-HTTP allowlist, limits *(back-ported from sub-spec 3)* | `wasmtime`, `wasmtime-wasi-http` |
+| `crates/mesh-runtime` | Pure wasmtime host with no `mesh-core` or `mesh-store` dependency: the `wasi:http` incoming handler, `meshnode:kv` (through a trait the embedder implements), the outgoing-HTTP allowlist, limits *(back-ported from sub-spec 3)* | `mesh-proto`, `wasmtime`, `wasmtime-wasi-http` *(`mesh-proto` amended in final review)* |
 | `crates/mesh-services` | Manifests, deploy/undeploy/purge, placement, the deployer, static sites, service blob GC; service KV writes go through `mesh-core`'s gated `StoreHandle` *(back-ported from sub-spec 3)* | core, runtime |
 | `crates/mesh-gateway` | localhost HTTP server, Host and port routing, forwarding to a peer; serves through `mesh-services` | core, services |
 | `crates/mesh-admin` | Admin API: request/response types plus two transports (local socket, in-process channel) | core |
@@ -211,7 +211,7 @@ interface store {
 
 - **Isolation:** each service can reach only its own namespace. No filesystem access. Outgoing network only to the allowlist.
 - **One fresh instance per request** (the wasi:http proxy model), from a cached `InstancePre` keyed by module hash.
-- **Compiled-code cache:** on desktop, a file cache under `<data>/cache/`. **On Android, compiled code is cached as bytes and loaded with `Module::deserialize` into anonymous memory, never memory-mapped from an app-data file**, because Android blocks executing code mapped from files in app-writable storage. Verified in the Android spike (§14). There is no interpreter fallback: Cranelift works in the app sandbox, so Pulley is left out *(back-ported from sub-spec 3)*.
+- **Compiled-code cache:** on desktop, a file cache under `<data>/services/cache/` *(path amended in final review)*. **On Android, compiled code is cached as bytes and loaded with `Module::deserialize` into anonymous memory, never memory-mapped from an app-data file**, because Android blocks executing code mapped from files in app-writable storage. Verified in the Android spike (`spikes/android/RESULTS.md`). There is no interpreter fallback: Cranelift works in the app sandbox, so Pulley is left out *(back-ported from sub-spec 3)*.
 - **Limits:** memory cap through `ResourceLimiter`, time cap through epoch interruption (10 ms ticks), body cap enforced before the module runs. A trap or timeout returns `500`/`504` and is logged; the node never crashes because of a service.
 - Request and response bodies are buffered, not streamed, for WASM and static responses (bounded by the limits) *(back-ported from sub-spec 3)*.
 - Writes made through `meshnode:kv` apply locally right away (read-your-writes on that node) and become ops for replication.

@@ -142,7 +142,7 @@ Validation on decode and before every write: name pattern; `memory_mb` 1..=1024;
 
 All writes go through the gated `StoreHandle`.
 
-- **`deploy_wasm(name, bytes, opts)`**: a module over 64 MiB is refused with `InvalidComponent` *(amended in final review)*; `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, so a rejected deploy pins nothing) → `blobs.add_bytes(bytes)` → write the manifest *(amended during implementation)*. A deploy holds the GC lock's shared side from adding the blob until the manifest is written (§5.5) with `version = previous + 1` (1 if none).
+- **`deploy_wasm(name, bytes, opts)`**: a module over 64 MiB is refused with `InvalidComponent` *(amended in final review)*; `runtime.load(hash, bytes)` (an invalid component fails here with `InvalidComponent`, so a rejected deploy pins nothing) → `blobs.add_bytes(bytes)` → write the manifest with `version = previous + 1` (1 if none) *(amended during implementation)*. A deploy holds the GC lock's shared side from adding the blob until the manifest is written (§5.5).
 - **`deploy_static(name, dir, opts)`**: `blobs.add_path(dir)` (a collection) → write the manifest.
 - **`set_placement`, `set_outbound`, `set_limits`**: rewrite the manifest with `version + 1`. `NotFound` if undeployed.
 - **`undeploy(name)`**: delete the manifest. The data stays.
@@ -221,7 +221,7 @@ impl Services {
     pub async fn handle(&self, name: &str, req: http::Request<Bytes>) -> http::Response<Bytes>;
     pub async fn shutdown(self);
 }
-pub struct ServicesConfig { pub cache: CodeCache, pub max_in_flight: usize }
+pub struct ServicesConfig { pub cache: Option<CodeCache>, pub max_in_flight: usize }  // default: cache None = <data>/services/cache (Mmap; Read on Android), 64 in flight (amended in final review)
 pub struct DeployOpts { pub limits: Limits, pub placement: Placement, pub outbound: Vec<String> }  // Default = spec defaults
 pub enum ServicesError { InvalidName, InvalidManifest(String), InvalidComponent(String), NotFound, Node(NodeError), Runtime(RuntimeError), Io(std::io::Error) }
 ```

@@ -9,7 +9,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use mesh_core::{Node, NodeConfig, NodeError, NodeEvent};
 use mesh_proto::{InviteTicket, NodeId, Placement, Role};
-use mesh_runtime::CodeCache;
 use mesh_services::{DeployOpts, LocalStatus, Services, ServicesConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
@@ -76,15 +75,8 @@ async fn run() -> Result<(), String> {
     if mode == "join" && !node.wait_first_sync(FIRST_SYNC_WAIT).await {
         println!("first sync not complete after {FIRST_SYNC_WAIT:?}; continuing");
     }
-    let services = match Services::start(
-        &node,
-        ServicesConfig {
-            cache: CodeCache::Mmap(dir.join("cache")),
-            ..ServicesConfig::default()
-        },
-    )
-    .await
-    {
+    // The default config caches compiled components under `<data>/services/cache`.
+    let services = match Services::start(&node, ServicesConfig::default()).await {
         Ok(s) => s,
         Err(e) => {
             node.shutdown().await;
@@ -300,10 +292,16 @@ async fn command(node: &Node, services: &Services, line: &str, w: &[&str]) -> Re
 /// Parses the flags after `deploy wasm|static <name> <src>`. `--outbound` is wasm only.
 fn deploy_opts(node: &Node, flags: &[&str], allow_outbound: bool) -> Result<DeployOpts, String> {
     let mut opts = DeployOpts::default();
+    let mut placement_flag: Option<&str> = None;
     let mut it = flags.iter();
     while let Some(&flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         let items = || value.split(',').filter(|s| !s.is_empty());
+        if matches!(flag, "--tags" | "--nodes")
+            && let Some(first) = placement_flag.replace(flag)
+        {
+            return Err(format!("{first} and {flag} cannot be combined"));
+        }
         match flag {
             "--tags" => opts.placement = Placement::Tags(items().map(String::from).collect()),
             "--nodes" => {

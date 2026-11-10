@@ -37,7 +37,7 @@ fn timings() -> DeployerTimings {
 
 async fn start(node: &Node, cache: CodeCache) -> Services {
     let cfg = ServicesConfig {
-        cache,
+        cache: Some(cache),
         ..ServicesConfig::default()
     };
     Services::start_with_timings(node, cfg, timings())

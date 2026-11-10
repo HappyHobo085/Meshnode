@@ -21,18 +21,30 @@ use crate::manifest::{
 /// Settings for [`Services::start`].
 #[derive(Clone, Debug)]
 pub struct ServicesConfig {
-    pub cache: CodeCache,
+    /// Where compiled components are cached. `None` (the default) is
+    /// `<data>/services/cache`, memory-mapped on desktop and read into memory on Android;
+    /// `Some(CodeCache::None)` turns the cache off.
+    pub cache: Option<CodeCache>,
     pub max_in_flight: usize,
 }
 
 impl Default for ServicesConfig {
     fn default() -> Self {
-        let rt = RuntimeConfig::default();
         ServicesConfig {
-            cache: rt.cache,
-            max_in_flight: rt.max_in_flight,
+            cache: None,
+            max_in_flight: RuntimeConfig::default().max_in_flight,
         }
     }
+}
+
+/// The code cache [`ServicesConfig::cache`]`: None` stands for.
+fn default_cache(data_dir: &Path) -> CodeCache {
+    let dir = data_dir.join("services").join("cache");
+    #[cfg(target_os = "android")]
+    let cache = CodeCache::Read(dir);
+    #[cfg(not(target_os = "android"))]
+    let cache = CodeCache::Mmap(dir);
+    cache
 }
 
 /// What a deploy sets on a new manifest. `Default` is the spec defaults.
@@ -85,12 +97,16 @@ impl Services {
         timings: DeployerTimings,
         gc_every: Duration,
     ) -> Result<Services, ServicesError> {
+        let handle = node.handle();
+        let cache = cfg
+            .cache
+            .unwrap_or_else(|| default_cache(handle.data_dir()));
         let runtime = Runtime::new(RuntimeConfig {
-            cache: cfg.cache,
+            cache,
             max_in_flight: cfg.max_in_flight,
         })
         .map_err(ServicesError::Runtime)?;
-        let shared = Arc::new(Shared::new(node.handle(), runtime));
+        let shared = Arc::new(Shared::new(handle, runtime));
         let deployer = DeployerTask::spawn(shared.clone(), timings);
         let gc = GcTask::spawn(shared.clone(), gc_every);
         Ok(Services {

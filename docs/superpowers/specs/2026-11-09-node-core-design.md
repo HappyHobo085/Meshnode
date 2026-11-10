@@ -384,7 +384,7 @@ Plus:
 
 ### 11.3 Demo and manual check
 
-`cargo run -p mesh-core --example meshdev -- <data-dir> init | join <ticket> | run`. `init` and `join` drop into the same REPL as `run`:
+`cargo run -p mesh-services --example meshdev -- <data-dir> init | join <ticket> | run` (the example moved to `mesh-services` in sub-spec 3, *amended in final review*). `init` and `join` drop into the same REPL as `run`:
 
 `invite [host|client]`, `members`, `put <ns> <key> <value>`, `get <ns> <key>`, `del <ns> <key>`, `ls <ns> [prefix]`, `remove <id-prefix>`, `status`, `sync`, `blob add <path>`, `blob get <hash> <out>`, `quit`.
 

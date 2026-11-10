@@ -45,10 +45,7 @@ impl AdminClient {
     /// Sends one request and returns the daemon's response (which may be
     /// [`AdminResponse::Error`]). `DeployStatic` and `LogsTail` have their own methods.
     pub async fn request(&mut self, req: AdminRequest) -> Result<AdminResponse, AdminError> {
-        if matches!(
-            req,
-            AdminRequest::DeployStatic { .. } | AdminRequest::LogsTail { .. }
-        ) {
+        if crate::server::needs_own_method(&req) {
             return Err(AdminError::Protocol(
                 "DeployStatic and LogsTail go through deploy_static and logs_tail".into(),
             ));

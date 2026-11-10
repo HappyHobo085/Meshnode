@@ -486,6 +486,16 @@ async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend, timeouts: Serv
     }
 }
 
+/// Requests that carry an upload or stream lines, so a plain `request` call cannot serve
+/// them. Both clients refuse them through this one predicate; `Probe` (Task 6) streams
+/// lines like `LogsTail` and joins this set.
+pub(crate) fn needs_own_method(req: &AdminRequest) -> bool {
+    matches!(
+        req,
+        AdminRequest::DeployStatic { .. } | AdminRequest::LogsTail { .. }
+    )
+}
+
 /// The one dispatch both transports use: state gating and argument checks, then the
 /// backend, then whatever the upload still owes. `io` must have been built from `req`.
 pub(crate) async fn dispatch(

@@ -1233,6 +1233,14 @@ async fn in_process_logs_tail_streams_then_ends() {
     let next = timeout(WAIT, s.next()).await.unwrap().unwrap().unwrap();
     assert_eq!(next, "new 1");
     drop(s);
+    // The backend notices the consumer left (send fails or client_gone) and ends itself.
+    timeout(WAIT, async {
+        while !fake.follow_ended.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("backend never saw the stream drop");
 
     // An error end is yielded as Err.
     let too_many = admin.logs_tail(AdminRequest::LogsTail {

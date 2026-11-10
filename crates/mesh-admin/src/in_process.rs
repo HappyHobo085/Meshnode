@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::proto::{AdminRequest, AdminResponse, DaemonState, DeployOpts, ErrorCode, FileMeta};
-use crate::server::{AdminBackend, Outcome, RequestIo, dispatch};
+use crate::server::{AdminBackend, Outcome, RequestIo, dispatch, needs_own_method};
 
 /// Lines buffered between the backend and the consumer of a stream.
 const LINE_BUFFER: usize = 64;
@@ -21,6 +21,9 @@ pub struct InProcessAdmin {
     backend: Arc<dyn AdminBackend>,
 }
 
+/// `Outcome::Close` means the connection went away mid-request, so no reply is wanted. For
+/// the in-process transport that is only reachable in `logs_tail`, after the consumer
+/// dropped its stream; the response is then never read.
 fn into_response(outcome: Outcome) -> AdminResponse {
     match outcome {
         Outcome::Reply(r) | Outcome::ReplyAndClose(r) => r,
@@ -28,20 +31,11 @@ fn into_response(outcome: Outcome) -> AdminResponse {
     }
 }
 
-/// Aborts the backend task when the stream is dropped.
-struct AbortOnDrop(JoinHandle<AdminResponse>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 enum Lines {
     Idle(InProcessAdmin, AdminRequest),
     Running {
         rx: mpsc::Receiver<Vec<String>>,
-        task: AbortOnDrop,
+        task: JoinHandle<AdminResponse>,
         buf: VecDeque<String>,
     },
     Done,
@@ -59,10 +53,7 @@ impl InProcessAdmin {
     /// Answers one request (which may be `AdminResponse::Error`). `DeployStatic` and
     /// `LogsTail` have their own methods.
     pub async fn request(&self, req: AdminRequest) -> AdminResponse {
-        if matches!(
-            req,
-            AdminRequest::DeployStatic { .. } | AdminRequest::LogsTail { .. }
-        ) {
+        if needs_own_method(&req) {
             return AdminResponse::error(
                 ErrorCode::InvalidArgument,
                 "DeployStatic and LogsTail go through deploy_static and logs_tail",
@@ -91,7 +82,8 @@ impl InProcessAdmin {
     /// Streams the lines of a line-streaming request (`LogsTail`, and later requests that
     /// stream the same way) until the ending response: an `Ok` end yields nothing more,
     /// an error end yields `Err(resp)`. The backend starts on the first poll; dropping the
-    /// stream stops it.
+    /// stream ends the request: the backend sees its line sends fail (or `client_gone` resolve) and
+    /// finishes by itself, as when a socket client leaves.
     pub fn logs_tail(
         &self,
         req: AdminRequest,
@@ -109,7 +101,7 @@ impl InProcessAdmin {
                         });
                         state = Lines::Running {
                             rx,
-                            task: AbortOnDrop(task),
+                            task,
                             buf: VecDeque::new(),
                         };
                     }
@@ -128,7 +120,7 @@ impl InProcessAdmin {
                             }
                             None => {
                                 let mut task = task;
-                                let resp = (&mut task.0).await.unwrap_or_else(|e| {
+                                let resp = (&mut task).await.unwrap_or_else(|e| {
                                     AdminResponse::error(ErrorCode::Internal, e.to_string())
                                 });
                                 return match resp {

@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use mesh_admin::{
     Access, AdminBackend, AdminClient, AdminError, AdminRequest, AdminResponse, AdminServer,
-    AdminStream, DaemonState, DeployOpts, ErrorCode, FileData, FileMeta, Hello, LocalStateView,
-    MAX_CONNECTIONS, MAX_UPLOAD_FILE, MAX_UPLOAD_FILES, MemberInfoView, PROTOCOL_VERSION,
-    RequestIo, ServerTimeouts, ServiceInfoView, ServiceKindView, StatusInfo, connect_raw,
-    endpoint_for,
+    AdminStream, DaemonState, DeployOpts, ErrorCode, FileData, FileMeta, Hello, InProcessAdmin,
+    LocalStateView, MAX_CONNECTIONS, MAX_UPLOAD_FILE, MAX_UPLOAD_FILES, MemberInfoView,
+    PROTOCOL_VERSION, RequestIo, ServerTimeouts, ServiceInfoView, ServiceKindView, StatusInfo,
+    connect_raw, endpoint_for,
 };
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_proto::{Limits, NodeId, Placement, RefuseReason, Role, ServiceKind, ServiceManifest};
@@ -1057,4 +1057,192 @@ async fn follow_stream_is_not_idle() {
     drop(s);
     drop(c);
     d.stop().await;
+}
+
+// ---- the in-process transport ----
+
+fn in_process() -> (tempfile::TempDir, Arc<Fake>, InProcessAdmin) {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(&dir.path().join("saved"));
+    let admin = InProcessAdmin::new(fake.clone());
+    (dir, fake, admin)
+}
+
+fn is_error(r: &AdminResponse, want: ErrorCode) -> bool {
+    matches!(r, AdminResponse::Error { code, .. } if *code == want)
+}
+
+fn file(path: &str, bytes: &[u8]) -> (FileMeta, Vec<u8>) {
+    (
+        FileMeta {
+            path: path.into(),
+            size: bytes.len() as u64,
+        },
+        bytes.to_vec(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_uninitialised_gating() {
+    let (_d, fake, admin) = in_process();
+    *fake.state.lock().unwrap() = DaemonState::Uninitialised;
+    assert_eq!(admin.daemon_state(), DaemonState::Uninitialised);
+    for req in [
+        AdminRequest::Members,
+        AdminRequest::Services,
+        AdminRequest::Undeploy { name: "x".into() },
+    ] {
+        let got = admin.request(req.clone()).await;
+        assert!(is_error(&got, ErrorCode::WrongState), "{req:?} -> {got:?}");
+    }
+    for req in [
+        AdminRequest::Status,
+        AdminRequest::Init { name: "pc".into() },
+        AdminRequest::ConfigGet { key: None },
+    ] {
+        assert_eq!(admin.request(req.clone()).await, expected_response(&req));
+    }
+    *fake.state.lock().unwrap() = DaemonState::Running;
+    let got = admin
+        .request(AdminRequest::Init { name: "pc".into() })
+        .await;
+    assert!(is_error(&got, ErrorCode::WrongState), "{got:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_removed_allows_reset_only() {
+    let (_d, fake, admin) = in_process();
+    let reset = AdminRequest::ResetIdentity { confirm: true };
+    for (state, allowed) in [
+        (DaemonState::Running, false),
+        (DaemonState::Rebootstrapping, false),
+        (DaemonState::Removed, true),
+        (DaemonState::Uninitialised, true),
+    ] {
+        *fake.state.lock().unwrap() = state;
+        let got = admin.request(reset.clone()).await;
+        if allowed {
+            assert_eq!(got, expected_response(&reset), "{state:?}");
+        } else {
+            assert!(is_error(&got, ErrorCode::WrongState), "{state:?}: {got:?}");
+        }
+    }
+    *fake.state.lock().unwrap() = DaemonState::Removed;
+    let got = admin
+        .request(AdminRequest::ResetIdentity { confirm: false })
+        .await;
+    assert!(is_error(&got, ErrorCode::InvalidArgument), "{got:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_deploy_static_round_trip() {
+    let (dir, fake, admin) = in_process();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let files = vec![
+        file("index.html", b"<h1>hi</h1>"),
+        file("assets/app.bin", &big),
+        file("empty", b""),
+    ];
+    let r = admin
+        .deploy_static("site".into(), DeployOpts::default(), files.clone())
+        .await;
+    assert_eq!(r, AdminResponse::Ok);
+    {
+        let uploads = fake.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "site");
+        assert_eq!(uploads[0].1, files);
+    }
+    let r = admin
+        .deploy_static("saved".into(), DeployOpts::default(), files)
+        .await;
+    assert_eq!(r, AdminResponse::Ok);
+    let save = dir.path().join("saved");
+    assert_eq!(
+        std::fs::read(save.join("index.html")).unwrap(),
+        b"<h1>hi</h1>"
+    );
+    assert_eq!(
+        std::fs::read(save.join("assets").join("app.bin")).unwrap(),
+        big
+    );
+    assert_eq!(std::fs::read(save.join("empty")).unwrap(), b"");
+    // A declared size that disagrees with the bytes is refused.
+    let mut mismatch = file("a", &[0; 5]);
+    mismatch.0.size = 10;
+    let r = admin
+        .deploy_static("site".into(), DeployOpts::default(), vec![mismatch])
+        .await;
+    assert!(is_error(&r, ErrorCode::InvalidArgument), "{r:?}");
+    assert_eq!(fake.uploads.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_upload_rejects_bad_path() {
+    let (_d, fake, admin) = in_process();
+    for bad in ["../x", "/etc/x", "C:/x", "a\\b", "a/b:c"] {
+        let r = admin
+            .deploy_static("site".into(), DeployOpts::default(), vec![file(bad, &[1])])
+            .await;
+        assert!(is_error(&r, ErrorCode::InvalidArgument), "{bad}: {r:?}");
+    }
+    assert!(fake.uploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_upload_rejects_count_over_limit() {
+    let (_d, fake, admin) = in_process();
+    let many: Vec<_> = (0..=MAX_UPLOAD_FILES)
+        .map(|i| file(&format!("f{i}"), &[]))
+        .collect();
+    let r = admin
+        .deploy_static("site".into(), DeployOpts::default(), many)
+        .await;
+    assert!(is_error(&r, ErrorCode::InvalidArgument), "{r:?}");
+    // Declared over the per-file limit; the check comes before any bytes are looked at.
+    let mut big = file("a", &[]);
+    big.0.size = MAX_UPLOAD_FILE + 1;
+    let r = admin
+        .deploy_static("site".into(), DeployOpts::default(), vec![big])
+        .await;
+    assert!(is_error(&r, ErrorCode::InvalidArgument), "{r:?}");
+    assert!(fake.uploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_logs_tail_streams_then_ends() {
+    let (_d, fake, admin) = in_process();
+    let all: Vec<_> = admin
+        .logs_tail(AdminRequest::LogsTail {
+            lines: 3,
+            follow: false,
+        })
+        .collect()
+        .await;
+    let all: Vec<String> = all.into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(all, vec!["line 0", "line 1", "line 2"]);
+
+    // Follow: lines keep coming; dropping the stream ends the backend.
+    let mut s = Box::pin(admin.logs_tail(AdminRequest::LogsTail {
+        lines: 1,
+        follow: true,
+    }));
+    let first = timeout(WAIT, s.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(first, "line 0");
+    fake.push_log.notify_one();
+    let next = timeout(WAIT, s.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(next, "new 1");
+    drop(s);
+
+    // An error end is yielded as Err.
+    let too_many = admin.logs_tail(AdminRequest::LogsTail {
+        lines: mesh_admin::MAX_LOG_LINES + 1,
+        follow: false,
+    });
+    let all: Vec<_> = too_many.collect().await;
+    assert_eq!(all.len(), 1);
+    assert!(
+        matches!(&all[0], Err(r) if is_error(r, ErrorCode::InvalidArgument)),
+        "{all:?}"
+    );
 }

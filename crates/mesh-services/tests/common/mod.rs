@@ -1,5 +1,5 @@
 //! Harness for the in-process node tests: loopback only, relay and discovery off, fast timings.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use std::path::Path;
 use std::sync::Arc;

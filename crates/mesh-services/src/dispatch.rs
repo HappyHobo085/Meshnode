@@ -37,10 +37,7 @@ impl Services {
                     };
                     shared.runtime.handle(loaded, req, ctx).await
                 }
-                Payload::Static => text(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "Static sites are not served yet",
-                ),
+                Payload::Static(site) => site.serve(shared.node.blobs(), &req).await,
             };
         }
         match read_manifest(shared.node.store(), name).await {

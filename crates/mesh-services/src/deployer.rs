@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::error::ServicesError;
 use crate::manifest::{current_generation, data_ns, read_manifest};
 use crate::placement::placed_among;
+use crate::static_site::StaticSite;
 use crate::status::LocalStatus;
 
 /// A fetch that takes longer is abandoned and retried.
@@ -64,8 +65,8 @@ pub(crate) struct Active {
 #[derive(Clone)]
 pub(crate) enum Payload {
     Wasm(Loaded),
-    /// The collection is fetched; serving it comes with the static handler.
-    Static,
+    /// The collection is fetched and its index loaded.
+    Static(Arc<StaticSite>),
 }
 
 /// A deployed service as the last scan saw it.
@@ -557,7 +558,10 @@ async fn load(shared: &Shared, kind: &ServiceKind) -> Result<Payload, String> {
         }
         ServiceKind::Static { root } => {
             fetched(blobs.fetch_collection(BlobHash::from(*root))).await?;
-            Ok(Payload::Static)
+            let site = StaticSite::load(blobs, *root)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Payload::Static(Arc::new(site)))
         }
     }
 }

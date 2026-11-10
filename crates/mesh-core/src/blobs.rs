@@ -374,6 +374,24 @@ impl Blobs {
         Ok(true)
     }
 
+    /// The (name, hash) entries of the collection rooted at `hash`, or `None` if it is not
+    /// stored (or its metadata is missing). Names are `/`-separated and come from peers.
+    pub async fn collection_entries(
+        &self,
+        hash: Hash,
+    ) -> Result<Option<Vec<(String, Hash)>>, NodeError> {
+        let c = self.load_collection(hash).await?;
+        Ok(c.map(|c| c.iter().map(|(n, h)| (n.clone(), *h)).collect()))
+    }
+
+    /// The size of a completely stored blob, or `None` if it is not stored.
+    pub async fn size(&self, hash: Hash) -> Result<Option<u64>, NodeError> {
+        match self.api().blobs().status(hash).await.map_err(err)? {
+            BlobStatus::Complete { size } => Ok(Some(size)),
+            _ => Ok(None),
+        }
+    }
+
     async fn root_complete(&self, hash: Hash) -> Result<bool, NodeError> {
         self.api().blobs().has(hash).await.map_err(err)
     }

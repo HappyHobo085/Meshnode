@@ -9,6 +9,7 @@ mod kv;
 mod manifest;
 mod ops;
 mod placement;
+mod static_site;
 mod status;
 
 pub use deployer::DeployerTimings;
@@ -17,4 +18,5 @@ pub use kv::ServiceKv;
 pub use manifest::{current_generation, data_ns, gen_key, manifest_key};
 pub use ops::{DeployOpts, Services, ServicesConfig};
 pub use placement::{placed, placed_hosts};
+pub use static_site::StaticSite;
 pub use status::{LocalStatus, ServiceStatus};

@@ -163,17 +163,22 @@ impl Sweep {
         let mut rx = self.state.subscribe();
         let before = self.state.borrow().swept_at;
         self.state.send_modify(|s| s.phase = 1);
-        let r = async {
-            let at = self.wait(&mut rx, |s| s.swept_at > before).await?.swept_at;
-            // The run that swept ends before the next one calls back.
-            self.wait(&mut rx, |s| s.ticks > at).await?;
-            Ok(())
-        };
-        let r = r.await;
-        if r.is_err() {
-            self.state.send_modify(|s| s.phase = 0);
-        }
-        r
+        // Disarms on every exit: an error, or this future dropped mid-sweep (the lock is
+        // still held while it runs). After a sweep the phase is 0 already.
+        let _disarm = Disarm(self);
+        let at = self.wait(&mut rx, |s| s.swept_at > before).await?.swept_at;
+        // The run that swept ends before the next one calls back.
+        self.wait(&mut rx, |s| s.ticks > at).await?;
+        Ok(())
+    }
+}
+
+/// Leaves the GC loop unarmed when dropped.
+struct Disarm<'a>(&'a Sweep);
+
+impl Drop for Disarm<'_> {
+    fn drop(&mut self) {
+        self.0.state.send_modify(|s| s.phase = 0);
     }
 }
 
@@ -566,4 +571,27 @@ fn list_files(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
     }
     out.sort();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_sweep_disarms() {
+        let sweep = Sweep::new(Duration::from_secs(3600));
+        {
+            let run = sweep.run_sweep();
+            tokio::pin!(run);
+            // Polled once: armed, then waiting for a GC tick that never comes.
+            assert!(
+                timeout(Duration::from_millis(50), &mut run).await.is_err(),
+                "no sweep can finish without a tick"
+            );
+            assert_eq!(sweep.state.borrow().phase, 1);
+        }
+        assert_eq!(sweep.state.borrow().phase, 0, "dropped mid-sweep: disarmed");
+        // The next GC run aborts instead of sweeping.
+        assert!(matches!(sweep.on_run(), ProtectOutcome::Abort));
+    }
 }

@@ -124,6 +124,17 @@ struct Running {
     slot: HttpFwdSlot,
 }
 
+/// How [`Inner::stop_node`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stopped {
+    /// Nothing runs any more (or nothing ran).
+    Clean,
+    /// The node was stopped, but the services were still in use and were not shut down.
+    ServicesInUse,
+    /// The node could not be taken in time: it may still be running.
+    Busy,
+}
+
 /// How the node comes up.
 enum How {
     Open,
@@ -428,20 +439,19 @@ impl Inner {
         Services::start(node, sc).await
     }
 
-    /// Stops the gateway, the services and the node, if running, by `deadline`. False when
-    /// the services were still in use and the node was stopped without them.
-    async fn stop_node(&self, deadline: Instant) -> bool {
+    /// Stops the gateway, the services and the node, if running, by `deadline`.
+    async fn stop_node(&self, deadline: Instant) -> Stopped {
         let left = deadline.saturating_duration_since(Instant::now());
         let Ok(mut run) = timeout(left, self.run.write()).await else {
             error!("the node is still in use; it cannot be stopped in time");
-            return false;
+            return Stopped::Busy;
         };
         lock(&self.handle).take();
         lock(&self.gateway_addrs).clear();
         let running = run.take();
         drop(run);
         let Some(running) = running else {
-            return true;
+            return Stopped::Clean;
         };
         let Running {
             node,
@@ -463,16 +473,17 @@ impl Inner {
                 if timeout(SERVICES_STOP, s.shutdown()).await.is_err() {
                     warn!("the services did not stop in time");
                 }
-                true
+                Stopped::Clean
             }
             None => {
                 error!("the services are still in use; stopping the node without them");
-                false
+                Stopped::ServicesInUse
             }
         };
         let left = deadline.saturating_duration_since(Instant::now());
         if timeout(left, node.shutdown()).await.is_err() {
             error!("the node did not stop in time");
+            return Stopped::Busy;
         }
         released
     }
@@ -530,5 +541,44 @@ impl AdminBackend for Backend {
             Some(inner) => Daemon { inner }.handle(req, io).await,
             None => AdminResponse::error(ErrorCode::NotRunning, "meshd is stopping"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `reset-identity` must not wipe the data directory when the node could not be taken
+    /// (here: a read guard on `run` stands in for a request still using it).
+    #[tokio::test]
+    async fn reset_refused_while_the_node_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MeshdConfig {
+            relay: "disabled".into(),
+            discovery: false,
+            ..MeshdConfig::default()
+        };
+        let daemon = Daemon::start(dir.path().to_path_buf(), cfg).await.unwrap();
+        let inner = daemon.inner.clone();
+        let marker = dir.path().join("keep-me");
+        std::fs::write(&marker, b"x").unwrap();
+        {
+            let _busy = inner.run.read().await;
+            let soon = Instant::now() + Duration::from_millis(200);
+            assert_eq!(inner.stop_node(soon).await, Stopped::Busy);
+            let soon = Instant::now() + Duration::from_millis(200);
+            match daemon.reset_identity_by(soon).await {
+                AdminResponse::Error { message, .. } => {
+                    assert!(message.contains("reset refused"), "{message}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(marker.exists(), "the data directory was wiped");
+        }
+        // Free again: the reset goes through.
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(daemon.reset_identity_by(soon).await, AdminResponse::Ok);
+        assert!(!marker.exists());
+        daemon.shutdown().await;
     }
 }

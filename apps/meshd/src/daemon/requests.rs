@@ -16,7 +16,9 @@ use mesh_services::{LocalStatus, ServiceStatus, Services, ServicesError};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::{Backend, Daemon, DaemonError, How, KEPT_ON_RESET, Running, SHUTDOWN_LIMIT, lock};
+use super::{
+    Backend, Daemon, DaemonError, How, KEPT_ON_RESET, Running, SHUTDOWN_LIMIT, Stopped, lock,
+};
 use crate::config::{ConfigError, MeshdConfig};
 use crate::paths::{logs_dir, tmp_dir};
 
@@ -163,6 +165,11 @@ impl Daemon {
     /// Stops the node and deletes everything in the data directory but `meshd.toml` and
     /// the logs (the server allows this only when removed or uninitialised).
     async fn reset_identity(&self) -> AdminResponse {
+        self.reset_identity_by(Instant::now() + SHUTDOWN_LIMIT)
+            .await
+    }
+
+    pub(super) async fn reset_identity_by(&self, deadline: Instant) -> AdminResponse {
         let inner = &*self.inner;
         let _t = inner.transition.lock().await;
         if !matches!(
@@ -171,7 +178,15 @@ impl Daemon {
         ) {
             return AdminResponse::error(ErrorCode::WrongState, "this node was not removed");
         }
-        let released = inner.stop_node(Instant::now() + SHUTDOWN_LIMIT).await;
+        let stopped = inner.stop_node(deadline).await;
+        if stopped == Stopped::Busy {
+            // The node may still be running: nothing is deleted.
+            return AdminResponse::error(
+                ErrorCode::Internal,
+                "reset refused: the node is busy and could not be stopped; nothing was deleted, try again",
+            );
+        }
+        let released = stopped == Stopped::Clean;
         let dir = inner.data_dir.clone();
         let wiped = tokio::task::spawn_blocking(move || wipe(&dir))
             .await
@@ -276,28 +291,33 @@ impl Daemon {
             R::SetInfo { name, tags } => {
                 // Both fields, the unchanged one from `meshd.toml`, so that a lagging
                 // membership snapshot cannot write back an older value.
-                let (cur_name, cur_tags) = {
-                    let cfg = self.inner.cfg.lock().await;
-                    (cfg.name.clone(), cfg.tags.clone())
-                };
-                node.set_info(
-                    Some(name.clone().unwrap_or(cur_name)),
-                    Some(tags.clone().unwrap_or(cur_tags)),
-                )
-                .await
-                .map_err(node_error)?;
-                self.remember_info(name, tags).await?;
+                // The cfg lock is held across the node call and the save, as in
+                // `config_set`.
+                let mut cfg = self.inner.cfg.lock().await;
+                let mut new = cfg.clone();
+                if let Some(n) = name {
+                    new.name = n;
+                }
+                if let Some(t) = tags {
+                    new.tags = t;
+                }
+                node.set_info(Some(new.name.clone()), Some(new.tags.clone()))
+                    .await
+                    .map_err(node_error)?;
+                self.save_info(&mut cfg, new).await?;
                 AdminResponse::Ok
             }
             R::SetTagsOf { id, tags } => {
                 is_member(node, id)?;
                 if id == node.node_id() {
                     // Through `set_info` with both fields (see `SetInfo`).
-                    let name = self.inner.cfg.lock().await.name.clone();
-                    node.set_info(Some(name), Some(tags.clone()))
+                    let mut cfg = self.inner.cfg.lock().await;
+                    let mut new = cfg.clone();
+                    new.tags = tags;
+                    node.set_info(Some(new.name.clone()), Some(new.tags.clone()))
                         .await
                         .map_err(node_error)?;
-                    self.remember_info(None, Some(tags)).await?;
+                    self.save_info(&mut cfg, new).await?;
                 } else {
                     node.set_tags_of(id, tags).await.map_err(node_error)?;
                 }
@@ -347,6 +367,11 @@ impl Daemon {
         if let Some(t) = tags {
             new.tags = t;
         }
+        self.save_info(&mut cfg, new).await
+    }
+
+    /// Saves `new` to `meshd.toml` and installs it into the locked `cfg`.
+    async fn save_info(&self, cfg: &mut MeshdConfig, new: MeshdConfig) -> Result<(), Fail> {
         save_config(&new, &self.inner.data_dir)
             .await
             .map_err(|e| Fail(ErrorCode::Internal, e))?;

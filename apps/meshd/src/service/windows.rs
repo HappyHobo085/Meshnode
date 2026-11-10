@@ -255,8 +255,12 @@ pub fn install(data: &Path) -> Result<(), ServiceError> {
     protect_data_dir(data)?;
     // The admin pipe also admits the installing user (spec §5.2).
     let mut cfg = MeshdConfig::load_or_default(data)?;
-    cfg.admin.windows_user_sid =
-        Some(current_user_sid().map_err(io_err("reading the installing user's SID"))?);
+    let sid = current_user_sid().map_err(io_err("reading the installing user's SID"))?;
+    // Only an account SID is accepted; anything else is skipped, so the pipe stays closed
+    // to the installing user (the CLI then needs an elevated shell).
+    if let Err(e) = cfg.set("admin.windows_user_sid", &sid) {
+        eprintln!("warning: the installing user's SID {sid} is not recorded: {e}");
+    }
     cfg.save(data)?;
     eventlog::register().map_err(io_err("registering the Meshnode Event Log source"))?;
 

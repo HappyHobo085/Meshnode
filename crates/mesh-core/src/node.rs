@@ -103,6 +103,10 @@ pub(crate) struct Inner {
     /// Test hook: the next re-bootstrap stops the node right after its step 3.
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     pub(crate) crash_after_reset: AtomicBool,
+    /// Test hook: while true, a re-bootstrap waits in its step 3, after the status became
+    /// `Rebootstrapping` and before the store is reset.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    pub(crate) hold_before_reset: watch::Sender<bool>,
     tasks: Mutex<JoinSet<()>>,
     pub(crate) cancel: CancellationToken,
     /// Makes the reactor run a full rescan (a test hook, and the end of a re-bootstrap).
@@ -528,6 +532,7 @@ pub(crate) async fn start(
         serve_paused,
         rebootstrap: tokio::sync::Mutex::new(()),
         crash_after_reset: AtomicBool::new(false),
+        hold_before_reset: watch::Sender::new(false),
         tasks: Mutex::new(tasks),
         cancel,
         force_lagged,
@@ -917,6 +922,12 @@ impl Node {
     /// right after its step 3, leaving `rebootstrap.bin` and the reset store behind.
     pub fn crash_after_reset(&self) {
         self.inner.crash_after_reset.store(true, Ordering::SeqCst);
+    }
+
+    /// While `on`, a re-bootstrap waits in its step 3: the status is already
+    /// `Rebootstrapping`, the store not yet reset.
+    pub fn hold_rebootstrap_before_reset(&self, on: bool) {
+        self.inner.hold_before_reset.send_replace(on);
     }
 
     /// Whether this node's tasks were stopped (by `shutdown`, a drop or a test crash).

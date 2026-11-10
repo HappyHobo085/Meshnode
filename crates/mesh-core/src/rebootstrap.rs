@@ -117,7 +117,27 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
         }
     };
 
-    // 3.
+    // 3. The status changes before the reset, so whoever reads the store while the
+    // status is `Running` reads it whole.
+    let s = file.s;
+    // `RefusedAsRemoved` stays visible.
+    inner.status.send_if_modified(|st| {
+        let running = matches!(st, NodeStatus::Running);
+        if running {
+            *st = NodeStatus::Rebootstrapping {
+                waiting_for_self_seq: s,
+            };
+        }
+        running
+    });
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let mut hold = inner.hold_before_reset.subscribe();
+        tokio::select! {
+            _ = inner.cancel.cancelled() => return Ok(()),
+            _ = hold.wait_for(|on| !*on) => {}
+        }
+    }
     let next = inner
         .store
         .call_raw(|st| {
@@ -137,17 +157,6 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             "own op written between the re-bootstrap export and the reset",
         )));
     }
-    let s = file.s;
-    // `RefusedAsRemoved` stays visible.
-    inner.status.send_if_modified(|st| {
-        let running = matches!(st, NodeStatus::Running);
-        if running {
-            *st = NodeStatus::Rebootstrapping {
-                waiting_for_self_seq: s,
-            };
-        }
-        running
-    });
     info!(waiting_for_self_seq = s, "store reset; catching up");
     #[cfg(any(test, feature = "test-hooks"))]
     if inner.crash_after_reset.swap(false, Ordering::SeqCst) {

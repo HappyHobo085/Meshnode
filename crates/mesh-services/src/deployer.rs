@@ -6,13 +6,18 @@
 //! `rescan_every` and when either event stream lags. Placement depends on the membership
 //! snapshot, which the node updates after the `_mesh` change that caused it, so membership
 //! and tag changes are picked up from `NodeEvent::MembersChanged`.
+//!
+//! While the node re-bootstraps its store is emptied and refilled, so a scan then leaves
+//! every known and active service as it is (it may only add services); the scan after
+//! `RebootstrapDone` brings everything up to date.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use mesh_core::membership::MESH_NS;
-use mesh_core::{BlobHash, NodeEvent, NodeHandle};
+use mesh_core::{BlobHash, NodeEvent, NodeHandle, NodeStatus};
 use mesh_proto::{ServiceKind, ServiceManifest};
 use mesh_runtime::{Loaded, Runtime};
 use mesh_store::{Change, ChangeKind};
@@ -98,6 +103,8 @@ pub(crate) struct Shared {
     pub gc_hold: watch::Sender<bool>,
     /// Test hook: notified when a pass reaches that wait.
     pub gc_reached: tokio::sync::Notify,
+    /// Scans the deployer has finished (a test hook reads it).
+    pub scans: AtomicU64,
 }
 
 impl Shared {
@@ -112,6 +119,7 @@ impl Shared {
             owned_file: Mutex::new(()),
             gc_hold: watch::Sender::new(false),
             gc_reached: tokio::sync::Notify::new(),
+            scans: AtomicU64::new(0),
         }
     }
 
@@ -325,6 +333,7 @@ impl Deployer {
         if let Err(e) = self.try_scan().await {
             warn!(error = %e, "service scan failed");
         }
+        self.shared.scans.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn try_scan(&mut self) -> Result<(), ServicesError> {
@@ -354,8 +363,7 @@ impl Deployer {
         names.extend(self.tracks.keys().cloned());
 
         let sizes = store.call(|r| r.namespace_sizes()).await?;
-        let members = node.members();
-        let me = node.node_id();
+        let mut seen = Vec::with_capacity(names.len());
         for name in names {
             let manifest = match read_manifest(store, &name).await {
                 Ok(m) => m,
@@ -365,13 +373,34 @@ impl Deployer {
                 }
                 Err(e) => return Err(e),
             };
+            let generation = match &manifest {
+                Some(_) => current_generation(store, &name).await?,
+                None => 0,
+            };
+            seen.push((name, manifest, generation));
+        }
+        // Read after the store: the node turns `Rebootstrapping` before it resets its store,
+        // so `Running` here means everything above was read from a whole store. While it
+        // re-bootstraps, `_mesh` is being refilled: nothing is forgotten, un-placed or
+        // changed, only services not active yet may be added (`RebootstrapDone` rescans).
+        let frozen = matches!(node.status(), NodeStatus::Rebootstrapping { .. });
+        let members = node.members();
+        let me = node.node_id();
+        for (name, manifest, generation) in seen {
+            if frozen && self.shared.active(&name).is_some() {
+                continue;
+            }
             let Some(m) = manifest else {
-                self.forget(&name);
+                if !frozen {
+                    self.forget(&name);
+                }
                 continue;
             };
-            let generation = current_generation(store, &name).await?;
-            let data_bytes = sizes.get(&data_ns(&name, generation)).copied().unwrap_or(0);
             let placed = placed_among(&m, me, &members);
+            if frozen && !placed {
+                continue;
+            }
+            let data_bytes = sizes.get(&data_ns(&name, generation)).copied().unwrap_or(0);
             self.apply(&name, m, generation, placed, data_bytes);
         }
         Ok(())

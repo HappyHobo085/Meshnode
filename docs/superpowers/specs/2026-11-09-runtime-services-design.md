@@ -171,11 +171,13 @@ One task, supervised and stopped by the node's cancel token.
   - A newer manifest arrives during a fetch: the stale fetch is abandoned.
   - Failure: keep the previous version; retry with backoff 5 s → 5 min; status `Failed { error, retry_at }`.
   - Undeployed or no longer placed here: remove from the active table.
+- **Re-bootstrap** *(amended in final review)*: while the node is `Rebootstrapping` its store is emptied and `_mesh` refills, so a scan neither forgets, un-places nor changes any known or active service (it may only add services not active yet). The node turns `Rebootstrapping` before it resets the store, so a scan that reads `Running` after reading the manifests read a whole store. `RebootstrapDone` triggers a full rescan.
 
 ### 5.3 Dispatch: `Services::handle(name, req)`
 
 | State | Response |
 |---|---|
+| Node `Rebootstrapping` (any service) | `503 Node re-bootstrapping` *(amended in final review)* |
 | Active | served by the runtime (§3.3) or the static handler (§6) |
 | Placed here, never ready | `503 Service not yet replicated` |
 | Not placed here | `503 Service not placed on this node` (sub-spec 4's gateway forwards instead) |

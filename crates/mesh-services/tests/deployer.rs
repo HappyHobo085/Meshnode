@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{T, fixture, test_cfg, wait_until};
-use mesh_core::{Node, NodeStatus};
+use mesh_core::membership::MESH_NS;
+use mesh_core::{Node, NodeEvent, NodeStatus};
+use mesh_hlc::ManualClock;
 use mesh_proto::{NodeId, Placement, Role, ServiceKind, ServiceManifest};
 use mesh_runtime::{CodeCache, Runtime, RuntimeConfig};
 use mesh_services::{
@@ -22,6 +24,8 @@ use tokio::time::{Instant, sleep, timeout};
 const NOT_PLACED: &str = "Service not placed on this node";
 const NOT_REPLICATED: &str = "Service not yet replicated";
 const NOT_DEPLOYED: &str = "Service not deployed";
+const REBOOTSTRAPPING: &str = "Node re-bootstrapping";
+const DAY_MS: u64 = 86_400_000;
 
 fn timings() -> DeployerTimings {
     DeployerTimings {
@@ -87,13 +91,28 @@ impl Net {
 }
 
 async fn net(founder_tags: &[&str], others: &[(Role, &[&str])]) -> Net {
+    net_on(None, founder_tags, others).await
+}
+
+/// [`net`] with every node on `clock` when given.
+async fn net_on(
+    clock: Option<&ManualClock>,
+    founder_tags: &[&str],
+    others: &[(Role, &[&str])],
+) -> Net {
+    let on_clock = |mut cfg: mesh_core::NodeConfig| {
+        if let Some(c) = clock {
+            cfg.wall = std::sync::Arc::new(c.clone());
+        }
+        cfg
+    };
     let mut dirs = vec![tempfile::tempdir().unwrap()];
-    let mut cfg = test_cfg(dirs[0].path(), "n0");
+    let mut cfg = on_clock(test_cfg(dirs[0].path(), "n0"));
     cfg.tags = founder_tags.iter().map(|t| t.to_string()).collect();
     let mut nodes = vec![Node::create_mesh(cfg).await.unwrap()];
     for (i, (role, tags)) in others.iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = test_cfg(dir.path(), &format!("n{}", i + 1));
+        let mut cfg = on_clock(test_cfg(dir.path(), &format!("n{}", i + 1)));
         cfg.tags = tags.iter().map(|t| t.to_string()).collect();
         let ticket = nodes[0]
             .invite(*role, Duration::from_secs(900))
@@ -592,4 +611,121 @@ async fn services_resume_after_restart() {
     assert_eq!(call(&svc, "counter", "/").await, (200, "2".into()));
     svc.shutdown().await;
     b.shutdown().await;
+}
+
+/// Waits until `node` completed a full sync at or after wall time `ms`.
+async fn full_sync_since(node: &Node, ms: u64) {
+    wait_for("a full sync at the new time", || async {
+        node.store()
+            .call(|r| r.last_full_sync_ms())
+            .await
+            .unwrap()
+            .is_some_and(|t| t >= ms)
+    })
+    .await;
+}
+
+/// While its node re-bootstraps (store emptied, `_mesh` refilling), a node's services
+/// answer 503 and the deployer keeps every active service; afterwards they serve again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebootstrap_freezes_services() {
+    let clock = ManualClock::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    );
+    // Founder X, hosts A (index 1, the node that goes stale) and C (index 2).
+    let n = net_on(Some(&clock), &[], &[(Role::Host, &[]), (Role::Host, &[])]).await;
+    let (x, a, c) = (&n.nodes[0], &n.nodes[1], &n.nodes[2]);
+    let svc_a = &n.svcs[1];
+    n.svcs[0]
+        .deploy_wasm("counter", wasm("counter"), DeployOpts::default())
+        .await
+        .unwrap();
+    for s in &n.svcs {
+        wait_ready(s, "counter", 1).await;
+    }
+    assert_eq!(call(svc_a, "counter", "/").await.0, 200);
+
+    // A is cut off; X and C keep syncing while the clock moves past A's 80-day staleness.
+    let (ix, ia, ic) = (n.id(0), n.id(1), n.id(2));
+    a.partition(&[ix, ic]);
+    x.partition(&[ia]);
+    c.partition(&[ia]);
+    wait_until("A cut off", T, || {
+        !online(a, ix) && !online(a, ic) && !online(x, ia) && !online(c, ia)
+    })
+    .await;
+    let day0 = mesh_hlc::WallClock::now_ms(&clock);
+    for day in [50, 81] {
+        clock.set(day0 + day * DAY_MS);
+        full_sync_since(x, day0 + day * DAY_MS).await;
+        full_sync_since(c, day0 + day * DAY_MS).await;
+    }
+
+    // On contact A re-bootstraps. It is held before its reset while it is cut off again,
+    // so its store stays empty: nothing can refill `_mesh`.
+    a.hold_rebootstrap_before_reset(true);
+    let mut events = a.subscribe();
+    a.heal();
+    x.heal();
+    c.heal();
+    wait_until("A re-bootstrapping", T, || {
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    a.partition(&[ix, ic]);
+    x.partition(&[ia]);
+    c.partition(&[ia]);
+    wait_until("A cut off again", T, || {
+        !online(a, ix) && !online(a, ic) && !online(x, ia) && !online(c, ia)
+    })
+    .await;
+    a.hold_rebootstrap_before_reset(false);
+    wait_for("A's store reset", || async {
+        a.store()
+            .list_keys(MESH_NS, "service/", None, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    // Two full deployer scans see the emptied store.
+    let scans = svc_a.deployer_scans();
+    wait_until("two deployer scans", T, || {
+        svc_a.deployer_scans() >= scans + 2
+    })
+    .await;
+    assert_eq!(
+        call(svc_a, "counter", "/").await,
+        (503, REBOOTSTRAPPING.into())
+    );
+    assert_eq!(
+        local(svc_a, "counter"),
+        Some(LocalStatus::Ready { version: 1 }),
+        "the service stays known and active"
+    );
+
+    a.heal();
+    x.heal();
+    c.heal();
+    timeout(T, async {
+        loop {
+            if events.recv().await.unwrap() == NodeEvent::RebootstrapDone {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("no RebootstrapDone");
+    wait_for("A serves counter again", || async {
+        call(svc_a, "counter", "/").await.0 == 200
+    })
+    .await;
+    assert_eq!(
+        local(svc_a, "counter"),
+        Some(LocalStatus::Ready { version: 1 })
+    );
+    n.shutdown().await;
 }

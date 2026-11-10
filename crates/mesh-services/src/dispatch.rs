@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Response, StatusCode, header};
+use mesh_core::NodeStatus;
 use mesh_runtime::RequestCtx;
 use tracing::warn;
 
@@ -16,12 +17,17 @@ use crate::placement::placed;
 const NOT_REPLICATED: &str = "Service not yet replicated";
 const NOT_PLACED: &str = "Service not placed on this node";
 const NOT_DEPLOYED: &str = "Service not deployed";
+const REBOOTSTRAPPING: &str = "Node re-bootstrapping";
 
 impl Services {
     /// Serves one request for service `name` on this node. Never fails: every outcome is
     /// an HTTP response.
     pub async fn handle(&self, name: &str, req: http::Request<Bytes>) -> Response<Bytes> {
         let shared = &self.shared;
+        // The store is being rebuilt: its KV data and manifests are incomplete.
+        if matches!(shared.node.status(), NodeStatus::Rebootstrapping { .. }) {
+            return text(StatusCode::SERVICE_UNAVAILABLE, REBOOTSTRAPPING);
+        }
         if let Some(active) = shared.active(name) {
             return match &active.payload {
                 Payload::Wasm(loaded) => {

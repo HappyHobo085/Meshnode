@@ -120,6 +120,12 @@ impl Services {
         self.shared.paused.send_replace(on);
     }
 
+    /// How many scans the deployer has finished.
+    #[cfg(feature = "test-hooks")]
+    pub fn deployer_scans(&self) -> u64 {
+        self.shared.scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// [`Services::start`] with another GC interval.
     #[cfg(feature = "test-hooks")]
     pub async fn start_with_gc_interval(

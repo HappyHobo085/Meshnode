@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use mesh_core::membership::MESH_NS;
@@ -12,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::deployer::{DeployerTask, DeployerTimings, Shared};
 use crate::error::ServicesError;
+use crate::gc::{self, GC_EVERY, GcTask};
 use crate::manifest::{current_generation, data_ns, gen_key, manifest_key, read_manifest};
 
 /// Settings for [`Services::start`].
@@ -53,6 +55,7 @@ impl Default for DeployOpts {
 pub struct Services {
     pub(crate) shared: Arc<Shared>,
     deployer: DeployerTask,
+    gc: GcTask,
     /// Serializes this node's manifest read-modify-write cycles.
     write: Mutex<()>,
 }
@@ -61,7 +64,7 @@ impl Services {
     /// Starts the runtime and the deployer, which stops with the node (or with
     /// [`Services::shutdown`]).
     pub async fn start(node: &Node, cfg: ServicesConfig) -> Result<Services, ServicesError> {
-        Self::start_inner(node, cfg, DeployerTimings::default())
+        Self::start_inner(node, cfg, DeployerTimings::default(), GC_EVERY)
     }
 
     /// [`Services::start`] with other deployer intervals.
@@ -71,13 +74,14 @@ impl Services {
         cfg: ServicesConfig,
         timings: DeployerTimings,
     ) -> Result<Services, ServicesError> {
-        Self::start_inner(node, cfg, timings)
+        Self::start_inner(node, cfg, timings, GC_EVERY)
     }
 
     fn start_inner(
         node: &Node,
         cfg: ServicesConfig,
         timings: DeployerTimings,
+        gc_every: Duration,
     ) -> Result<Services, ServicesError> {
         let runtime = Runtime::new(RuntimeConfig {
             cache: cfg.cache,
@@ -86,9 +90,11 @@ impl Services {
         .map_err(ServicesError::Runtime)?;
         let shared = Arc::new(Shared::new(node.handle(), runtime));
         let deployer = DeployerTask::spawn(shared.clone(), timings);
+        let gc = GcTask::spawn(shared.clone(), gc_every);
         Ok(Services {
             shared,
             deployer,
+            gc,
             write: Mutex::new(()),
         })
     }
@@ -97,8 +103,12 @@ impl Services {
     /// store file is released once the node shuts down too.
     pub async fn shutdown(self) {
         let Services {
-            shared, deployer, ..
+            shared,
+            deployer,
+            gc,
+            ..
         } = self;
+        gc.stop().await;
         deployer.stop().await;
         drop(shared);
     }
@@ -108,6 +118,22 @@ impl Services {
     #[cfg(feature = "test-hooks")]
     pub fn pause_deployer(&self, on: bool) {
         self.shared.paused.send_replace(on);
+    }
+
+    /// [`Services::start`] with another GC interval.
+    #[cfg(feature = "test-hooks")]
+    pub async fn start_with_gc_interval(
+        node: &Node,
+        cfg: ServicesConfig,
+        every: Duration,
+    ) -> Result<Services, ServicesError> {
+        Self::start_inner(node, cfg, DeployerTimings::default(), every)
+    }
+
+    /// Runs one blob GC pass now.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn gc_now(&self) -> Result<(), ServicesError> {
+        gc::run_once(&self.shared).await
     }
 
     /// The code cache's `(hits, misses)` since start.

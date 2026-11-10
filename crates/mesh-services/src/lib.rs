@@ -5,6 +5,7 @@
 mod deployer;
 mod dispatch;
 mod error;
+mod gc;
 mod kv;
 mod manifest;
 mod ops;

@@ -86,6 +86,8 @@ pub(crate) struct Shared {
     /// While true the deployer does not scan (a test hook; always present so the loop
     /// has one shape).
     pub paused: watch::Sender<bool>,
+    /// Serializes blob GC passes.
+    pub gc_lock: tokio::sync::Mutex<()>,
 }
 
 impl Shared {
@@ -96,6 +98,7 @@ impl Shared {
             active: RwLock::default(),
             known: Mutex::default(),
             paused: watch::Sender::new(false),
+            gc_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -114,6 +117,12 @@ impl Shared {
         if table.remove(name).is_some() {
             info!(service = name, "service stopped on this node");
         }
+    }
+
+    /// What every active service was loaded from.
+    pub fn active_kinds(&self) -> Vec<ServiceKind> {
+        let table = self.active.read().unwrap_or_else(PoisonError::into_inner);
+        table.values().map(|a| a.manifest.kind.clone()).collect()
     }
 
     fn active_names(&self) -> Vec<String> {

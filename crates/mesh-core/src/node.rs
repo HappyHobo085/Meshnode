@@ -180,6 +180,16 @@ impl NodeHandle {
         self.inner.status()
     }
 
+    /// The node's data directory.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.inner.cfg.data_dir
+    }
+
+    /// The node's wall clock, in ms since the Unix epoch.
+    pub fn now_ms(&self) -> u64 {
+        self.inner.cfg.wall.now_ms()
+    }
+
     /// The node's events (see [`Node::subscribe`]); `MembersChanged` follows every change
     /// to the membership snapshot that [`NodeHandle::members`] reads.
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {

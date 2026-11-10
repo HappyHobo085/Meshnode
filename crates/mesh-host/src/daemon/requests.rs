@@ -32,7 +32,12 @@ impl AdminBackend for Daemon {
         use AdminRequest as R;
         let inner = &*self.inner;
         match req {
-            R::Status => self.status().await,
+            R::Status => {
+                // Lock order: `run`, then `cfg`.
+                let run = inner.run.read().await;
+                let cfg = inner.cfg.lock().await;
+                AdminResponse::Status(self.status_info(run.as_ref(), Some(&cfg)))
+            }
             R::Init { name } => self.init(name, None).await,
             R::Join { ticket, name } => match InviteTicket::from_text(&ticket) {
                 Ok(t) => self.init(name, Some(t)).await,
@@ -85,7 +90,13 @@ impl From<Fail> for AdminResponse {
 type Answer = Result<AdminResponse, Fail>;
 
 impl Daemon {
-    async fn status(&self) -> AdminResponse {
+    /// The answer to `Status`, from the running node (if any) and `meshd.toml` (if
+    /// available: it is the fallback for this node's name and tags).
+    pub(super) fn status_info(
+        &self,
+        run: Option<&Running>,
+        cfg: Option<&HostConfig>,
+    ) -> StatusInfo {
         let inner = &*self.inner;
         let mut s = StatusInfo {
             state: self.state(),
@@ -102,7 +113,7 @@ impl Daemon {
             gateway: None,
             ports: Vec::new(),
         };
-        if let Some(run) = inner.run.read().await.as_ref() {
+        if let Some(run) = run {
             let me = run.node.node_id();
             let members = run.node.members();
             s.node_id = Some(me);
@@ -113,8 +124,9 @@ impl Daemon {
             match own.and_then(|m| m.info.as_ref()) {
                 Some(i) => (s.name, s.tags) = (Some(i.name.clone()), i.tags.clone()),
                 None => {
-                    let cfg = inner.cfg.lock().await;
-                    (s.name, s.tags) = (Some(cfg.name.clone()), cfg.tags.clone());
+                    if let Some(cfg) = cfg {
+                        (s.name, s.tags) = (Some(cfg.name.clone()), cfg.tags.clone());
+                    }
                 }
             }
             s.members_total = members.len() as u32;
@@ -127,7 +139,7 @@ impl Daemon {
                 }
             }
         }
-        AdminResponse::Status(s)
+        s
     }
 
     /// `Init` (no ticket) or `Join`: starts the node in place and records the name.

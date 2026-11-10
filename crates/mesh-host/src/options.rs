@@ -2,21 +2,7 @@
 
 use std::sync::Arc;
 
-/// How periodic work is scheduled. Stub: filled in with the Android host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Periodic {
-    /// The host runs its own timers.
-    #[default]
-    Timers,
-    /// The embedding platform drives periodic work.
-    Driven,
-}
-
-/// Receives wake-lock requests from the host. Stub: filled in with the Android host.
-pub trait WakeLockSink: Send + Sync {
-    fn acquire(&self, tag: &str, max_ms: u64);
-    fn release(&self, tag: &str);
-}
+use crate::power::{Periodic, WakeLockSink};
 
 /// Options that differ between hosts; the default is the desktop daemon.
 #[derive(Clone)]
@@ -24,6 +10,7 @@ pub struct HostOptions {
     /// Serve the admin API on `<data>/admin.sock` (or the named pipe).
     pub admin_socket: bool,
     pub periodic: Periodic,
+    /// Wake locks for the power policy (Android); `None` takes none.
     pub power: Option<Arc<dyn WakeLockSink>>,
 }
 

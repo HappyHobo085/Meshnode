@@ -37,3 +37,4 @@ mesh-host = { path = ".", features = ["test-hooks"] }
 mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -11,10 +11,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mesh_admin::{
     Access, AdminBackend, AdminError, AdminRequest, AdminResponse, AdminServer, DaemonState,
-    Endpoint, ErrorCode, RequestIo, connect_raw, endpoint_for,
+    Endpoint, ErrorCode, InProcessAdmin, RequestIo, connect_raw, endpoint_for,
 };
 use mesh_core::local::read_genesis;
-use mesh_core::{Node, NodeConfig, NodeError, NodeHandle, NodeStatus, Timings};
+use mesh_core::{Node, NodeConfig, NodeError, NodeHandle, NodeStatus, Timings, WakeOutcome};
 use mesh_gateway::{Forwarder, Gateway, GatewayConfig, GatewayError, HttpFwdHandler, HttpFwdSlot};
 use mesh_proto::{ALPN_HTTPFWD, InviteTicket};
 use mesh_services::{Services, ServicesConfig, ServicesError};
@@ -26,6 +26,7 @@ use crate::config::{CONFIG_FILE, ConfigError, HostConfig};
 use crate::lock::{DataLock, LOCK_FILE, LockError};
 use crate::options::HostOptions;
 use crate::paths::{logs_dir, tmp_dir};
+use crate::power::{CATCH_UP_AFTER, Periodic, Power, PowerState, WakeReason, saver_paused};
 
 mod requests;
 
@@ -39,6 +40,8 @@ const GATEWAY_STOP: Duration = Duration::from_secs(6);
 /// in-flight `httpfwd` request) to let go.
 const SERVICES_RELEASE: Duration = Duration::from_secs(3);
 const SERVICES_STOP: Duration = Duration::from_secs(3);
+/// How long [`Daemon::wake`] waits for the catch-up.
+const WAKE_LIMIT: Duration = Duration::from_secs(10);
 /// Entries of the data directory that `ResetIdentity` keeps.
 const KEPT_ON_RESET: [&str; 4] = [CONFIG_FILE, "logs", "admin.sock", LOCK_FILE];
 
@@ -97,6 +100,22 @@ impl TestOptions {
     }
 }
 
+/// What an embedding host shows (Android notification, placeholder page).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostStatus {
+    pub state: DaemonState,
+    /// Hex, while a node runs.
+    pub node_id: Option<String>,
+    /// The mesh id in hex (a mesh has no other name), while a node runs.
+    pub mesh_name: Option<String>,
+    /// The services of the mesh (as `Status` counts them).
+    pub services_hosted: u32,
+    /// Other members online.
+    pub peers_online: u32,
+    /// The gateway's listening ports: the main one first, then the mapped ones.
+    pub gateway_ports: Vec<u16>,
+}
+
 /// A running daemon. Stop it with [`Daemon::shutdown`] or [`Daemon::run_until`].
 pub struct Daemon {
     inner: Arc<Inner>,
@@ -118,6 +137,18 @@ struct Inner {
     /// The gateway's listeners while it runs: the main one (`None`) first.
     gateway_addrs: Mutex<Vec<(SocketAddr, Option<String>)>>,
     admin: Mutex<Option<AdminServer>>,
+    /// The runtime the daemon started on (for work started from synchronous calls).
+    rt: tokio::runtime::Handle,
+    /// The power state and wake locks; applied to every node started.
+    power: Arc<Power>,
+    /// `[android] periodic_wake_s`, as started.
+    periodic_wake_s: u32,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.power.close();
+    }
 }
 
 /// The node and what runs on it.
@@ -212,6 +243,14 @@ impl Daemon {
         }
         let access = access_for(&cfg);
         let initialised = read_genesis(&data_dir)?.is_some();
+        let rt = tokio::runtime::Handle::current();
+        // The platform reports the real state through `set_power`.
+        let power_state = PowerState {
+            policy: cfg.android.power,
+            charging: false,
+            screen_on: true,
+        };
+        let power = Arc::new(Power::new(opts.host.power.clone(), rt.clone(), power_state));
         let inner = Arc::new(Inner {
             _lock: data_lock,
             data_dir,
@@ -223,6 +262,9 @@ impl Daemon {
             handle: Mutex::new(None),
             gateway_addrs: Mutex::new(Vec::new()),
             admin: Mutex::new(None),
+            rt,
+            power,
+            periodic_wake_s: cfg.android.periodic_wake_s,
         });
         if initialised {
             let gateway = inner.start_node(&cfg, How::Open).await?;
@@ -244,6 +286,7 @@ impl Daemon {
                 }
             }
         }
+        inner.power.apply_standing();
         info!(
             data = %inner.data_dir.display(),
             endpoint = %inner.endpoint,
@@ -290,7 +333,84 @@ impl Daemon {
             }
         };
         inner.stop_node(deadline).await;
+        inner.power.close();
         info!("meshd stopped");
+    }
+
+    /// Catches up now (Android: alarm, network change, boot, incoming push): redials and
+    /// syncs with every connected peer, for at most 10 s (the rest goes on in the
+    /// background). Holds the `"catchup"` wake lock meanwhile and, on an alarm, the
+    /// `"alarm"` lock for its timeout, as the power policy says. Without a running node it
+    /// does nothing.
+    pub async fn wake(&self, reason: WakeReason) -> WakeOutcome {
+        let inner = &self.inner;
+        let run = inner.run.read().await;
+        let Some(run) = run.as_ref() else {
+            return WakeOutcome {
+                peers: 0,
+                rounds_completed: 0,
+                timed_out: false,
+            };
+        };
+        if reason == WakeReason::Alarm {
+            inner.power.alarm(inner.periodic_wake_s);
+        }
+        let _lock = inner.power.catch_up_lock();
+        let outcome = run.node.wake(WAKE_LIMIT).await;
+        info!(?reason, ?outcome, "wake");
+        outcome
+    }
+
+    /// The device's network changed: rebinds and redials now. Without a running node it
+    /// does nothing.
+    pub fn network_changed(&self) {
+        self.inner.with_node(|_, run| run.node.network_change());
+    }
+
+    /// Records the power state (policy, charging, screen) and applies it: in Saver with
+    /// the screen off, inbound `httpfwd` answers 503 and the incoming-traffic catch-up is
+    /// off; the `"always"` / `"charging"` wake lock is taken or let go. The state is kept
+    /// across node starts and applies to each.
+    pub fn set_power(&self, state: PowerState) {
+        self.inner.power.set_state(state);
+        self.inner.with_node(Inner::apply_power);
+    }
+
+    /// The admin API, called in-process (no socket).
+    pub fn in_process_admin(&self) -> InProcessAdmin {
+        InProcessAdmin::new(Arc::new(Backend(Arc::downgrade(&self.inner))))
+    }
+
+    /// What `Status` reports, summarised. While a node starts or stops, its details may be
+    /// missing.
+    pub fn status(&self) -> HostStatus {
+        let inner = &*self.inner;
+        let run = inner.run.try_read().ok();
+        let cfg = inner.cfg.try_lock().ok();
+        let s = self.status_info(run.as_deref().and_then(Option::as_ref), cfg.as_deref());
+        let main = s
+            .gateway
+            .as_deref()
+            .and_then(|a| a.parse::<SocketAddr>().ok())
+            .map(|a| a.port());
+        HostStatus {
+            state: s.state,
+            node_id: s.node_id.map(|id| hex::encode(id.0)),
+            mesh_name: s.mesh_id.map(|id| hex::encode(id.0)),
+            services_hosted: s.services,
+            // This node counts itself online.
+            peers_online: s.members_online.saturating_sub(1),
+            gateway_ports: main
+                .into_iter()
+                .chain(s.ports.iter().map(|p| p.0))
+                .collect(),
+        }
+    }
+
+    /// Inbound `httpfwd` streams being served (counted only with a wake-lock sink).
+    #[cfg(feature = "test-hooks")]
+    pub fn requests_in_flight(&self) -> u32 {
+        self.inner.power.in_flight()
     }
 }
 
@@ -394,12 +514,19 @@ impl Inner {
         how: How,
     ) -> Result<Option<GatewayError>, DaemonError> {
         let (handler, slot) = HttpFwdHandler::new();
+        if self.power.has_sink() {
+            let power = self.power.clone();
+            slot.set_activity(Arc::new(move |a| power.activity(a)));
+        }
+        let power_state = self.power.state();
+        slot.set_paused(saver_paused(&power_state));
         let mut nc = NodeConfig::new(&self.data_dir, cfg.name.clone());
         nc.tags = cfg.tags.clone();
         nc.relay = cfg.relay_choice();
         nc.discovery = cfg.discovery;
         nc.bind_addr = self.opts.bind_addr;
         nc.timings = self.opts.timings.clone();
+        nc.catch_up_on_incoming_after = self.catch_up_after(&power_state);
         nc.extra_protocols
             .push((ALPN_HTTPFWD.to_vec(), Arc::new(handler)));
         let node = match how {
@@ -432,12 +559,16 @@ impl Inner {
         let handle = node.handle();
         // `run` first: `state()` (from `handle`) never says Running while `run` is empty.
         let mut run = self.run.write().await;
-        *run = Some(Running {
+        let running = Running {
             node,
             services,
             gateway,
             slot,
-        });
+        };
+        // Under the write lock: the state may have changed since it was read above, and a
+        // `set_power` from now on finds this node (or waits for it).
+        self.apply_power(&running);
+        *run = Some(running);
         *lock(&self.gateway_addrs) = addrs.unwrap_or_default();
         *lock(&self.handle) = Some(handle);
         Ok(failed)
@@ -506,6 +637,40 @@ impl Inner {
             return Stopped::Busy;
         }
         released
+    }
+
+    /// The incoming-traffic catch-up for `state`: on with `Periodic::Driven`, except while
+    /// Saver pauses serving.
+    fn catch_up_after(&self, state: &PowerState) -> Option<Duration> {
+        (self.opts.host.periodic == Periodic::Driven && !saver_paused(state))
+            .then_some(CATCH_UP_AFTER)
+    }
+
+    /// Applies the current power state to a running node.
+    fn apply_power(&self, run: &Running) {
+        let state = self.power.state();
+        run.slot.set_paused(saver_paused(&state));
+        run.node
+            .set_catch_up_on_incoming(self.catch_up_after(&state));
+    }
+
+    /// Calls `f` with the running node, if any: at once when the node is free, otherwise
+    /// on a task once the start or stop in progress ends.
+    fn with_node(self: &Arc<Self>, f: impl FnOnce(&Inner, &Running) + Send + 'static) {
+        if let Ok(run) = self.run.try_read() {
+            if let Some(run) = run.as_ref() {
+                f(self, run);
+            }
+            return;
+        }
+        let me = Arc::downgrade(self);
+        self.rt.spawn(async move {
+            if let Some(inner) = me.upgrade()
+                && let Some(run) = inner.run.read().await.as_ref()
+            {
+                f(&inner, run);
+            }
+        });
     }
 
     fn running_or<'a>(

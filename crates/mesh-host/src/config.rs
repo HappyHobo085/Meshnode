@@ -8,6 +8,8 @@ use mesh_core::RelayChoice;
 use mesh_proto::{MemberInfo, valid_service_name};
 use serde::{Deserialize, Serialize};
 
+use crate::power::PowerPolicy;
+
 /// The config file's name inside the data directory.
 pub const CONFIG_FILE: &str = "meshd.toml";
 
@@ -65,6 +67,9 @@ pub struct HostConfig {
     pub gateway: GatewaySection,
     pub services: ServicesSection,
     pub admin: AdminSection,
+    /// Android only (spec §5.3); left out of the file while it has the defaults.
+    #[serde(skip_serializing_if = "AndroidConfig::is_default")]
+    pub android: AndroidConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +97,21 @@ pub struct AdminSection {
     pub windows_user_sid: Option<String>,
 }
 
+/// `[android]`: the power policy and the optional wake lock on each 15-min alarm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AndroidConfig {
+    pub power: PowerPolicy,
+    /// Seconds to hold a wake lock on each wall-clock alarm (`Balanced`); 0 is off.
+    pub periodic_wake_s: u32,
+}
+
+impl AndroidConfig {
+    fn is_default(&self) -> bool {
+        *self == AndroidConfig::default()
+    }
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         HostConfig {
@@ -103,6 +123,7 @@ impl Default for HostConfig {
             gateway: GatewaySection::default(),
             services: ServicesSection::default(),
             admin: AdminSection::default(),
+            android: AndroidConfig::default(),
         }
     }
 }

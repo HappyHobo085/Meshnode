@@ -78,7 +78,7 @@ impl State {
             wasi,
             http: WasiHttpCtx::new(),
             outbound: Outbound::new(service, outbound),
-            table: ResourceTable::new(),
+            table: resource_table(),
             kv,
             node_id,
             kv_status,
@@ -90,6 +90,16 @@ impl State {
     pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
         &mut self.limiter
     }
+}
+
+/// Host resources (streams, pollables, fields, requests...) one request may hold at once.
+/// A guest that leaks handles in a loop gets an error instead of growing host memory.
+const MAX_RESOURCES: usize = 10_000;
+
+fn resource_table() -> ResourceTable {
+    let mut table = ResourceTable::new();
+    table.set_max_capacity(MAX_RESOURCES);
+    table
 }
 
 /// Core instances one request may create. A component's instance count is fixed by its
@@ -361,6 +371,16 @@ mod tests {
             u64::from(16 * PAGES_PER_MIB)
         );
         assert!(b.grow(&mut store, 1).is_err());
+    }
+
+    #[test]
+    fn resource_table_is_capped() {
+        let mut table = resource_table();
+        assert_eq!(table.max_capacity(), MAX_RESOURCES);
+        for i in 0..MAX_RESOURCES {
+            table.push(i).unwrap();
+        }
+        assert!(table.push(0usize).is_err());
     }
 
     #[test]

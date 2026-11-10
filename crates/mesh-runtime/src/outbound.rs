@@ -5,10 +5,15 @@ use http::Uri;
 use http::uri::Scheme;
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
+/// Denied requests logged one by one per request; the rest get one summary line.
+const LOGGED_DENIALS: u32 = 10;
+
 /// The `wasi:http` hooks of one request.
 pub(crate) struct Outbound {
     service: String,
     allowed: Vec<String>,
+    /// Requests denied so far in this request.
+    denied: u32,
 }
 
 impl Outbound {
@@ -16,7 +21,14 @@ impl Outbound {
         Outbound {
             service: service.to_owned(),
             allowed,
+            denied: 0,
         }
+    }
+
+    /// Counts a denial; true while it should be logged on its own.
+    fn note_denied(&mut self) -> bool {
+        self.denied = self.denied.saturating_add(1);
+        self.denied <= LOGGED_DENIALS
     }
 
     /// Whether `uri`'s `host:port` equals an allowlist entry, ignoring case. The port
@@ -63,8 +75,10 @@ impl WasiHttpHooks for Outbound {
             > + Send,
     > {
         if !self.allows(request.uri()) {
-            let dest = destination(request.uri()).unwrap_or_else(|| request.uri().to_string());
-            tracing::warn!(service = %self.service, %dest, "outbound request denied");
+            if self.note_denied() {
+                let dest = destination(request.uri()).unwrap_or_else(|| request.uri().to_string());
+                tracing::warn!(service = %self.service, %dest, "outbound request denied");
+            }
             return Box::new(async { Err(Error::HttpRequestDenied) });
         }
         Box::new(async move {
@@ -80,9 +94,30 @@ impl WasiHttpHooks for Outbound {
     }
 }
 
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        if self.denied > LOGGED_DENIALS {
+            tracing::warn!(
+                service = %self.service,
+                unlogged = self.denied - LOGGED_DENIALS,
+                total = self.denied,
+                "further outbound requests denied in this request"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denials_are_logged_up_to_the_cap() {
+        let mut o = Outbound::new("t", Vec::new());
+        let logged = (0..LOGGED_DENIALS + 5).filter(|_| o.note_denied()).count();
+        assert_eq!(logged, LOGGED_DENIALS as usize);
+        assert_eq!(o.denied, LOGGED_DENIALS + 5);
+    }
 
     fn allows(list: &[&str], uri: &str) -> bool {
         let allowed = list.iter().map(|s| s.to_string()).collect();

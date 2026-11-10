@@ -11,6 +11,8 @@
 # Then this script does the remaining steps itself, the way the CLI does them: it copies the
 # library (already built by the CLI, with the Kotlin glue it generates) into jniLibs and runs
 # the same Gradle task, skipping the Gradle Rust tasks (they would rebuild and symlink again).
+# The fallback is detected by the CLI's error text "Failed to create a symbolic link", as
+# printed by tauri-cli 2.12.4 (cargo-mobile2 0.22.5); recheck it when the CLI is upgraded.
 set -euo pipefail
 
 profile=debug
@@ -27,6 +29,7 @@ android_dir="$tauri_dir/gen/android"
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
+echo "build-apk: $(cargo tauri --version)" >&2
 cd "$tauri_dir"
 if cargo tauri android build "${cli_flags[@]}" --target aarch64 --apk --ci 2>&1 | tee "$log"; then
     exit 0

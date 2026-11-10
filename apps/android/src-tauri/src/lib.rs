@@ -14,12 +14,13 @@ fn status() -> FfiStatus {
     mesh_ffi::status()
 }
 
-/// Joins a mesh with an invite (`AdminRequest::Join`, through `mesh_ffi::admin`).
+/// Joins a mesh with an invite (`AdminRequest::Join`, through `mesh_ffi::admin`). The page
+/// trims both values.
 #[tauri::command]
 async fn join(invite: String, name: String) -> Result<(), String> {
     let request = postcard::to_allocvec(&AdminRequest::Join {
-        ticket: invite.trim().to_owned(),
-        name: name.trim().to_owned(),
+        ticket: invite,
+        name,
     })
     .map_err(|e| e.to_string())?;
     let response = mesh_ffi::admin(request).await.map_err(|e| e.to_string())?;

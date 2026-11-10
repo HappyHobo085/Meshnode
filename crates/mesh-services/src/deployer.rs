@@ -17,10 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use mesh_core::membership::MESH_NS;
-use mesh_core::{BlobHash, NodeEvent, NodeHandle, NodeStatus};
+use mesh_core::{BlobHash, Change, ChangeKind, NodeEvent, NodeHandle, NodeStatus};
 use mesh_proto::{ServiceKind, ServiceManifest};
 use mesh_runtime::{Loaded, Runtime};
-use mesh_store::{Change, ChangeKind};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, Id, JoinError, JoinHandle, JoinSet};

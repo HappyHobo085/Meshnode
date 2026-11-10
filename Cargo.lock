@@ -2314,7 +2314,6 @@ dependencies = [
  "mesh-proto",
  "mesh-runtime",
  "mesh-services",
- "mesh-store",
  "serde",
  "serde_json",
  "tempfile",

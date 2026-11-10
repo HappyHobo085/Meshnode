@@ -1,8 +1,7 @@
 //! A service's key-value data over the gated store.
 
-use mesh_core::{NodeError, StoreHandle};
+use mesh_core::{NodeError, StoreError, StoreHandle};
 use mesh_runtime::{KvBackend, KvError};
-use mesh_store::StoreError;
 
 /// [`KvBackend`] over one namespace of the replicated store. The namespace is fixed at
 /// construction, so a service cannot reach another one. Writes go through the store's

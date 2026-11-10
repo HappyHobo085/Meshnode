@@ -10,7 +10,6 @@ mesh-core = { path = "../mesh-core" }
 mesh-proto = { path = "../mesh-proto" }
 mesh-runtime = { path = "../mesh-runtime" }
 async-trait.workspace = true
-mesh-store = { path = "../mesh-store" }
 blake3.workspace = true
 bytes.workspace = true
 serde.workspace = true

@@ -28,4 +28,6 @@ pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;
 pub use maint::MaintJob;
+/// Store types that appear in this crate's API (store errors and change events).
+pub use mesh_store::{Change, ChangeKind, StoreError};
 pub use node::{MemberStatus, Node, NodeHandle, NodeStatus};

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "The placeholder page's window: Tauri core only (the app's own commands are allowed by default).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

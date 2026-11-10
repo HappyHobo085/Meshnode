@@ -39,5 +39,6 @@ test-hooks = []
 
 [dev-dependencies]
 mesh-ffi = { path = ".", features = ["test-hooks"] }
+serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshnode</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: 16px; max-width: 40rem; }
+    h1 { font-size: 1.4rem; margin: 0 0 12px; }
+    h2 { font-size: 1.1rem; margin: 20px 0 8px; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+    dt { opacity: 0.7; }
+    dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
+    textarea, input { box-sizing: border-box; width: 100%; font: inherit; padding: 6px; margin: 0 0 8px; }
+    textarea { min-height: 5rem; font-family: ui-monospace, monospace; }
+    button { font: inherit; padding: 8px 16px; margin: 0 8px 8px 0; }
+    #message { min-height: 1.4em; overflow-wrap: anywhere; }
+    .error { color: #c62828; }
+  </style>
+</head>
+<body>
+  <h1>Meshnode</h1>
+
+  <dl>
+    <dt>State</dt><dd id="state">…</dd>
+    <dt>Node id</dt><dd id="node">–</dd>
+    <dt>Mesh</dt><dd id="mesh">–</dd>
+    <dt>Peers online</dt><dd id="peers">–</dd>
+    <dt>Services hosted</dt><dd id="services">–</dd>
+    <dt>Last error</dt><dd id="last-error">–</dd>
+  </dl>
+
+  <h2>Service</h2>
+  <button id="start" type="button">Start</button>
+  <button id="stop" type="button">Stop</button>
+
+  <h2>Join a mesh</h2>
+  <label for="invite">Invite</label>
+  <textarea id="invite" autocomplete="off" spellcheck="false"></textarea>
+  <label for="name">Name of this node</label>
+  <input id="name" type="text" autocomplete="off">
+  <button id="join" type="button">Join</button>
+
+  <p id="message" role="status"></p>
+
+  <script>
+    const invoke = window.__TAURI__.core.invoke;
+    const $ = (id) => document.getElementById(id);
+
+    function say(text, isError) {
+      $("message").textContent = text;
+      $("message").className = isError ? "error" : "";
+    }
+
+    async function refresh() {
+      try {
+        const s = await invoke("status");
+        $("state").textContent = s.state;
+        $("node").textContent = s.node_id ?? "–";
+        $("mesh").textContent = s.mesh_name ?? "–";
+        $("peers").textContent = String(s.peers_online);
+        $("services").textContent = String(s.services_hosted);
+        $("last-error").textContent = s.last_error ?? "–";
+      } catch (e) {
+        say("status: " + e, true);
+      }
+    }
+
+    async function run(label, command, args) {
+      say(label + "…", false);
+      try {
+        await invoke(command, args);
+        say(label + ": done", false);
+      } catch (e) {
+        say(label + ": " + e, true);
+      }
+      refresh();
+    }
+
+    $("start").addEventListener("click", () => run("Start", "service_start"));
+    $("stop").addEventListener("click", () => run("Stop", "service_stop"));
+    $("join").addEventListener("click", () => {
+      const invite = $("invite").value.trim();
+      const name = $("name").value.trim();
+      if (!invite || !name) {
+        say("Join: an invite and a name are needed", true);
+        return;
+      }
+      run("Join", "join", { invite, name });
+    });
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

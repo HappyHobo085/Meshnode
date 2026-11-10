@@ -348,3 +348,32 @@ two
     let end: AdminResponse = postcard::from_bytes(&end).unwrap();
     assert!(matches!(end, AdminResponse::Error { .. }), "{end:?}");
 }
+
+/// The Tauri `status` command hands `FfiStatus` to the placeholder page as JSON: snake_case
+/// fields and the state as its variant name.
+#[test]
+fn status_serializes_for_the_webview() {
+    let status = mesh_ffi::FfiStatus {
+        state: FfiState::Running,
+        node_id: Some("ab12".into()),
+        mesh_name: None,
+        services_hosted: 2,
+        peers_online: 3,
+        gateway_ports: vec![8080],
+        last_error: None,
+        power_policy: Some(FfiPowerPolicy::AlwaysOn),
+    };
+    assert_eq!(
+        serde_json::to_value(&status).unwrap(),
+        serde_json::json!({
+            "state": "Running",
+            "node_id": "ab12",
+            "mesh_name": null,
+            "services_hosted": 2,
+            "peers_online": 3,
+            "gateway_ports": [8080],
+            "last_error": null,
+            "power_policy": "AlwaysOn",
+        })
+    );
+}

@@ -57,7 +57,7 @@ pub enum FfiError {
 }
 
 /// The host's state: `Stopped` when no daemon runs, otherwise the daemon's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum, serde::Serialize)]
 pub enum FfiState {
     Stopped,
     Uninitialised,
@@ -67,7 +67,7 @@ pub enum FfiState {
 }
 
 /// [`mesh_host::HostStatus`], plus the last start error or panic.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record, serde::Serialize)]
 pub struct FfiStatus {
     pub state: FfiState,
     /// Hex, while a node runs.
@@ -94,7 +94,7 @@ pub enum FfiWakeReason {
     Incoming,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum, serde::Serialize)]
 pub enum FfiPowerPolicy {
     Balanced,
     AlwaysOn,

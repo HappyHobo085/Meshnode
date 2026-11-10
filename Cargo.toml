@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/*"]
 exclude = ["spikes", "crates/mesh-runtime/tests/fixtures"]
 
 [workspace.package]
@@ -37,4 +37,6 @@ wasmtime-wasi-http = "50.0.1"
 http = "1"
 http-body-util = "0.1"
 async-trait = "0.1"
+toml = "1"
+tracing-appender = "0.2"
 wat = "1"

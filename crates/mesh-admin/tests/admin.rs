@@ -136,6 +136,7 @@ fn expected_response(req: &AdminRequest) -> AdminResponse {
             members_online: 2,
             services: 1,
             gateway: Some("127.0.0.1:7777".into()),
+            ports: vec![(7801, "sync".into())],
         }),
         R::Members => AdminResponse::Members(vec![MemberInfoView {
             id: node(2),

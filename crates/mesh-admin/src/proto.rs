@@ -231,6 +231,8 @@ pub struct StatusInfo {
     pub services: u32,
     /// The gateway's listen address, when it runs.
     pub gateway: Option<String>,
+    /// The gateway's mapped ports that are listening, with the service each serves.
+    pub ports: Vec<(u16, String)>,
 }
 
 /// One row of `meshd members`.

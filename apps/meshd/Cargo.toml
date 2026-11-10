@@ -1,0 +1,41 @@
+[package]
+name = "meshd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mesh-admin = { path = "../../crates/mesh-admin" }
+mesh-core = { path = "../../crates/mesh-core" }
+mesh-gateway = { path = "../../crates/mesh-gateway" }
+mesh-proto = { path = "../../crates/mesh-proto" }
+mesh-services = { path = "../../crates/mesh-services" }
+async-trait.workspace = true
+bytes.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[features]
+# Test-only helpers: `Daemon::start_with` (fast node timings, loopback binding, quick
+# deployer rescans).
+test-hooks = ["mesh-core/test-hooks", "mesh-services/test-hooks"]
+
+[dev-dependencies]
+meshd = { path = ".", features = ["test-hooks"] }
+mesh-runtime = { path = "../../crates/mesh-runtime", features = ["test-hooks"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tempfile.workspace = true

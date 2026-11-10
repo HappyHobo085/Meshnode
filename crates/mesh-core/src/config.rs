@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::protocol::DynProtocolHandler;
 use mesh_hlc::{SystemClock, WallClock};
 
 /// Wrapper that lets a shared `dyn WallClock` be used as the store's clock type.
@@ -84,6 +85,8 @@ pub struct NodeConfig {
     pub bind_addr: Option<SocketAddr>,
     pub timings: Timings,
     pub wall: Arc<dyn WallClock>,
+    /// Further protocols (ALPN, handler), served behind the membership gate like `sync/1`.
+    pub extra_protocols: Vec<(Vec<u8>, Arc<dyn DynProtocolHandler>)>,
 }
 
 impl NodeConfig {
@@ -98,6 +101,7 @@ impl NodeConfig {
             bind_addr: None,
             timings: Timings::default(),
             wall: Arc::new(SystemClock),
+            extra_protocols: Vec::new(),
         }
     }
 }

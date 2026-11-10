@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::{Connection, VarInt, presets};
-use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use mesh_proto::{NodeAddrBytes, NodeId, ProtoError};
 use tokio::sync::watch;
@@ -100,6 +100,21 @@ impl Provisional {
         let mut st = self.lock();
         st.over = true;
         st.ids.clear();
+    }
+}
+
+/// Adapts a shared dyn handler (from `NodeConfig::extra_protocols`) so it can sit behind a
+/// [`Gate`].
+#[derive(Debug, Clone)]
+pub(crate) struct Extra(pub Arc<dyn DynProtocolHandler>);
+
+impl ProtocolHandler for Extra {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.0.accept(conn).await
+    }
+
+    async fn shutdown(&self) {
+        self.0.shutdown().await
     }
 }
 

@@ -438,3 +438,121 @@ async fn node_handle_cancelled_resolves_on_shutdown() {
     // Also after the fact, and for a clone.
     timeout(T, h.clone().cancelled()).await.unwrap();
 }
+
+// ---------------------------------------------------------------- extra protocols
+
+mod extra {
+    use std::sync::Arc;
+
+    use super::*;
+    use mesh_core::transport::NOT_MEMBER;
+    use mesh_core::{AcceptError, Connection, DynProtocolHandler, ProtocolHandler};
+
+    const ECHO: &[u8] = b"test/echo";
+
+    #[derive(Debug)]
+    struct Echo;
+
+    impl ProtocolHandler for Echo {
+        async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+            let (mut s, mut r) = conn.accept_bi().await.map_err(AcceptError::from_err)?;
+            let msg = r.read_to_end(1024).await.map_err(AcceptError::from_err)?;
+            s.write_all(&msg).await.map_err(AcceptError::from_err)?;
+            s.finish().map_err(AcceptError::from_err)?;
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    async fn echo_roundtrip(conn: &Connection, msg: &[u8]) -> Vec<u8> {
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        s.write_all(msg).await.unwrap();
+        s.finish().unwrap();
+        r.read_to_end(1024).await.unwrap()
+    }
+
+    /// `a` (founder, serves `test/echo`) and `b` (member with a hint for `a`), both online.
+    async fn echo_pair(da: &Path, db: &Path) -> (Node, Node) {
+        let mut ca = test_cfg(da, "a").0;
+        let handler: Arc<dyn DynProtocolHandler> = Arc::new(Echo);
+        ca.extra_protocols.push((ECHO.to_vec(), handler));
+        let a = Node::create_mesh(ca).await.unwrap();
+        let b_id = id_of_dir(db);
+        a.store()
+            .set_add(MESH_NS, MEMBERS, member_bytes(&b_id, Role::Host).to_vec())
+            .await
+            .unwrap();
+        let genesis = read_genesis(da).unwrap().unwrap();
+        let hints = vec![(a.node_id(), own_addr(&a).await)];
+        let b = Node::start_member_for_test(test_cfg(db, "b").0, genesis, hints)
+            .await
+            .unwrap();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        wait_until("a and b online", T, || async {
+            online(&a, bid) && online(&b, aid)
+        })
+        .await;
+        (a, b)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn node_handle_connect_reaches_member() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = echo_pair(da.path(), db.path()).await;
+        let conn = b.handle().connect(a.node_id(), ECHO).await.unwrap();
+        assert_eq!(echo_roundtrip(&conn, b"hello").await, b"hello");
+        timeout(T, a.shutdown()).await.unwrap();
+        timeout(T, b.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn extra_protocols_are_gated() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = echo_pair(da.path(), db.path()).await;
+        // A member is served.
+        let conn = b.handle().connect(a.node_id(), ECHO).await.unwrap();
+        assert_eq!(echo_roundtrip(&conn, b"ok").await, b"ok");
+
+        // A bare endpoint that is no member is closed with NOT_MEMBER.
+        let dx = tempfile::tempdir().unwrap();
+        let mut cx = mesh_core::NodeConfig::new(dx.path(), "x");
+        cx.relay = mesh_core::RelayChoice::Disabled;
+        cx.discovery = false;
+        cx.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[77; 32]);
+        let ep = mesh_core::transport::build_endpoint(&cx, &key)
+            .await
+            .unwrap();
+        let conn = ep.connect(a.endpoint_addr_for_test(), ECHO).await.unwrap();
+        let err = timeout(T, conn.closed()).await.unwrap();
+        match err {
+            iroh::endpoint::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(c.error_code, NOT_MEMBER)
+            }
+            other => panic!("unexpected close: {other:?}"),
+        }
+        ep.close().await;
+        timeout(T, a.shutdown()).await.unwrap();
+        timeout(T, b.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_to_non_member_refused() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = echo_pair(da.path(), db.path()).await;
+        let stranger = NodeId([5; 32]);
+        let r = a.handle().connect(stranger, ECHO).await;
+        assert!(matches!(r, Err(NodeError::NotEffective)), "{:?}", r.err());
+        // A removed member is refused too.
+        let bid = b.node_id();
+        a.remove(bid).await.unwrap();
+        wait_until("b no longer effective on a", T, || async {
+            a.members().iter().any(|m| m.id == bid && !m.effective)
+        })
+        .await;
+        let r = a.handle().connect(bid, ECHO).await;
+        assert!(matches!(r, Err(NodeError::NotEffective)), "{:?}", r.err());
+        timeout(T, a.shutdown()).await.unwrap();
+        timeout(T, b.shutdown()).await.unwrap();
+    }
+}

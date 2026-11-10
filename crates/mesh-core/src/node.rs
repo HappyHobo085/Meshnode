@@ -34,7 +34,7 @@ use crate::membership::{
 };
 use crate::peers::{PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
-use crate::transport::{ALPN_JOIN, ALPN_SYNC, Gate, addr_to_bytes, build_endpoint};
+use crate::transport::{ALPN_JOIN, ALPN_SYNC, Extra, Gate, addr_to_bytes, build_endpoint};
 
 const STORE_FILE: &str = "store.redb";
 const EVENT_CAPACITY: usize = 1024;
@@ -187,6 +187,21 @@ impl NodeHandle {
     /// The node's data directory.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.inner.cfg.data_dir
+    }
+
+    /// Dials an effective member on `alpn` with the node's endpoint and the addresses the
+    /// peer manager knows (published record, hints, discovery). The peer's gate decides
+    /// whether it serves the protocol.
+    pub async fn connect(
+        &self,
+        peer: NodeId,
+        alpn: &[u8],
+    ) -> Result<iroh::endpoint::Connection, NodeError> {
+        let snap = self.inner.membership.borrow().clone();
+        if !snap.is_effective(&peer) {
+            return Err(NodeError::NotEffective);
+        }
+        self.inner.peers.connect(peer, alpn).await
     }
 
     /// The node's wall clock, in ms since the Unix epoch.
@@ -439,7 +454,7 @@ pub(crate) async fn start(
         cfg.timings.blob_gc_tick,
     )
     .await?;
-    let router = Router::builder(endpoint.clone())
+    let mut router = Router::builder(endpoint.clone())
         .accept(
             ALPN_SYNC,
             Gate::new(SyncHandler(peers.clone()), membership_rx.clone())
@@ -450,8 +465,14 @@ pub(crate) async fn start(
             Gate::new(blobs.protocol(), membership_rx.clone()),
         )
         // Not gated: a joiner is not a member yet.
-        .accept(ALPN_JOIN, JoinHandler(join.clone()))
-        .spawn();
+        .accept(ALPN_JOIN, JoinHandler(join.clone()));
+    for (alpn, handler) in &cfg.extra_protocols {
+        router = router.accept(
+            alpn.clone(),
+            Gate::new(Extra(handler.clone()), membership_rx.clone()),
+        );
+    }
+    let router = router.spawn();
 
     if let Err(e) = publish_addr(&store, me, &endpoint.addr()).await {
         warn!(error = %e, "could not publish own address");

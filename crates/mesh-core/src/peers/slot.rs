@@ -16,7 +16,7 @@ use super::{BoxFut, DIAL_TIMEOUT, DUPLICATE_GRACE, PeerEnv, Shared, Slot, lock};
 use crate::events::NodeEvent;
 use crate::node::NodeStatus;
 use crate::sync::{SessionCtx, SessionEnd, run_session};
-use crate::transport::{ALPN_SYNC, PROTOCOL, REMOVED, SHUTDOWN, addr_from_bytes, endpoint_id_of};
+use crate::transport::{ALPN_SYNC, PROTOCOL, REMOVED, SHUTDOWN};
 
 /// A running session and the connection it runs on.
 struct Live {
@@ -185,16 +185,7 @@ impl SlotTask {
             let s = self.slot.lock();
             (s.addr.clone(), s.hint.clone())
         };
-        let id = endpoint_id_of(&self.slot.peer).ok()?;
-        let mut target = EndpointAddr::new(id);
-        for bytes in [addr, hint].into_iter().flatten() {
-            match addr_from_bytes(&bytes) {
-                Ok(a) if a.id == id => target.addrs.extend(a.addrs),
-                Ok(_) => warn!(peer = %self.slot.peer.short(), "address for another node ignored"),
-                Err(e) => debug!(peer = %self.slot.peer.short(), error = %e, "bad address ignored"),
-            }
-        }
-        (!target.addrs.is_empty() || self.env().discovery).then_some(target)
+        super::dial_target(self.slot.peer, [addr, hint], self.env().discovery)
     }
 
     fn start_dial(&mut self) {

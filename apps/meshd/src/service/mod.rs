@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ConfigError;
 
@@ -125,6 +125,9 @@ mod platform {
     pub fn install(_data: &Path) -> Result<(), ServiceError> {
         Err(ServiceError::Unsupported)
     }
+    pub fn installed() -> Result<super::Installed, ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     pub fn uninstall() -> Result<(), ServiceError> {
         Err(ServiceError::Unsupported)
     }
@@ -139,6 +142,16 @@ mod platform {
     }
 }
 
+/// The data directory `service install` uses when none is given (`--data` or
+/// `MESHD_DATA`). On Windows it comes from the known folder, not the environment.
+pub fn default_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Ok(dir) = windows::default_data_dir() {
+        return dir;
+    }
+    mesh_admin::default_data_dir()
+}
+
 /// Installs the service for the data directory `data` and starts it.
 pub fn install(data: &Path) -> Result<(), ServiceError> {
     require_privileges("install")?;
@@ -148,20 +161,97 @@ pub fn install(data: &Path) -> Result<(), ServiceError> {
     platform::install(&data)
 }
 
-/// Stops and removes the service; with `purge_data` also deletes the data directory
-/// `data`, which is otherwise kept.
-pub fn uninstall(data: &Path, purge_data: bool) -> Result<(), ServiceError> {
+/// What is installed, as read back from the service's registration (the systemd unit, the
+/// launchd plist, the SCM's command line).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Installed {
+    No,
+    /// Installed for this data directory.
+    DataDir(PathBuf),
+    /// Installed, but the registration names no data directory meshd can read.
+    UnknownDataDir,
+}
+
+impl Installed {
+    /// From a registration's text (`None`: no registration) and its parser.
+    pub fn from_registration(text: Option<&str>, parse: fn(&str) -> Option<PathBuf>) -> Self {
+        match text {
+            None => Installed::No,
+            Some(t) => parse(t).map_or(Installed::UnknownDataDir, Installed::DataDir),
+        }
+    }
+}
+
+/// The directory `uninstall --purge-data` deletes: the installed service's own data
+/// directory. Refuses when nothing is installed, when the registration names none, and
+/// when `requested` (an explicit `--data` / `MESHD_DATA`) is a different directory.
+pub fn purge_target(
+    installed: &Installed,
+    requested: Option<&Path>,
+) -> Result<PathBuf, ServiceError> {
+    let dir = match installed {
+        Installed::No => return Err(ServiceError::NotInstalled),
+        Installed::UnknownDataDir => {
+            return Err(ServiceError::Failed(
+                "cannot read the installed service's data directory; nothing was purged".into(),
+            ));
+        }
+        Installed::DataDir(dir) => dir,
+    };
+    if let Some(requested) = requested
+        && !same_dir(requested, dir)
+    {
+        return Err(ServiceError::Failed(format!(
+            "the installed service uses the data directory {}, not {}; nothing was changed",
+            dir.display(),
+            requested.display()
+        )));
+    }
+    Ok(dir.clone())
+}
+
+/// Whether two paths name the same directory: compared as absolute paths, ignoring case
+/// on Windows.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = p
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    norm(a) == norm(b)
+}
+
+/// Stops and removes the service. With `purge_data` also deletes the installed service's
+/// data directory (see [`purge_target`]) and returns it; otherwise the data is kept.
+/// Nothing installed is [`ServiceError::NotInstalled`], and nothing is removed.
+pub fn uninstall(
+    requested: Option<&Path>,
+    purge_data: bool,
+) -> Result<Option<PathBuf>, ServiceError> {
     require_privileges("uninstall")?;
+    let installed = platform::installed()?;
+    if installed == Installed::No {
+        return Err(ServiceError::NotInstalled);
+    }
+    let purge = if purge_data {
+        Some(purge_target(&installed, requested)?)
+    } else {
+        None
+    };
     platform::uninstall()?;
-    if purge_data {
-        match std::fs::remove_dir_all(data) {
+    if let Some(dir) = &purge {
+        // Does not follow a link at `dir`; removes the link itself.
+        match std::fs::remove_dir_all(dir) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(io_err(format!("removing {}", data.display()))(e));
+                return Err(io_err(format!("removing {}", dir.display()))(e));
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(purge)
 }
 
 /// Starts the installed service.
@@ -246,6 +336,15 @@ mod unix {
             .map_err(io_err(format!("setting the mode of {}", path.display())))
     }
 
+    /// Reads a registration file; `None` when it does not exist.
+    pub fn read_registration(path: &Path) -> Result<Option<String>, ServiceError> {
+        match std::fs::read_to_string(path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(format!("reading {}", path.display()))(e)),
+        }
+    }
+
     /// Removes a file; a missing one is fine.
     pub fn remove_file(path: &Path) -> Result<(), ServiceError> {
         match std::fs::remove_file(path) {
@@ -254,5 +353,76 @@ mod unix {
             }
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_fixed(_: &str) -> Option<PathBuf> {
+        Some(PathBuf::from("/var/lib/meshnode"))
+    }
+
+    fn parse_none(_: &str) -> Option<PathBuf> {
+        None
+    }
+
+    #[test]
+    fn registration_is_read_back() {
+        assert_eq!(
+            Installed::from_registration(None, parse_fixed),
+            Installed::No
+        );
+        assert_eq!(
+            Installed::from_registration(Some("x"), parse_fixed),
+            Installed::DataDir("/var/lib/meshnode".into())
+        );
+        assert_eq!(
+            Installed::from_registration(Some("x"), parse_none),
+            Installed::UnknownDataDir
+        );
+    }
+
+    #[test]
+    fn purge_targets_only_the_installed_data_dir() {
+        let base = std::env::temp_dir();
+        let installed_dir = base.join("meshnode-installed");
+        let installed = Installed::DataDir(installed_dir.clone());
+        // No --data: the installed directory.
+        assert_eq!(purge_target(&installed, None).unwrap(), installed_dir);
+        // The same directory given explicitly (another spelling of it).
+        let spelled = PathBuf::from(format!(
+            "{}{}",
+            installed_dir.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            purge_target(&installed, Some(&spelled)).unwrap(),
+            installed_dir
+        );
+        // A different directory: refused.
+        let other = base.join("somewhere-else");
+        let err = purge_target(&installed, Some(&other)).unwrap_err();
+        assert!(matches!(err, ServiceError::Failed(_)), "{err:?}");
+        assert!(err.to_string().contains("nothing was changed"), "{err}");
+        // Nothing installed, or an unreadable registration: refused.
+        assert!(matches!(
+            purge_target(&Installed::No, None),
+            Err(ServiceError::NotInstalled)
+        ));
+        assert!(matches!(
+            purge_target(&Installed::UnknownDataDir, None),
+            Err(ServiceError::Failed(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn data_dirs_compare_without_case_on_windows() {
+        assert!(same_dir(
+            Path::new(r"C:\ProgramData\Meshnode"),
+            Path::new(r"c:\programdata\meshnode\")
+        ));
     }
 }

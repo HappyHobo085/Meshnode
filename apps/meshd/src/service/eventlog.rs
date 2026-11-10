@@ -35,6 +35,8 @@ pub enum Event {
     Started,
     Stopped,
     StartFailed,
+    /// The running service ended on an internal error (a panic).
+    Crashed,
 }
 
 impl Event {
@@ -44,13 +46,14 @@ impl Event {
             Event::Started => 1,
             Event::Stopped => 2,
             Event::StartFailed => 3,
+            Event::Crashed => 4,
         }
     }
 
     fn kind(self) -> REPORT_EVENT_TYPE {
         match self {
             Event::Started | Event::Stopped => EVENTLOG_INFORMATION_TYPE,
-            Event::StartFailed => EVENTLOG_ERROR_TYPE,
+            Event::StartFailed | Event::Crashed => EVENTLOG_ERROR_TYPE,
         }
     }
 }
@@ -181,7 +184,12 @@ mod tests {
 
     #[test]
     fn event_ids_fit_the_message_file() {
-        for e in [Event::Started, Event::Stopped, Event::StartFailed] {
+        for e in [
+            Event::Started,
+            Event::Stopped,
+            Event::StartFailed,
+            Event::Crashed,
+        ] {
             assert!((1..=1000).contains(&e.id()), "{e:?}");
         }
         assert_eq!(Event::StartFailed.kind(), EVENTLOG_ERROR_TYPE);

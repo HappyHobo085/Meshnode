@@ -6,6 +6,9 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::fs::MetadataExt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -24,27 +27,35 @@ use windows_sys::Win32::Foundation::{
     ERROR_SUCCESS, HANDLE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ProgressInvokeNever, SDDL_REVISION_1, SE_FILE_OBJECT, TREE_SEC_INFO_RESET,
+    TreeSetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION, TOKEN_QUERY,
-    TOKEN_USER, TokenElevation, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+    TokenUser,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+};
+use windows_sys::core::GUID;
 
 use super::eventlog::{self, Event, EventLog};
-use super::{SERVICE_NAME, ServiceError, ServiceStatus, io_err};
+use super::{Installed, SERVICE_NAME, ServiceError, ServiceStatus, io_err};
 use crate::{Daemon, MeshdConfig, logging};
 
 /// The service's display name.
 pub const DISPLAY_NAME: &str = "Meshnode";
 /// The account the service runs as.
 pub const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
-/// The data directory's DACL: full control for LocalService and Administrators only, not
-/// inherited from `%ProgramData%`.
-pub const DATA_DIR_SDDL: &str = "D:P(A;OICI;FA;;;LS)(A;OICI;FA;;;BA)";
+/// The data directory's owner (Administrators) and DACL: full control for LocalService and
+/// Administrators only, not inherited from `%ProgramData%`.
+pub const DATA_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;LS)(A;OICI;FA;;;BA)";
 /// Restarts after a failure, and the delay before each.
 pub const RESTARTS: usize = 3;
 pub const RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -52,7 +63,9 @@ pub const RESTART_DELAY: Duration = Duration::from_secs(5);
 const FAILURE_RESET: Duration = Duration::from_secs(24 * 3600);
 /// How long the SCM should wait for a start (opening the node) and for a stop (the
 /// daemon's shutdown takes at most 20 s).
-const START_WAIT_HINT: Duration = Duration::from_secs(60);
+const START_WAIT_HINT: Duration = Duration::from_secs(15);
+/// While the daemon starts, the start checkpoint advances this often.
+const START_CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
 pub const STOP_WAIT_HINT: Duration = Duration::from_secs(25);
 /// How long `stop` and `uninstall` wait for the service to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,12 +73,94 @@ const POLL: Duration = Duration::from_millis(250);
 
 // --- configuration (pure) ----------------------------------------------------------------
 
-/// `%ProgramFiles%\Meshnode`, where the binary is installed.
-pub fn install_dir() -> PathBuf {
-    let program_files = std::env::var_os("ProgramFiles")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| r"C:\Program Files".into());
-    PathBuf::from(program_files).join("Meshnode")
+/// `<Program Files>\Meshnode`, where the binary is installed (from the known folder, not
+/// the environment).
+pub fn install_dir() -> io::Result<PathBuf> {
+    Ok(known_folder(&FOLDERID_ProgramFiles)?.join("Meshnode"))
+}
+
+/// `<ProgramData>\meshnode`, the default data directory (from the known folder).
+pub fn default_data_dir() -> io::Result<PathBuf> {
+    Ok(known_folder(&FOLDERID_ProgramData)?.join("meshnode"))
+}
+
+fn known_folder(id: &GUID) -> io::Result<PathBuf> {
+    let mut path: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `id` is a valid GUID; a null token is the current user; `path` is a valid
+    // out pointer.
+    let hr = unsafe {
+        SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut path)
+    };
+    let result = if hr < 0 {
+        Err(io::Error::from_raw_os_error(hr))
+    } else {
+        let mut len = 0;
+        // SAFETY: on success `path` is a NUL-terminated string.
+        while unsafe { *path.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` u16s were just read.
+        let wide = unsafe { std::slice::from_raw_parts(path, len) };
+        Ok(PathBuf::from(OsString::from_wide(wide)))
+    };
+    // SAFETY: allocated with CoTaskMemAlloc; freed once, whether or not the call succeeded.
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
+}
+
+/// The data directory in the service's command line (`… --data <dir>`, quoted as the SCM
+/// stores it); `None` when there is none.
+pub fn data_dir_from_command_line(command_line: &str) -> Option<PathBuf> {
+    let args = split_command_line(command_line);
+    let i = args.iter().position(|a| a == "--data")?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+/// Splits a command line by the Microsoft C runtime's rules: whitespace separates
+/// arguments outside double quotes; `2n` backslashes before a quote are `n` backslashes
+/// and the quote toggles quoting, `2n + 1` are `n` backslashes and a literal quote;
+/// other backslashes are literal.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut arg = String::new();
+        let mut quoted = false;
+        while let Some(&c) = chars.peek() {
+            match c {
+                '\\' => {
+                    let mut n = 0;
+                    while chars.next_if_eq(&'\\').is_some() {
+                        n += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        arg.extend(std::iter::repeat_n('\\', n / 2));
+                        if n % 2 == 1 {
+                            arg.push('"');
+                            chars.next();
+                        }
+                    } else {
+                        arg.extend(std::iter::repeat_n('\\', n));
+                    }
+                }
+                '"' => {
+                    chars.next();
+                    quoted = !quoted;
+                }
+                c if c.is_whitespace() && !quoted => break,
+                c => {
+                    arg.push(c);
+                    chars.next();
+                }
+            }
+        }
+        args.push(arg);
+    }
+    args
 }
 
 /// The service's registration for the installed binary `exe` and the data directory
@@ -168,9 +263,21 @@ pub fn install(data: &Path) -> Result<(), ServiceError> {
     let service = scm
         .create_service(
             &service_info(&exe, data),
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+            ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::START
+                | ServiceAccess::QUERY_STATUS
+                | ServiceAccess::DELETE,
         )
         .map_err(scm_err("creating the meshnode service"))?;
+    let configured = configure_and_start(&service);
+    if configured.is_err() {
+        // Best-effort: leave no half-configured service behind.
+        let _ = service.delete();
+    }
+    configured
+}
+
+fn configure_and_start(service: &Service) -> Result<(), ServiceError> {
     service
         .set_description("Meshnode mesh daemon: the node, its services and the localhost gateway")
         .map_err(scm_err("describing the meshnode service"))?;
@@ -189,10 +296,14 @@ pub fn install(data: &Path) -> Result<(), ServiceError> {
         .map_err(scm_err("starting the meshnode service"))
 }
 
-/// Copies the running executable to `%ProgramFiles%\Meshnode\meshd.exe`, unless it is that
-/// file, and returns the installed path.
+fn program_files_dir() -> Result<PathBuf, ServiceError> {
+    install_dir().map_err(io_err("finding the Program Files folder"))
+}
+
+/// Copies the running executable to `<Program Files>\Meshnode\meshd.exe`, unless it is
+/// that file, and returns the installed path.
 fn install_binary() -> Result<PathBuf, ServiceError> {
-    let dir = install_dir();
+    let dir = program_files_dir()?;
     let target = dir.join("meshd.exe");
     let source = std::env::current_exe().map_err(io_err("finding the meshd executable"))?;
     if same_file(&source, &target) {
@@ -211,18 +322,51 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
-/// Creates the data directory if needed and replaces its DACL with [`DATA_DIR_SDDL`]
-/// (protected, so `%ProgramData%`'s inherited entries are dropped; the entries are
-/// inherited by everything inside).
+/// Prepares the data directory with [`DATA_DIR_SDDL`].
 fn protect_data_dir(data: &Path) -> Result<(), ServiceError> {
+    prepare_data_dir(data, DATA_DIR_SDDL)
+}
+
+/// Creates the data directory if needed and secures it before anything is written there:
+/// - a junction or symbolic link at its path is refused (it could point the service, and
+///   the DACL change, at another directory);
+/// - its owner and protected DACL are set from `sddl`, so `%ProgramData%`'s inherited
+///   entries are dropped;
+/// - everything already inside is reset to the owner and to only the directory's
+///   inherited entries (`TreeSetNamedSecurityInfoW` with `TREE_SEC_INFO_RESET`), so explicit
+///   entries placed there beforehand are removed.
+fn prepare_data_dir(data: &Path, sddl: &str) -> Result<(), ServiceError> {
+    refuse_link(data)?;
     std::fs::create_dir_all(data).map_err(io_err(format!("creating {}", data.display())))?;
-    set_protected_dacl(data, DATA_DIR_SDDL).map_err(io_err(format!(
+    refuse_link(data)?;
+    set_tree_security(data, sddl).map_err(io_err(format!(
         "setting the permissions of {}",
         data.display()
     )))
 }
 
-fn set_protected_dacl(path: &Path, sddl: &str) -> io::Result<()> {
+/// Refuses a reparse point (junction, symbolic link) or a non-directory at `path`; a
+/// missing path is fine.
+fn refuse_link(path: &Path) -> Result<(), ServiceError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+            Err(ServiceError::Failed(format!(
+                "{} is a junction or symbolic link; refusing to use it as the data directory",
+                path.display()
+            )))
+        }
+        Ok(m) if !m.is_dir() => Err(ServiceError::Failed(format!(
+            "{} is not a directory",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(format!("inspecting {}", path.display()))(e)),
+    }
+}
+
+/// Sets the owner and the protected DACL of `sddl` on `path` and resets everything inside.
+fn set_tree_security(path: &Path, sddl: &str) -> io::Result<()> {
     let sddl = wide(sddl);
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; `sd` is a valid out pointer; the size is optional.
@@ -242,19 +386,34 @@ fn set_protected_dacl(path: &Path, sddl: &str) -> io::Result<()> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     // SAFETY: `sd` is the descriptor just created; the out pointers are valid.
     let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) };
-    let result = if ok == 0 {
+    let mut owner: PSID = std::ptr::null_mut();
+    // SAFETY: as above.
+    let ok = ok != 0 && unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) } != 0;
+    let result = if !ok {
         Err(io::Error::last_os_error())
+    } else if owner.is_null() || dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the security descriptor needs an owner and a DACL",
+        ))
     } else {
         let name = wide(&path.as_os_str().to_string_lossy());
-        // SAFETY: `name` is NUL-terminated; `dacl` points into `sd`, alive until freed below.
+        // SAFETY: `name` is NUL-terminated; `owner` and `dacl` point into `sd`, alive until
+        // freed below; no progress callback.
         let code = unsafe {
-            SetNamedSecurityInfoW(
+            TreeSetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
                 std::ptr::null_mut(),
                 dacl,
+                std::ptr::null(),
+                TREE_SEC_INFO_RESET,
+                None,
+                ProgressInvokeNever,
                 std::ptr::null(),
             )
         };
@@ -269,15 +428,34 @@ fn set_protected_dacl(path: &Path, sddl: &str) -> io::Result<()> {
     result
 }
 
+/// What is installed, read back from the SCM's command line for the service.
+pub fn installed() -> Result<Installed, ServiceError> {
+    let scm = manager(ServiceManagerAccess::CONNECT)?;
+    let command_line = match open(&scm, ServiceAccess::QUERY_CONFIG)? {
+        None => None,
+        Some(service) => Some(
+            service
+                .query_config()
+                .map_err(scm_err("reading the meshnode service's configuration"))?
+                .executable_path
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    Ok(Installed::from_registration(
+        command_line.as_deref(),
+        data_dir_from_command_line,
+    ))
+}
+
 pub fn uninstall() -> Result<(), ServiceError> {
     let scm = manager(ServiceManagerAccess::CONNECT)?;
     let access = ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE;
-    if let Some(service) = open(&scm, access)? {
-        stop_and_wait(&service)?;
-        service
-            .delete()
-            .map_err(scm_err("deleting the meshnode service"))?;
-    }
+    let service = open(&scm, access)?.ok_or(ServiceError::NotInstalled)?;
+    stop_and_wait(&service)?;
+    service
+        .delete()
+        .map_err(scm_err("deleting the meshnode service"))?;
     eventlog::unregister().map_err(io_err("removing the Meshnode Event Log source"))?;
     remove_binary()
 }
@@ -285,7 +463,7 @@ pub fn uninstall() -> Result<(), ServiceError> {
 /// Removes the installed binary and its directory — unless this process runs from it
 /// (Windows cannot delete a running executable); it is then left in place.
 fn remove_binary() -> Result<(), ServiceError> {
-    let dir = install_dir();
+    let dir = program_files_dir()?;
     let target = dir.join("meshd.exe");
     let running = std::env::current_exe().is_ok_and(|exe| same_file(&exe, &target));
     if running || !target.exists() {
@@ -387,10 +565,12 @@ pub fn control_reply(control: &ServiceControl) -> ControlReply {
 }
 
 /// The status reported to the SCM in `state`: while running it accepts stop and system
-/// shutdown; pending states carry a wait hint.
+/// shutdown; pending states carry a wait hint and `checkpoint` (at least 1; it must grow
+/// while a long start goes on). Other states report checkpoint 0.
 pub fn reported_status(
     state: ServiceState,
     exit_code: ServiceExitCode,
+    checkpoint: u32,
 ) -> windows_service::service::ServiceStatus {
     let (controls_accepted, wait_hint) = match state {
         ServiceState::Running => (
@@ -406,7 +586,11 @@ pub fn reported_status(
         current_state: state,
         controls_accepted,
         exit_code,
-        checkpoint: u32::from(!wait_hint.is_zero()),
+        checkpoint: if wait_hint.is_zero() {
+            0
+        } else {
+            checkpoint.max(1)
+        },
         wait_hint,
         process_id: None,
     }
@@ -479,49 +663,94 @@ fn service_main(_arguments: Vec<OsString>) {
             return;
         }
     };
-    let set = |state, exit| {
-        let _ = status.set_service_status(reported_status(state, exit));
+    let set_pending = |state, checkpoint| {
+        let _ = status.set_service_status(reported_status(
+            state,
+            ServiceExitCode::NO_ERROR,
+            checkpoint,
+        ));
     };
-    set(ServiceState::StartPending, ServiceExitCode::NO_ERROR);
+    let set = |state, exit| {
+        let _ = status.set_service_status(reported_status(state, exit, 0));
+    };
+    set_pending(ServiceState::StartPending, 1);
 
-    let result = ctx.runtime.block_on(async {
-        let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| e.to_string())?;
-        let _log = logging::init(&ctx.data, &cfg.log_level);
-        let daemon = match Daemon::start(ctx.data.clone(), cfg).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("meshd failed to start: {e}");
-                return Err(e.to_string());
-            }
-        };
-        set(ServiceState::Running, ServiceExitCode::NO_ERROR);
-        info!("running as the {SERVICE_NAME} Windows service");
-        report(
-            Event::Started,
-            &format!("Meshnode started (data directory {}).", ctx.data.display()),
-        );
-        daemon
-            .run_until(async {
-                // A dropped sender (no handler any more) also stops the daemon.
-                let _ = stop_rx.await;
-                set(ServiceState::StopPending, ServiceExitCode::NO_ERROR);
-            })
-            .await;
-        Ok::<(), String>(())
-    });
+    // A panic in the daemon's own code ends the service as a failure (the SCM restarts it).
+    let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        ctx.runtime.block_on(async {
+            let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| e.to_string())?;
+            let _log = logging::init(&ctx.data, &cfg.log_level);
+            // Opening the node can take a while: show the SCM progress meanwhile.
+            let start = Daemon::start(ctx.data.clone(), cfg);
+            tokio::pin!(start);
+            let mut ticks = tokio::time::interval(START_CHECKPOINT_EVERY);
+            ticks.tick().await;
+            let mut checkpoint = 1;
+            let started = loop {
+                tokio::select! {
+                    r = &mut start => break r,
+                    _ = ticks.tick() => {
+                        checkpoint += 1;
+                        set_pending(ServiceState::StartPending, checkpoint);
+                    }
+                }
+            };
+            let daemon = match started {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("meshd failed to start: {e}");
+                    return Err(e.to_string());
+                }
+            };
+            set(ServiceState::Running, ServiceExitCode::NO_ERROR);
+            info!("running as the {SERVICE_NAME} Windows service");
+            report(
+                Event::Started,
+                &format!("Meshnode started (data directory {}).", ctx.data.display()),
+            );
+            daemon
+                .run_until(async {
+                    // A dropped sender (no handler any more) also stops the daemon.
+                    let _ = stop_rx.await;
+                    set_pending(ServiceState::StopPending, 1);
+                })
+                .await;
+            Ok::<(), String>(())
+        })
+    }));
 
-    match result {
-        Ok(()) => {
+    match run {
+        Err(panic) => {
+            let message = format!(
+                "Meshnode stopped after an internal error: {}",
+                panic_message(panic.as_ref())
+            );
+            error!("{message}");
+            report(Event::Crashed, &message);
+            set(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(2));
+        }
+        Ok(Ok(())) => {
             report(Event::Stopped, "Meshnode stopped.");
             set(ServiceState::Stopped, ServiceExitCode::NO_ERROR);
         }
-        Err(message) => {
+        Ok(Err(message)) => {
             report(
                 Event::StartFailed,
                 &format!("Meshnode failed to start: {message}"),
             );
             set(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
         }
+    }
+}
+
+/// The text of a panic's payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".into()
     }
 }
 
@@ -647,8 +876,51 @@ mod tests {
     }
 
     #[test]
-    fn install_dir_is_under_program_files() {
-        assert!(install_dir().ends_with("Meshnode"));
+    fn folders_come_from_the_known_folders() {
+        let install = install_dir().unwrap();
+        assert!(
+            install.is_absolute() && install.ends_with("Meshnode"),
+            "{install:?}"
+        );
+        let data = default_data_dir().unwrap();
+        assert!(data.is_absolute() && data.ends_with("meshnode"), "{data:?}");
+    }
+
+    #[test]
+    fn data_dir_is_read_back_from_the_command_line() {
+        let cases = [
+            (
+                r#""C:\Program Files\Meshnode\meshd.exe" run --service --data C:\ProgramData\meshnode"#,
+                Some(r"C:\ProgramData\meshnode"),
+            ),
+            (
+                r#""C:\Program Files\Meshnode\meshd.exe" run --service --data "D:\mesh data\node""#,
+                Some(r"D:\mesh data\node"),
+            ),
+            // A trailing backslash inside quotes is doubled by the escaping.
+            (
+                r#"meshd.exe run --service --data "D:\with space\\""#,
+                Some(r"D:\with space\"),
+            ),
+            (r#"meshd.exe run --data "a\"b""#, Some(r#"a"b"#)),
+            (r#""C:\x\meshd.exe" run --service"#, None),
+            (r#"meshd.exe run --data"#, None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(
+                data_dir_from_command_line(line),
+                want.map(PathBuf::from),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn panic_messages() {
+        let caught = std::panic::catch_unwind(|| panic!("boom {}", 1)).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "boom 1");
+        let caught = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "unknown panic");
     }
 
     #[test]
@@ -671,18 +943,26 @@ mod tests {
 
     #[test]
     fn reported_statuses() {
-        let running = reported_status(ServiceState::Running, ServiceExitCode::NO_ERROR);
+        let running = reported_status(ServiceState::Running, ServiceExitCode::NO_ERROR, 7);
         assert_eq!(
             running.controls_accepted,
             ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
         );
         assert_eq!((running.checkpoint, running.wait_hint), (0, Duration::ZERO));
-        let stopping = reported_status(ServiceState::StopPending, ServiceExitCode::NO_ERROR);
+        let stopping = reported_status(ServiceState::StopPending, ServiceExitCode::NO_ERROR, 0);
         assert!(stopping.controls_accepted.is_empty());
         // The daemon's shutdown takes at most 20 s.
         assert!(stopping.wait_hint > Duration::from_secs(20));
         assert_eq!(stopping.checkpoint, 1);
-        let failed = reported_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+        // A long start advances its checkpoint, each step within the wait hint.
+        let starting = reported_status(ServiceState::StartPending, ServiceExitCode::NO_ERROR, 3);
+        assert_eq!(starting.checkpoint, 3);
+        assert!(starting.wait_hint > START_CHECKPOINT_EVERY);
+        let failed = reported_status(
+            ServiceState::Stopped,
+            ServiceExitCode::ServiceSpecific(1),
+            0,
+        );
         assert_eq!(failed.exit_code, ServiceExitCode::ServiceSpecific(1));
         assert!(failed.controls_accepted.is_empty());
     }
@@ -711,27 +991,128 @@ mod tests {
             .unwrap();
     }
 
+    /// [`DATA_DIR_SDDL`]'s entries plus this test's own user (as owner too, which a
+    /// non-elevated process may set), so the test can work in and clean up its temp dir.
+    fn test_sddl() -> (String, String) {
+        let me = current_user_sid().unwrap();
+        let dacl = DATA_DIR_SDDL.strip_prefix("O:BA").unwrap();
+        (format!("O:{me}{dacl}(A;OICI;FA;;;{me})"), me)
+    }
+
     #[test]
-    fn protected_dacl_is_applied_to_a_directory() {
-        // A temporary directory only: grants this test's own user too, so it can clean up.
+    fn data_dir_sddl_sets_owner_and_protected_dacl() {
+        assert!(DATA_DIR_SDDL.starts_with("O:BAD:P"));
+    }
+
+    #[test]
+    fn protected_dacl_is_applied_to_a_new_directory() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("data");
-        std::fs::create_dir(&sub).unwrap();
-        let me = current_user_sid().unwrap();
-        set_protected_dacl(&sub, &format!("{DATA_DIR_SDDL}(A;OICI;FA;;;{me})")).unwrap();
-        let sddl = dacl_sddl(&sub);
-        assert!(sddl.starts_with("D:P"), "{sddl}");
+        let (sddl, me) = test_sddl();
+        prepare_data_dir(&sub, &sddl).unwrap();
+        let got = security_sddl(&sub);
+        assert!(got.starts_with(&format!("O:{me}D:P")), "{got}");
         for ace in ["(A;OICI;FA;;;LS)", "(A;OICI;FA;;;BA)"] {
-            assert!(sddl.contains(ace), "{sddl}");
+            assert!(got.contains(ace), "{got}");
         }
         // Nothing inherited from the parent.
-        assert!(!sddl.contains("ID;"), "{sddl}");
+        assert!(!got.contains("ID;"), "{got}");
         std::fs::write(sub.join("f"), b"x").unwrap();
         assert_eq!(std::fs::read(sub.join("f")).unwrap(), b"x");
     }
 
-    /// A file's DACL as SDDL.
-    fn dacl_sddl(path: &Path) -> String {
+    #[test]
+    fn existing_children_are_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("data");
+        std::fs::create_dir(&sub).unwrap();
+        let child = sub.join("planted");
+        std::fs::write(&child, b"x").unwrap();
+        let (sddl, me) = test_sddl();
+        // An explicit, protected grant to Everyone, as an attacker could have placed it.
+        set_file_dacl(&child, &format!("D:P(A;;FA;;;WD)(A;;FA;;;{me})"));
+        assert!(security_sddl(&child).contains("(A;;FA;;;WD)"));
+
+        prepare_data_dir(&sub, &sddl).unwrap();
+        let got = security_sddl(&child);
+        assert!(got.starts_with(&format!("O:{me}")), "{got}");
+        assert!(!got.contains(";;;WD)"), "{got}");
+        assert!(!got.contains("D:P"), "the child inherits again: {got}");
+        for ace in ["(A;ID;FA;;;LS)", "(A;ID;FA;;;BA)"] {
+            assert!(got.contains(ace), "{got}");
+        }
+    }
+
+    #[test]
+    fn a_junction_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        // `mklink /J` needs no privilege; skip if the shell cannot make one here.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("skipped: could not create a junction");
+            return;
+        }
+        let before = security_sddl(&target);
+        let (sddl, _) = test_sddl();
+        let err = prepare_data_dir(&link, &sddl).unwrap_err();
+        assert!(
+            err.to_string().contains("junction or symbolic link"),
+            "{err}"
+        );
+        assert_eq!(security_sddl(&target), before, "the target was not touched");
+        // A file is refused too.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(prepare_data_dir(&file, &sddl).is_err());
+    }
+
+    /// Replaces a file's DACL (protected) without touching anything else.
+    fn set_file_dacl(path: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+        let w = wide(sddl);
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: as in `set_tree_security`.
+        unsafe {
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    w.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            let (mut present, mut defaulted) = (0, 0);
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            assert_ne!(
+                GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            let name = wide(&path.to_string_lossy());
+            let code = SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            );
+            LocalFree(sd);
+            assert_eq!(code, ERROR_SUCCESS);
+        }
+    }
+
+    /// A file's owner and DACL as SDDL.
+    fn security_sddl(path: &Path) -> String {
         use windows_sys::Win32::Security::Authorization::{
             ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
         };
@@ -742,7 +1123,7 @@ mod tests {
             GetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -757,7 +1138,7 @@ mod tests {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 sd,
                 SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut text,
                 std::ptr::null_mut(),
             )

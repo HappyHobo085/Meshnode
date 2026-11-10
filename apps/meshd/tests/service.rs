@@ -70,7 +70,10 @@ fn install_without_privileges_refused() {
     };
     let checks: [(&str, Result<(), ServiceError>); 4] = [
         ("install", service::install(data.path())),
-        ("uninstall", service::uninstall(data.path(), false)),
+        (
+            "uninstall",
+            service::uninstall(Some(data.path()), false).map(drop),
+        ),
         ("start", service::start()),
         ("stop", service::stop()),
     ];

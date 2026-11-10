@@ -63,6 +63,12 @@ fn error_answer(code: mesh_admin::ErrorCode, message: String) -> CliError {
 }
 
 pub async fn run(cli: Cli) -> Result<(), CliError> {
+    // An explicitly chosen data directory (`--data`, else `MESHD_DATA`), if any.
+    let requested = cli.data.clone().or_else(|| {
+        std::env::var_os(meshd::paths::DATA_ENV)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+    });
     let data = cli.data.unwrap_or_else(meshd::paths::default_data_dir);
     match cli.command {
         Command::Run { service } => crate::run_daemon(&data, service).await,
@@ -168,19 +174,22 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Logs { lines, follow } => logs(&data, lines, follow).await,
-        Command::Service(cmd) => tokio::task::spawn_blocking(move || service(&data, cmd))
+        Command::Service(cmd) => tokio::task::spawn_blocking(move || service(requested, cmd))
             .await
             .map_err(|e| CliError::failed(e.to_string()))?,
     }
 }
 
 /// `meshd service …` (spec §6.4): no daemon involved; may wait for the service manager.
-fn service(data: &Path, cmd: ServiceCmd) -> Result<(), CliError> {
+/// `requested` is an explicitly chosen data directory: install uses it (else the OS
+/// default), uninstall checks it against the installed one.
+fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> {
     use meshd::service;
     let failed = |e: service::ServiceError| CliError::failed(e.to_string());
     match cmd {
         ServiceCmd::Install => {
-            service::install(data).map_err(failed)?;
+            let data = requested.unwrap_or_else(service::default_data_dir);
+            service::install(&data).map_err(failed)?;
             say!(
                 "Installed and started the meshnode service (data directory {}).",
                 data.display()
@@ -191,17 +200,12 @@ fn service(data: &Path, cmd: ServiceCmd) -> Result<(), CliError> {
             }
         }
         ServiceCmd::Uninstall { purge_data } => {
-            service::uninstall(data, purge_data).map_err(failed)?;
-            if purge_data {
-                say!(
+            match service::uninstall(requested.as_deref(), purge_data).map_err(failed)? {
+                Some(purged) => say!(
                     "Removed the meshnode service and deleted {}.",
-                    data.display()
-                );
-            } else {
-                say!(
-                    "Removed the meshnode service; the data directory {} was kept.",
-                    data.display()
-                );
+                    purged.display()
+                ),
+                None => say!("Removed the meshnode service; its data directory was kept."),
             }
         }
         ServiceCmd::Start => {

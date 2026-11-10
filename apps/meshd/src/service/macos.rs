@@ -3,7 +3,7 @@
 //!
 //! [`plist`] is pure and compiled everywhere; the installer is macOS-only.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The launchd label.
 pub const LABEL: &str = "net.meshnode.meshd";
@@ -55,23 +55,57 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// The data directory in a plist's `ProgramArguments` (`… --data <dir>`), as [`plist`]
+/// wrote it; `None` when there is none.
+pub fn data_dir_from_plist(text: &str) -> Option<PathBuf> {
+    let after_key = &text[text.find("<key>ProgramArguments</key>")?..];
+    let array = &after_key[after_key.find("<array>")?..];
+    let array = &array[..array.find("</array>")?];
+    let mut args = Vec::new();
+    let mut rest = array;
+    while let Some(start) = rest.find("<string>") {
+        let value = &rest[start + "<string>".len()..];
+        let end = value.find("</string>")?;
+        args.push(xml_unescape(&value[..end]));
+        rest = &value[end..];
+    }
+    let i = args.iter().position(|a| a == "--data")?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 #[cfg(target_os = "macos")]
-pub(super) use installer::{install, start, status, stop, uninstall};
+pub(super) use installer::{install, installed, start, status, stop, uninstall};
 
 #[cfg(target_os = "macos")]
 mod installer {
     use std::path::Path;
 
     use super::super::unix::{
-        INSTALLED_BINARY, install_binary, output, remove_file, run, write_file,
+        INSTALLED_BINARY, install_binary, output, read_registration, remove_file, run, write_file,
     };
-    use super::super::{ServiceError, ServiceStatus, io_err};
-    use super::{LABEL, plist};
+    use super::super::{Installed, ServiceError, ServiceStatus, io_err};
+    use super::{LABEL, data_dir_from_plist, plist};
 
     const PLIST_PATH: &str = "/Library/LaunchDaemons/net.meshnode.meshd.plist";
 
-    fn installed() -> bool {
+    fn is_installed() -> bool {
         Path::new(PLIST_PATH).exists()
+    }
+
+    pub fn installed() -> Result<Installed, ServiceError> {
+        let plist = read_registration(Path::new(PLIST_PATH))?;
+        Ok(Installed::from_registration(
+            plist.as_deref(),
+            data_dir_from_plist,
+        ))
     }
 
     fn target() -> String {
@@ -84,7 +118,7 @@ mod installer {
     }
 
     pub fn install(data: &Path) -> Result<(), ServiceError> {
-        if installed() {
+        if is_installed() {
             return Err(ServiceError::AlreadyInstalled);
         }
         install_binary()?;
@@ -97,6 +131,9 @@ mod installer {
     }
 
     pub fn uninstall() -> Result<(), ServiceError> {
+        if !is_installed() {
+            return Err(ServiceError::NotInstalled);
+        }
         if loaded()? {
             run("launchctl", &["bootout", &target()])?;
         }
@@ -106,7 +143,7 @@ mod installer {
 
     /// Loading the daemon starts it (`RunAtLoad`).
     pub fn start() -> Result<(), ServiceError> {
-        if !installed() {
+        if !is_installed() {
             return Err(ServiceError::NotInstalled);
         }
         if loaded()? {
@@ -118,7 +155,7 @@ mod installer {
 
     /// `KeepAlive` restarts a killed daemon, so stopping unloads it.
     pub fn stop() -> Result<(), ServiceError> {
-        if !installed() {
+        if !is_installed() {
             return Err(ServiceError::NotInstalled);
         }
         if loaded()? {
@@ -128,7 +165,7 @@ mod installer {
     }
 
     pub fn status() -> Result<ServiceStatus, ServiceError> {
-        if !installed() {
+        if !is_installed() {
             return Ok(ServiceStatus::NotInstalled);
         }
         let out = output("launchctl", &["print", &target()])?;
@@ -141,5 +178,29 @@ mod installer {
         } else {
             ServiceStatus::Stopped
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dir_is_read_back_from_the_plist() {
+        for data in ["/Library/Application Support/meshnode", "/data/a&b<c>\"d'e"] {
+            let text = plist(Path::new("/usr/local/bin/meshd"), Path::new(data));
+            assert_eq!(
+                data_dir_from_plist(&text),
+                Some(PathBuf::from(data)),
+                "{text}"
+            );
+        }
+        assert_eq!(data_dir_from_plist("<plist><dict></dict></plist>"), None);
+        assert_eq!(
+            data_dir_from_plist(
+                "<key>ProgramArguments</key><array><string>/x</string><string>run</string></array>"
+            ),
+            None
+        );
     }
 }

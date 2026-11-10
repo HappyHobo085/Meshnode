@@ -423,7 +423,7 @@ impl Daemon {
 }
 
 /// Writes `meshd.toml` on a blocking thread.
-async fn save_config(cfg: &HostConfig, dir: &Path) -> Result<(), String> {
+pub(super) async fn save_config(cfg: &HostConfig, dir: &Path) -> Result<(), String> {
     let (cfg, dir) = (cfg.clone(), dir.to_path_buf());
     match tokio::task::spawn_blocking(move || cfg.save(&dir)).await {
         Ok(r) => r.map_err(|e| e.to_string()),

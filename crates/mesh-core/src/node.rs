@@ -2,7 +2,7 @@
 //! read side of membership and peer state.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -128,6 +128,9 @@ pub(crate) struct Inner {
     pub(crate) force_lagged: Arc<Notify>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     lose_events: Arc<AtomicBool>,
+    /// Test hook: iroh `Endpoint::network_change` calls completed.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    network_changes: AtomicU64,
 }
 
 impl Inner {
@@ -600,6 +603,7 @@ pub(crate) async fn start(
         rebootstrap: tokio::sync::Mutex::new(()),
         crash_after_reset: AtomicBool::new(false),
         hold_before_reset: watch::Sender::new(false),
+        network_changes: AtomicU64::new(0),
         tasks: Mutex::new(tasks),
         cancel,
         force_lagged,
@@ -772,8 +776,11 @@ impl Node {
     /// The network changed (Android hook): tell iroh and redial every peer now.
     pub fn network_change(&self) {
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let ep = self.inner.endpoint.clone();
-            rt.spawn(async move { ep.network_change().await });
+            let inner = self.inner.clone();
+            rt.spawn(async move {
+                inner.endpoint.network_change().await;
+                inner.network_changes.fetch_add(1, Ordering::SeqCst);
+            });
         }
         self.inner.peers.reset_backoff_all();
     }
@@ -987,6 +994,11 @@ impl Node {
 
     pub fn heal(&self) {
         self.inner.peers.heal();
+    }
+
+    /// iroh `Endpoint::network_change` calls completed through [`Node::network_change`].
+    pub fn network_changes_for_test(&self) -> u64 {
+        self.inner.network_changes.load(Ordering::SeqCst)
     }
 
     /// Runs one maintenance job now.

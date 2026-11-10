@@ -15,7 +15,10 @@ pub use httpfwd::{
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};
-pub use service::{Limits, Placement, ServiceKind, ServiceManifest, valid_service_name};
+pub use service::{
+    Limits, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, Placement, ServiceKind, ServiceManifest,
+    valid_service_name,
+};
 pub use sync::{MAX_BATCH_BYTES, MAX_BATCH_OPS, SyncMsg, VersionVector, batch_ops};
 pub use ticket::InviteTicket;
 

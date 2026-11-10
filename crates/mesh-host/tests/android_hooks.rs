@@ -15,7 +15,7 @@ use mesh_host::{
     AndroidConfig, Daemon, HostConfig, HostOptions, Periodic, PowerPolicy, PowerState, TestOptions,
     WakeLockSink, WakeOutcome, WakeReason,
 };
-use mesh_proto::{NodeId, Placement, Role};
+use mesh_proto::{ALPN_HTTPFWD, NodeId, Placement, Role};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -87,7 +87,7 @@ fn phone() -> (HostOptions, Arc<Rec>) {
 struct D {
     daemon: Daemon,
     admin: InProcessAdmin,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 impl D {
@@ -112,15 +112,19 @@ impl D {
         self.daemon.gateway_addr().expect("gateway running")
     }
 
-    async fn stop(self) {
+    async fn stop(self) -> TempDir {
         timeout(Duration::from_secs(30), self.daemon.shutdown())
             .await
             .expect("daemon shutdown");
+        self.dir
     }
 }
 
-async fn start(mut cfg: HostConfig, host: HostOptions) -> D {
-    let dir = tempfile::tempdir().unwrap();
+async fn start(cfg: HostConfig, host: HostOptions) -> D {
+    start_in(tempfile::tempdir().unwrap(), cfg, host).await
+}
+
+async fn start_in(dir: TempDir, mut cfg: HostConfig, host: HostOptions) -> D {
     // `free_port` races with parallel tests: when the gateway cannot bind, try a fresh port.
     let mut attempt = 1;
     let daemon = loop {
@@ -145,11 +149,7 @@ async fn start(mut cfg: HostConfig, host: HostOptions) -> D {
         }
     };
     let admin = daemon.in_process_admin();
-    D {
-        daemon,
-        admin,
-        _dir: dir,
-    }
+    D { daemon, admin, dir }
 }
 
 /// Polls `cond` until it holds; panics after [`T`].
@@ -320,11 +320,15 @@ async fn wake_when_uninitialised_is_noop() {
 async fn saver_screen_off_refuses_httpfwd_503() {
     let (a, b, _rec) = pair().await;
     counter_on(&a, &b).await;
+    // Only the phone serves the counter.
+    assert_eq!(b.daemon.status().services_hosted, 1);
+    assert_eq!(a.daemon.status().services_hosted, 0);
     b.daemon.set_power(PowerState {
         policy: PowerPolicy::Saver,
         charging: false,
         screen_on: false,
     });
+    let served = b.daemon.httpfwd_served_for_test().await;
     // The paused phone answers `503 Service not yet replicated`, which the desktop's
     // forwarder retries elsewhere; with no other host it gives up with a 502.
     let (code, body) = http_get(a.gateway(), "counter.mesh.localhost", "/").await;
@@ -332,6 +336,10 @@ async fn saver_screen_off_refuses_httpfwd_503() {
         (code, body.as_str()),
         (502, "No host could serve counter"),
         "the only host is paused"
+    );
+    assert!(
+        b.daemon.httpfwd_served_for_test().await > served,
+        "the phone itself answered (with its 503)"
     );
     b.daemon.set_power(PowerState {
         policy: PowerPolicy::Saver,
@@ -438,4 +446,99 @@ fn android_config_round_trip() {
     assert!(HostConfig::load_or_default(dir.path()).is_err());
     std::fs::write(&file, "[android]\nbogus = 1\n").unwrap();
     assert!(HostConfig::load_or_default(dir.path()).is_err());
+}
+
+#[tokio::test]
+async fn request_lock_released_after_failed_request() {
+    let (a, b, rec) = pair().await;
+    let conn = a
+        .daemon
+        .node_handle_for_test()
+        .unwrap()
+        .connect(b.id().await, ALPN_HTTPFWD)
+        .await
+        .expect("connect to b");
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    // The start of a frame, never completed.
+    send.write_all(&[0, 0, 1, 0, 7]).await.unwrap();
+    wait_for("b accepted the stream", || async {
+        !rec.of("request").is_empty()
+    })
+    .await;
+    conn.close(0u32.into(), b"gone");
+    wait_for("the request failed on b", || async {
+        b.daemon.requests_in_flight() == 0
+    })
+    .await;
+    assert_eq!(rec.of("request"), ["+request:330000"]);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(35)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let got = rec.of("request");
+    tokio::time::resume();
+    assert_eq!(got, ["+request:330000", "-request"]);
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn network_changed_from_a_foreign_thread() {
+    let (host, _rec) = phone();
+    let d = start(test_config(), host).await;
+    assert_eq!(
+        d.req(AdminRequest::Init { name: "p".into() }).await,
+        AdminResponse::Ok
+    );
+    let before = d.daemon.network_changes_for_test().await;
+    // As from a JNI thread: no Tokio runtime there.
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            d.daemon.network_changed();
+        });
+    });
+    wait_for("iroh saw the network change", || async {
+        d.daemon.network_changes_for_test().await > before
+    })
+    .await;
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn power_policy_persists_across_restart() {
+    let (host, _rec) = phone();
+    let d = start(test_config(), host.clone()).await;
+    d.daemon.set_power(PowerState {
+        policy: PowerPolicy::Saver,
+        charging: false,
+        screen_on: true,
+    });
+    let file = d.dir.path().join(CONFIG_FILE);
+    wait_for("power saved", || async {
+        std::fs::read_to_string(&file).is_ok_and(|t| t.contains("power = \"saver\""))
+    })
+    .await;
+    // Charging or screen changes alone do not touch the file.
+    let saved = std::fs::read_to_string(&file).unwrap();
+    d.daemon.set_power(PowerState {
+        policy: PowerPolicy::Saver,
+        charging: true,
+        screen_on: false,
+    });
+    let dir = d.stop().await;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+
+    // As the hosts do: the config comes from meshd.toml.
+    let cfg = HostConfig::load_or_default(dir.path()).unwrap();
+    assert_eq!(cfg.android.power, PowerPolicy::Saver);
+    let d = start_in(dir, cfg, host).await;
+    assert_eq!(d.daemon.power_state().policy, PowerPolicy::Saver);
+    // Back to the default: the section leaves the file again.
+    d.daemon.set_power(balanced(false, true));
+    let dir = d.stop().await;
+    let text = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+    assert!(!text.contains("android"), "{text}");
 }

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use mesh_gateway::Activity;
+use mesh_proto::MAX_TIMEOUT_MS;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -27,8 +28,11 @@ pub const CATCH_UP_AFTER: Duration = Duration::from_secs(60);
 
 /// Holds and releases the platform's wake locks, as the host tells it. One lock per tag;
 /// `acquire` on a tag already held refreshes its timeout; `release` releases it whatever
-/// the number of `acquire`s. `max_ms == u64::MAX` means no timeout. Both are called on
-/// async tasks, so they must not block.
+/// the number of `acquire`s. `max_ms == u64::MAX` means no timeout.
+///
+/// Both are called on async tasks and while the host holds an internal lock, so an
+/// implementation must not block and must not call back into the [`Daemon`](crate::Daemon)
+/// (hand the work to another thread instead).
 pub trait WakeLockSink: Send + Sync {
     fn acquire(&self, tag: &str, max_ms: u64);
     fn release(&self, tag: &str);
@@ -83,9 +87,9 @@ pub(crate) const TAG_ALARM: &str = "alarm";
 
 /// How long the request lock is kept after the last request ends.
 pub(crate) const REQUEST_LINGER: Duration = Duration::from_secs(30);
-/// The longest a service request may run (`mesh_proto` `MAX_TIMEOUT_MS`): the request
-/// lock's timeout is this plus [`REQUEST_LINGER`].
-pub(crate) const REQUEST_TIMEOUT_MS: u64 = 300_000;
+/// The longest a service request may run: the request lock's timeout is this plus
+/// [`REQUEST_LINGER`].
+const REQUEST_TIMEOUT_MS: u64 = MAX_TIMEOUT_MS;
 const CATCHUP_MAX_MS: u64 = 60_000;
 const SAVER_ALARM_MS: u64 = 10_000;
 
@@ -143,6 +147,9 @@ struct PowerSt {
     /// Inbound streams being served.
     in_flight: u32,
     request_held: bool,
+    /// Wakes in progress, and whether they hold `"catchup"`.
+    catchups: u32,
+    catchup_held: bool,
     /// Bumped whenever a pending request release is scheduled or cancelled.
     linger_gen: u64,
     linger: Option<JoinHandle<()>>,
@@ -153,15 +160,20 @@ struct PowerSt {
     closed: bool,
 }
 
-/// Releases a lock when dropped.
-pub(crate) struct LockGuard {
-    sink: Arc<dyn WakeLockSink>,
-    tag: &'static str,
-}
+/// One wake in progress: the last one to end releases `"catchup"`.
+pub(crate) struct CatchUpGuard(Arc<Power>);
 
-impl Drop for LockGuard {
+impl Drop for CatchUpGuard {
     fn drop(&mut self) {
-        self.sink.release(self.tag);
+        let p = &self.0;
+        let mut st = p.st();
+        st.catchups = st.catchups.saturating_sub(1);
+        if st.catchups == 0
+            && std::mem::take(&mut st.catchup_held)
+            && let Some(sink) = &p.sink
+        {
+            sink.release(TAG_CATCHUP);
+        }
     }
 }
 
@@ -175,6 +187,8 @@ impl Power {
                 standing: None,
                 in_flight: 0,
                 request_held: false,
+                catchups: 0,
+                catchup_held: false,
                 linger_gen: 0,
                 linger: None,
                 alarm_gen: 0,
@@ -197,11 +211,13 @@ impl Power {
         self.st().state
     }
 
-    /// Records `state` and takes or lets go of the standing lock to match it.
-    pub(crate) fn set_state(&self, state: PowerState) {
+    /// Records `state` and takes or lets go of the standing lock to match it. Returns the
+    /// previous state.
+    pub(crate) fn set_state(&self, state: PowerState) -> PowerState {
         let mut st = self.st();
-        st.state = state;
+        let old = std::mem::replace(&mut st.state, state);
         self.reconcile(&mut st);
+        old
     }
 
     /// Takes the standing lock the current state calls for (after start).
@@ -226,25 +242,50 @@ impl Power {
             sink.acquire(tag, max);
             st.standing = Some(tag);
         }
+        // Work in progress that the standing lock covered needs its own lock now.
+        if st.standing.is_none() {
+            if st.in_flight > 0 {
+                self.take_request(st);
+            }
+            if st.catchups > 0 {
+                self.take_catchup(st);
+            }
+        }
     }
 
-    /// The `"catchup"` lock for the duration of a wake, if the policy calls for one.
-    pub(crate) fn catch_up_lock(&self) -> Option<LockGuard> {
-        let sink = self.sink.as_ref()?;
-        let st = self.st();
-        if st.closed {
-            return None;
+    /// Takes (or refreshes) `"request"` if the policy calls for it.
+    fn take_request(&self, st: &mut PowerSt) {
+        let Some(sink) = &self.sink else { return };
+        if let Some((tag, max)) =
+            wake_lock_for(&st.state, LockActivity::Request, REQUEST_TIMEOUT_MS)
+            && tag == TAG_REQUEST
+        {
+            sink.acquire(tag, max);
+            st.request_held = true;
         }
-        match wake_lock_for(&st.state, LockActivity::CatchUp, REQUEST_TIMEOUT_MS) {
-            Some((tag, max)) if tag == TAG_CATCHUP => {
-                sink.acquire(tag, max);
-                Some(LockGuard {
-                    sink: sink.clone(),
-                    tag,
-                })
-            }
-            _ => None,
+    }
+
+    /// Takes (or refreshes) `"catchup"` if the policy calls for it.
+    fn take_catchup(&self, st: &mut PowerSt) {
+        let Some(sink) = &self.sink else { return };
+        if let Some((tag, max)) =
+            wake_lock_for(&st.state, LockActivity::CatchUp, REQUEST_TIMEOUT_MS)
+            && tag == TAG_CATCHUP
+        {
+            sink.acquire(tag, max);
+            st.catchup_held = true;
         }
+    }
+
+    /// Marks a wake in progress for the guard's lifetime, holding `"catchup"` if the
+    /// policy calls for it. Overlapping wakes share the lock.
+    pub(crate) fn catch_up_lock(self: &Arc<Self>) -> CatchUpGuard {
+        let mut st = self.st();
+        st.catchups += 1;
+        if !st.closed {
+            self.take_catchup(&mut st);
+        }
+        CatchUpGuard(self.clone())
     }
 
     /// The `"alarm"` lock, held for its full timeout from now (a later alarm restarts it).
@@ -285,26 +326,25 @@ impl Power {
 
     /// An inbound stream started or ended (the `httpfwd` slot's activity callback).
     pub(crate) fn activity(self: &Arc<Self>, a: Activity) {
-        let Some(sink) = &self.sink else { return };
+        if self.sink.is_none() {
+            return;
+        }
         let mut st = self.st();
         match a {
             Activity::Start => {
                 st.in_flight += 1;
-                if st.in_flight != 1 || st.closed {
+                if st.closed {
                     return;
                 }
-                // A release pending from an earlier request no longer applies.
-                st.linger_gen += 1;
-                if let Some(t) = st.linger.take() {
-                    t.abort();
+                if st.in_flight == 1 {
+                    // A release pending from an earlier request no longer applies.
+                    st.linger_gen += 1;
+                    if let Some(t) = st.linger.take() {
+                        t.abort();
+                    }
                 }
-                let lock = wake_lock_for(&st.state, LockActivity::Request, REQUEST_TIMEOUT_MS);
-                if let Some((tag, max)) = lock
-                    && tag == TAG_REQUEST
-                {
-                    sink.acquire(tag, max);
-                    st.request_held = true;
-                }
+                // Every request refreshes the timeout: overlapping traffic may outlast it.
+                self.take_request(&mut st);
             }
             Activity::End => {
                 st.in_flight = st.in_flight.saturating_sub(1);
@@ -353,6 +393,9 @@ impl Power {
         let Some(sink) = &self.sink else { return };
         if std::mem::take(&mut st.request_held) {
             sink.release(TAG_REQUEST);
+        }
+        if std::mem::take(&mut st.catchup_held) {
+            sink.release(TAG_CATCHUP);
         }
         if std::mem::take(&mut st.alarm_held) {
             sink.release(TAG_ALARM);
@@ -501,7 +544,8 @@ mod tests {
         let (p, rec) = power(balanced());
         p.activity(Activity::Start);
         p.activity(Activity::Start);
-        assert_eq!(rec.take(), ["+request:330000"]);
+        // Each request refreshes the lock's timeout.
+        assert_eq!(rec.take(), ["+request:330000", "+request:330000"]);
         p.activity(Activity::End);
         p.activity(Activity::End);
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -544,8 +588,86 @@ mod tests {
             policy: PowerPolicy::AlwaysOn,
             ..balanced()
         });
-        assert!(p.catch_up_lock().is_none());
+        drop(p.catch_up_lock());
         assert!(rec.take().is_empty(), "nothing after close");
+        p.close();
+    }
+
+    /// A request lock taken before a policy change is still let go after the linger.
+    #[tokio::test(start_paused = true)]
+    async fn request_lock_released_after_policy_change() {
+        for policy in [PowerPolicy::AlwaysOn, PowerPolicy::Saver] {
+            let (p, rec) = power(balanced());
+            p.activity(Activity::Start);
+            p.set_state(PowerState {
+                policy,
+                ..balanced()
+            });
+            p.activity(Activity::End);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            settle().await;
+            let got = rec.take();
+            assert_eq!(got.first().map(String::as_str), Some("+request:330000"));
+            assert_eq!(
+                got.last().map(String::as_str),
+                Some("-request"),
+                "{policy:?}"
+            );
+            p.close();
+        }
+    }
+
+    /// Dropping the standing lock mid-request takes the request lock in its place.
+    #[tokio::test(start_paused = true)]
+    async fn request_lock_taken_when_standing_lock_drops() {
+        let (p, rec) = power(PowerState {
+            charging: true,
+            ..balanced()
+        });
+        p.apply_standing();
+        p.activity(Activity::Start);
+        p.set_state(balanced());
+        p.activity(Activity::End);
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        settle().await;
+        assert_eq!(
+            rec.take(),
+            [
+                "+charging:18446744073709551615",
+                "-charging",
+                "+request:330000",
+                "-request"
+            ]
+        );
+        p.close();
+    }
+
+    #[tokio::test]
+    async fn overlapping_wakes_share_the_catchup_lock() {
+        let (p, rec) = power(balanced());
+        let first = p.catch_up_lock();
+        let second = p.catch_up_lock();
+        drop(first);
+        assert_eq!(rec.take(), ["+catchup:60000", "+catchup:60000"]);
+        drop(second);
+        assert_eq!(rec.take(), ["-catchup"]);
+        // Charging covers a wake; unplugging mid-wake takes "catchup".
+        p.set_state(PowerState {
+            charging: true,
+            ..balanced()
+        });
+        let g = p.catch_up_lock();
+        p.set_state(balanced());
+        drop(g);
+        assert_eq!(
+            rec.take(),
+            [
+                "+charging:18446744073709551615",
+                "-charging",
+                "+catchup:60000",
+                "-catchup"
+            ]
+        );
         p.close();
     }
 
@@ -565,7 +687,7 @@ mod tests {
         });
         p.activity(Activity::Start); // "always" covers it
         p.activity(Activity::End);
-        assert!(p.catch_up_lock().is_none());
+        drop(p.catch_up_lock());
         p.set_state(PowerState {
             charging: true,
             ..balanced()

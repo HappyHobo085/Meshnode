@@ -30,7 +30,11 @@ libc.workspace = true
 [features]
 # Test-only helpers: `Daemon::start_with` (fast node timings, loopback binding, quick
 # deployer rescans).
-test-hooks = ["mesh-core/test-hooks", "mesh-services/test-hooks"]
+test-hooks = [
+    "mesh-core/test-hooks",
+    "mesh-gateway/test-hooks",
+    "mesh-services/test-hooks",
+]
 
 [dev-dependencies]
 mesh-host = { path = ".", features = ["test-hooks"] }

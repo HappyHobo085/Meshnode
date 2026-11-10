@@ -17,7 +17,7 @@ use mesh_core::local::read_genesis;
 use mesh_core::{Node, NodeConfig, NodeError, NodeHandle, NodeStatus, Timings, WakeOutcome};
 use mesh_gateway::{Forwarder, Gateway, GatewayConfig, GatewayError, HttpFwdHandler, HttpFwdSlot};
 use mesh_proto::{ALPN_HTTPFWD, InviteTicket};
-use mesh_services::{Services, ServicesConfig, ServicesError};
+use mesh_services::{LocalStatus, Services, ServicesConfig, ServicesError};
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{error, info, warn};
@@ -42,6 +42,8 @@ const SERVICES_RELEASE: Duration = Duration::from_secs(3);
 const SERVICES_STOP: Duration = Duration::from_secs(3);
 /// How long [`Daemon::wake`] waits for the catch-up.
 const WAKE_LIMIT: Duration = Duration::from_secs(10);
+/// How long shutdown waits for a pending save of the power policy.
+const POLICY_SAVE: Duration = Duration::from_secs(3);
 /// Entries of the data directory that `ResetIdentity` keeps.
 const KEPT_ON_RESET: [&str; 4] = [CONFIG_FILE, "logs", "admin.sock", LOCK_FILE];
 
@@ -108,7 +110,7 @@ pub struct HostStatus {
     pub node_id: Option<String>,
     /// The mesh id in hex (a mesh has no other name), while a node runs.
     pub mesh_name: Option<String>,
-    /// The services of the mesh (as `Status` counts them).
+    /// The services this node serves itself (ready here).
     pub services_hosted: u32,
     /// Other members online.
     pub peers_online: u32,
@@ -143,6 +145,8 @@ struct Inner {
     power: Arc<Power>,
     /// `[android] periodic_wake_s`, as started.
     periodic_wake_s: u32,
+    /// The latest save of `[android] power` started by `set_power`.
+    policy_save: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for Inner {
@@ -265,6 +269,7 @@ impl Daemon {
             rt,
             power,
             periodic_wake_s: cfg.android.periodic_wake_s,
+            policy_save: Mutex::new(None),
         });
         if initialised {
             let gateway = inner.start_node(&cfg, How::Open).await?;
@@ -334,6 +339,12 @@ impl Daemon {
         };
         inner.stop_node(deadline).await;
         inner.power.close();
+        let save = lock(&inner.policy_save).take();
+        if let Some(save) = save
+            && timeout(POLICY_SAVE, save).await.is_err()
+        {
+            warn!("the power policy was not saved in time");
+        }
         info!("meshd stopped");
     }
 
@@ -370,10 +381,19 @@ impl Daemon {
     /// Records the power state (policy, charging, screen) and applies it: in Saver with
     /// the screen off, inbound `httpfwd` answers 503 and the incoming-traffic catch-up is
     /// off; the `"always"` / `"charging"` wake lock is taken or let go. The state is kept
-    /// across node starts and applies to each.
+    /// across node starts and applies to each. A new policy is saved to `meshd.toml`
+    /// (`[android] power`), so that it survives a restart.
     pub fn set_power(&self, state: PowerState) {
-        self.inner.power.set_state(state);
+        let old = self.inner.power.set_state(state);
         self.inner.with_node(Inner::apply_power);
+        if old.policy != state.policy {
+            self.inner.save_policy();
+        }
+    }
+
+    /// The power state in force.
+    pub fn power_state(&self) -> PowerState {
+        self.inner.power.state()
     }
 
     /// The admin API, called in-process (no socket).
@@ -387,7 +407,14 @@ impl Daemon {
         let inner = &*self.inner;
         let run = inner.run.try_read().ok();
         let cfg = inner.cfg.try_lock().ok();
-        let s = self.status_info(run.as_deref().and_then(Option::as_ref), cfg.as_deref());
+        let running = run.as_deref().and_then(Option::as_ref);
+        let s = self.status_info(running, cfg.as_deref());
+        let hosted = running.map_or(0, |r| {
+            let all = r.services.services();
+            all.iter()
+                .filter(|s| matches!(s.local, LocalStatus::Ready { .. }))
+                .count() as u32
+        });
         let main = s
             .gateway
             .as_deref()
@@ -397,7 +424,7 @@ impl Daemon {
             state: s.state,
             node_id: s.node_id.map(|id| hex::encode(id.0)),
             mesh_name: s.mesh_id.map(|id| hex::encode(id.0)),
-            services_hosted: s.services,
+            services_hosted: hosted,
             // This node counts itself online.
             peers_online: s.members_online.saturating_sub(1),
             gateway_ports: main
@@ -411,6 +438,27 @@ impl Daemon {
     #[cfg(feature = "test-hooks")]
     pub fn requests_in_flight(&self) -> u32 {
         self.inner.power.in_flight()
+    }
+
+    /// The running node's handle.
+    #[cfg(feature = "test-hooks")]
+    pub fn node_handle_for_test(&self) -> Option<NodeHandle> {
+        lock(&self.inner.handle).clone()
+    }
+
+    /// iroh network-change calls completed by the running node (0 without one).
+    #[cfg(feature = "test-hooks")]
+    pub async fn network_changes_for_test(&self) -> u64 {
+        let run = self.inner.run.read().await;
+        run.as_ref()
+            .map_or(0, |r| r.node.network_changes_for_test())
+    }
+
+    /// `httpfwd` requests the running node answered (0 without one).
+    #[cfg(feature = "test-hooks")]
+    pub async fn httpfwd_served_for_test(&self) -> u64 {
+        let run = self.inner.run.read().await;
+        run.as_ref().map_or(0, |r| r.slot.served())
     }
 }
 
@@ -656,9 +704,12 @@ impl Inner {
 
     /// Calls `f` with the running node, if any: at once when the node is free, otherwise
     /// on a task once the start or stop in progress ends.
+    /// `f` runs inside the daemon's runtime, even when called from a foreign thread
+    /// (the node spawns work from it).
     fn with_node(self: &Arc<Self>, f: impl FnOnce(&Inner, &Running) + Send + 'static) {
         if let Ok(run) = self.run.try_read() {
             if let Some(run) = run.as_ref() {
+                let _rt = self.rt.enter();
                 f(self, run);
             }
             return;
@@ -671,6 +722,29 @@ impl Inner {
                 f(&inner, run);
             }
         });
+    }
+
+    /// Saves the current power policy to `meshd.toml` if it differs, on a task (the
+    /// latest policy wins when calls overlap). Shutdown waits for the last one.
+    fn save_policy(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        let task = self.rt.spawn(async move {
+            let Some(inner) = me.upgrade() else { return };
+            let mut cfg = inner.cfg.lock().await;
+            let policy = inner.power.state().policy;
+            if cfg.android.power == policy {
+                return;
+            }
+            let mut new = cfg.clone();
+            new.android.power = policy;
+            match requests::save_config(&new, &inner.data_dir).await {
+                Ok(()) => *cfg = new,
+                Err(e) => warn!("cannot save the power policy: {e}"),
+            }
+        });
+        // An earlier save is not aborted (it may be mid-write): this one queues behind it
+        // on the cfg lock, so waiting for the last one waits for all.
+        *lock(&self.policy_save) = Some(task);
     }
 
     fn running_or<'a>(

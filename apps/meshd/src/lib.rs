@@ -7,6 +7,7 @@ mod daemon;
 pub mod lock;
 pub mod logging;
 pub mod paths;
+pub mod service;
 
 pub use config::{ConfigError, MeshdConfig};
 #[cfg(feature = "test-hooks")]

@@ -1,0 +1,14 @@
+[Unit]
+Description=Meshnode daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=meshnode
+Group=meshnode
+StateDirectory=meshnode
+ExecStart=/usr/local/bin/meshd run --data /var/lib/meshnode
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

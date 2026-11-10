@@ -42,9 +42,20 @@ pub async fn run_daemon(data: &Path, service: bool) -> Result<(), CliError> {
     run_foreground(data).await
 }
 
-/// Task 9 hook: on Windows `run --service` is started by the service control manager and
-/// must report its state to it (and stop on a service-stop control) instead of waiting for
-/// Ctrl-C. Until then it runs as plain `run` everywhere.
+/// `run --service` on Windows: started by the service control manager, it reports its
+/// state to it and stops on a service stop instead of Ctrl-C (spec §6.4). systemd and
+/// launchd run plain `run`, so elsewhere it is the same as `run`.
+#[cfg(windows)]
+async fn run_service(data: &Path) -> Result<(), CliError> {
+    let runtime = tokio::runtime::Handle::current();
+    let data = data.to_path_buf();
+    tokio::task::spawn_blocking(move || meshd::service::windows::run_dispatcher(data, runtime))
+        .await
+        .map_err(|e| CliError::failed(format!("the service dispatcher failed: {e}")))?
+        .map_err(|e| CliError::failed(e.to_string()))
+}
+
+#[cfg(not(windows))]
 async fn run_service(data: &Path) -> Result<(), CliError> {
     run_foreground(data).await
 }

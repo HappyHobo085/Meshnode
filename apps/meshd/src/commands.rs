@@ -12,7 +12,7 @@ use mesh_admin::{
 use mesh_proto::{InviteTicket, Limits, NodeId, Placement, Role};
 use serde::Serialize;
 
-use crate::cli::{Cli, Command, ConfigCmd, Deploy, LimitArgs, PlacementArgs};
+use crate::cli::{Cli, Command, ConfigCmd, Deploy, LimitArgs, PlacementArgs, ServiceCmd};
 use crate::output::{say, say_raw};
 use crate::{local, output};
 
@@ -168,7 +168,56 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Logs { lines, follow } => logs(&data, lines, follow).await,
+        Command::Service(cmd) => tokio::task::spawn_blocking(move || service(&data, cmd))
+            .await
+            .map_err(|e| CliError::failed(e.to_string()))?,
     }
+}
+
+/// `meshd service …` (spec §6.4): no daemon involved; may wait for the service manager.
+fn service(data: &Path, cmd: ServiceCmd) -> Result<(), CliError> {
+    use meshd::service;
+    let failed = |e: service::ServiceError| CliError::failed(e.to_string());
+    match cmd {
+        ServiceCmd::Install => {
+            service::install(data).map_err(failed)?;
+            say!(
+                "Installed and started the meshnode service (data directory {}).",
+                data.display()
+            );
+            #[cfg(target_os = "linux")]
+            if std::env::var("SUDO_USER").is_ok_and(|u| !u.is_empty() && u != "root") {
+                say!("Log in again to use meshd's commands without sudo (group meshnode).");
+            }
+        }
+        ServiceCmd::Uninstall { purge_data } => {
+            service::uninstall(data, purge_data).map_err(failed)?;
+            if purge_data {
+                say!(
+                    "Removed the meshnode service and deleted {}.",
+                    data.display()
+                );
+            } else {
+                say!(
+                    "Removed the meshnode service; the data directory {} was kept.",
+                    data.display()
+                );
+            }
+        }
+        ServiceCmd::Start => {
+            service::start().map_err(failed)?;
+            say!("Started the meshnode service.");
+        }
+        ServiceCmd::Stop => {
+            service::stop().map_err(failed)?;
+            say!("Stopped the meshnode service.");
+        }
+        ServiceCmd::Status => {
+            let status = service::status().map_err(failed)?;
+            say!("meshnode service: {status}");
+        }
+    }
+    Ok(())
 }
 
 // --- talking to the daemon ---------------------------------------------------------------

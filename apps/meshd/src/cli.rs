@@ -115,6 +115,28 @@ pub enum Command {
         #[arg(short = 'f', long)]
         follow: bool,
     },
+    /// Install or control meshd as an OS service (needs root / Administrator, except
+    /// status).
+    #[command(subcommand)]
+    Service(ServiceCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCmd {
+    /// Install the service for the data directory (--data) and start it.
+    Install,
+    /// Stop and remove the service; the data directory is kept unless --purge-data.
+    Uninstall {
+        /// Also delete the data directory.
+        #[arg(long)]
+        purge_data: bool,
+    },
+    /// Start the installed service.
+    Start,
+    /// Stop the installed service.
+    Stop,
+    /// Show whether the service is installed and running.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

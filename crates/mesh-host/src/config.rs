@@ -53,7 +53,7 @@ fn invalid(key: &str, message: impl Into<String>) -> ConfigError {
 /// The contents of `meshd.toml`. Missing fields take their defaults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct MeshdConfig {
+pub struct HostConfig {
     /// This node's member name (set by `init` / `join`).
     pub name: String,
     pub tags: Vec<String>,
@@ -92,9 +92,9 @@ pub struct AdminSection {
     pub windows_user_sid: Option<String>,
 }
 
-impl Default for MeshdConfig {
+impl Default for HostConfig {
     fn default() -> Self {
-        MeshdConfig {
+        HostConfig {
             name: String::new(),
             tags: Vec::new(),
             relay: "default".into(),
@@ -141,19 +141,19 @@ mod port_map {
     }
 }
 
-impl MeshdConfig {
+impl HostConfig {
     /// Reads `<dir>/meshd.toml`, or returns the defaults when it does not exist. The
     /// result is validated.
-    pub fn load_or_default(dir: &Path) -> Result<MeshdConfig, ConfigError> {
+    pub fn load_or_default(dir: &Path) -> Result<HostConfig, ConfigError> {
         let path = dir.join(CONFIG_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(MeshdConfig::default());
+                return Ok(HostConfig::default());
             }
             Err(source) => return Err(ConfigError::Io { path, source }),
         };
-        let cfg: MeshdConfig = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        let cfg: HostConfig = toml::from_str(&text).map_err(|e| ConfigError::Parse {
             path: path.clone(),
             message: e.to_string(),
         })?;
@@ -400,36 +400,36 @@ max_memory_mb = 4096
 [admin]
 windows_user_sid = "S-1-5-21-1-2-3-1001"
 "#;
-        let cfg: MeshdConfig = toml::from_str(text).unwrap();
+        let cfg: HostConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(
             cfg.gateway.ports.get(&7801).map(String::as_str),
             Some("sync")
         );
         assert_eq!(cfg.services.max_memory_mb, Some(4096));
-        let back: MeshdConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        let back: HostConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
     }
 
     #[test]
     fn defaults_and_save_load() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MeshdConfig::load_or_default(dir.path()).unwrap();
-        assert_eq!(cfg, MeshdConfig::default());
+        let cfg = HostConfig::load_or_default(dir.path()).unwrap();
+        assert_eq!(cfg, HostConfig::default());
         cfg.validate().unwrap();
         let mut cfg = cfg;
         assert!(!cfg.set("name", "pc").unwrap());
         assert!(cfg.set("services.max_memory_mb", "128").unwrap());
         cfg.save(dir.path()).unwrap();
         cfg.save(dir.path()).unwrap(); // overwrites
-        assert_eq!(MeshdConfig::load_or_default(dir.path()).unwrap(), cfg);
+        assert_eq!(HostConfig::load_or_default(dir.path()).unwrap(), cfg);
         std::fs::write(dir.path().join(CONFIG_FILE), "bogus = 1").unwrap();
-        assert!(MeshdConfig::load_or_default(dir.path()).is_err());
+        assert!(HostConfig::load_or_default(dir.path()).is_err());
     }
 
     #[test]
     fn get_set_round_trip() {
-        let mut cfg = MeshdConfig::default();
+        let mut cfg = HostConfig::default();
         for (k, v) in [
             ("tags", "a,b"),
             ("relay", "https://relay.example"),

@@ -6,9 +6,11 @@ pub mod config;
 mod daemon;
 pub mod lock;
 pub mod logging;
+mod options;
 pub mod paths;
 
-pub use config::{ConfigError, MeshdConfig};
+pub use config::{ConfigError, HostConfig};
 #[cfg(feature = "test-hooks")]
 pub use daemon::TestOptions;
 pub use daemon::{Daemon, DaemonError, wipe_identity};
+pub use options::{HostOptions, Periodic, WakeLockSink};

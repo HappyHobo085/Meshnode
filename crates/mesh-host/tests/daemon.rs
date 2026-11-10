@@ -10,9 +10,9 @@ use mesh_admin::{
     AdminClient, AdminRequest, AdminResponse, DaemonState, DeployOpts, ErrorCode, FileMeta,
     LocalStateView, StatusInfo,
 };
-use mesh_proto::{Limits, Placement, Role};
 use mesh_host::config::GatewaySection;
-use mesh_host::{Daemon, MeshdConfig, TestOptions};
+use mesh_host::{Daemon, HostConfig, TestOptions};
+use mesh_proto::{Limits, Placement, Role};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -30,15 +30,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn test_config() -> MeshdConfig {
-    MeshdConfig {
+fn test_config() -> HostConfig {
+    HostConfig {
         relay: "disabled".into(),
         discovery: false,
         gateway: GatewaySection {
             listen: SocketAddr::from(([127, 0, 0, 1], free_port())),
             ports: BTreeMap::new(),
         },
-        ..MeshdConfig::default()
+        ..HostConfig::default()
     }
 }
 
@@ -86,7 +86,7 @@ impl D {
     }
 }
 
-async fn start_in(dir: TempDir, mut cfg: MeshdConfig) -> D {
+async fn start_in(dir: TempDir, mut cfg: HostConfig) -> D {
     // `free_port` races with parallel tests: when the gateway cannot bind, try a fresh port
     // (up to 3 attempts in all).
     let mut attempt = 1;
@@ -286,7 +286,7 @@ async fn init_then_status_running() {
     let (code, body) = http_get(d.gateway(), "127.0.0.1", "/status.json").await;
     assert_eq!(code, 200, "{body}");
     // The name was written to meshd.toml.
-    let cfg = MeshdConfig::load_or_default(d.data()).unwrap();
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
     assert_eq!(cfg.name, "pc");
     // A restart opens the existing mesh directly.
     let node_id = s.node_id;
@@ -305,7 +305,7 @@ async fn join_through_daemon() {
     assert_eq!(sb.state, DaemonState::Running);
     assert_eq!(sa.mesh_id, sb.mesh_id);
     assert_eq!(sb.name.as_deref(), Some("b"));
-    assert_eq!(MeshdConfig::load_or_default(b.data()).unwrap().name, "b");
+    assert_eq!(HostConfig::load_or_default(b.data()).unwrap().name, "b");
     b.stop().await;
     a.stop().await;
 }
@@ -360,7 +360,7 @@ async fn every_request_against_real_daemon() {
         s.name.as_deref() == Some("pc2") && s.tags == ["desktop", "big"]
     })
     .await;
-    assert_eq!(MeshdConfig::load_or_default(d.data()).unwrap().name, "pc2");
+    assert_eq!(HostConfig::load_or_default(d.data()).unwrap().name, "pc2");
 
     // Deploy the counter and call it through the gateway, on the main and mapped ports.
     let wasm = mesh_runtime::test_fixtures::fixture("counter");
@@ -637,7 +637,7 @@ async fn config_set_validation() {
             restart_required: true
         }
     );
-    let saved = MeshdConfig::load_or_default(d.data()).unwrap();
+    let saved = HostConfig::load_or_default(d.data()).unwrap();
     assert_eq!(saved.name, "renamed");
     assert_eq!(saved.gateway.listen, "127.0.0.1:7999".parse().unwrap());
     assert_eq!(
@@ -694,7 +694,7 @@ async fn shutdown_within_20s() {
         .expect("log follower ended")
         .unwrap();
     // Everything was released: the same data directory starts again, Running.
-    let cfg = MeshdConfig::load_or_default(dir.path()).unwrap();
+    let cfg = HostConfig::load_or_default(dir.path()).unwrap();
     let d = start_in(dir, cfg).await;
     assert_eq!(d.status().await.state, DaemonState::Running);
     d.stop().await;
@@ -703,7 +703,7 @@ async fn shutdown_within_20s() {
 #[tokio::test]
 async fn second_daemon_on_same_data_dir_refused() {
     let d = initialised("pc").await;
-    let cfg = MeshdConfig::load_or_default(d.data()).unwrap();
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
     let r = Daemon::start_with(d.data().to_path_buf(), cfg, TestOptions::fast()).await;
     let err = r.err().expect("second daemon refused").to_string();
     assert_eq!(
@@ -723,7 +723,7 @@ async fn gateway_port_in_use_fails_start_then_restarts() {
     let d = initialised("pc").await;
     let addr = d.gateway();
     let dir = d.stop().await;
-    let cfg = MeshdConfig::load_or_default(dir.path()).unwrap();
+    let cfg = HostConfig::load_or_default(dir.path()).unwrap();
     let blocker = std::net::TcpListener::bind(addr).unwrap();
     let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
     let err = r
@@ -746,7 +746,25 @@ async fn start_creates_meshd_toml_when_absent() {
     assert!(!file.exists());
     let d = start_in(dir, test_config()).await;
     assert!(file.exists(), "meshd.toml was not created");
-    let loaded = MeshdConfig::load_or_default(d.data()).unwrap();
+    let loaded = HostConfig::load_or_default(d.data()).unwrap();
     assert_eq!(loaded.relay, "disabled");
     d.stop().await;
+}
+
+#[tokio::test]
+async fn no_admin_socket_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = TestOptions::fast();
+    opts.host.admin_socket = false;
+    let daemon = Daemon::start_with(dir.path().to_path_buf(), test_config(), opts)
+        .await
+        .unwrap();
+    let endpoint = mesh_admin::endpoint_for(dir.path());
+    match AdminClient::connect(&endpoint).await {
+        Err(mesh_admin::AdminError::NotRunning) => {}
+        other => panic!("expected NotRunning, got {:?}", other.map(|_| ())),
+    }
+    #[cfg(unix)]
+    assert!(!dir.path().join("admin.sock").exists());
+    timeout(T, daemon.shutdown()).await.unwrap();
 }

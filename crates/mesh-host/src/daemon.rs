@@ -22,8 +22,9 @@ use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{error, info, warn};
 
-use crate::config::{CONFIG_FILE, ConfigError, MeshdConfig};
+use crate::config::{CONFIG_FILE, ConfigError, HostConfig};
 use crate::lock::{DataLock, LOCK_FILE, LockError};
+use crate::options::HostOptions;
 use crate::paths::{logs_dir, tmp_dir};
 
 mod requests;
@@ -64,6 +65,7 @@ pub enum DaemonError {
 struct StartOptions {
     timings: Timings,
     bind_addr: Option<SocketAddr>,
+    host: HostOptions,
     #[cfg(feature = "test-hooks")]
     deployer: Option<mesh_services::DeployerTimings>,
 }
@@ -75,6 +77,7 @@ pub struct TestOptions {
     pub timings: Timings,
     pub bind_addr: Option<SocketAddr>,
     pub deployer: mesh_services::DeployerTimings,
+    pub host: HostOptions,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -89,6 +92,7 @@ impl TestOptions {
                 retry_min: Duration::from_millis(200),
                 retry_max: Duration::from_secs(1),
             },
+            host: HostOptions::default(),
         }
     }
 }
@@ -105,7 +109,7 @@ struct Inner {
     endpoint: Endpoint,
     opts: StartOptions,
     /// Serializes changes of `meshd.toml`.
-    cfg: tokio::sync::Mutex<MeshdConfig>,
+    cfg: tokio::sync::Mutex<HostConfig>,
     /// Serializes Init, Join, ResetIdentity and shutdown.
     transition: tokio::sync::Mutex<()>,
     run: RwLock<Option<Running>>,
@@ -150,20 +154,34 @@ impl Daemon {
     /// Prepares the data directory (creating it, emptying `tmp/`), then, if it holds a
     /// mesh, starts the node, its services and the gateway; finally serves the admin API.
     /// Without a mesh only the admin API runs (`Uninitialised`) until `Init` or `Join`.
-    pub async fn start(data_dir: PathBuf, cfg: MeshdConfig) -> Result<Daemon, DaemonError> {
-        Self::start_inner(data_dir, cfg, StartOptions::default()).await
+    pub async fn start(data_dir: PathBuf, cfg: HostConfig) -> Result<Daemon, DaemonError> {
+        Self::start_opts(data_dir, cfg, HostOptions::default()).await
+    }
+
+    /// [`Daemon::start`] with host-specific options.
+    pub async fn start_opts(
+        data_dir: PathBuf,
+        cfg: HostConfig,
+        host: HostOptions,
+    ) -> Result<Daemon, DaemonError> {
+        let opts = StartOptions {
+            host,
+            ..StartOptions::default()
+        };
+        Self::start_inner(data_dir, cfg, opts).await
     }
 
     /// [`Daemon::start`] with test timings and bindings.
     #[cfg(feature = "test-hooks")]
     pub async fn start_with(
         data_dir: PathBuf,
-        cfg: MeshdConfig,
+        cfg: HostConfig,
         test: TestOptions,
     ) -> Result<Daemon, DaemonError> {
         let opts = StartOptions {
             timings: test.timings,
             bind_addr: test.bind_addr,
+            host: test.host,
             deployer: Some(test.deployer),
         };
         Self::start_inner(data_dir, cfg, opts).await
@@ -171,7 +189,7 @@ impl Daemon {
 
     async fn start_inner(
         data_dir: PathBuf,
-        cfg: MeshdConfig,
+        cfg: HostConfig,
         opts: StartOptions,
     ) -> Result<Daemon, DaemonError> {
         cfg.validate()?;
@@ -213,15 +231,17 @@ impl Daemon {
                 return Err(e.into());
             }
         }
-        let backend = Arc::new(Backend(Arc::downgrade(&inner)));
-        match AdminServer::bind(&inner.endpoint, access, backend) {
-            Ok(server) => *lock(&inner.admin) = Some(server),
-            Err(e) => {
-                inner.stop_node(Instant::now() + SHUTDOWN_LIMIT).await;
-                return Err(match e {
-                    AdminError::InUse(_) => DaemonError::AlreadyRunning(inner.data_dir.clone()),
-                    e => e.into(),
-                });
+        if inner.opts.host.admin_socket {
+            let backend = Arc::new(Backend(Arc::downgrade(&inner)));
+            match AdminServer::bind(&inner.endpoint, access, backend) {
+                Ok(server) => *lock(&inner.admin) = Some(server),
+                Err(e) => {
+                    inner.stop_node(Instant::now() + SHUTDOWN_LIMIT).await;
+                    return Err(match e {
+                        AdminError::InUse(_) => DaemonError::AlreadyRunning(inner.data_dir.clone()),
+                        e => e.into(),
+                    });
+                }
             }
         }
         info!(
@@ -309,7 +329,7 @@ async fn served(endpoint: &Endpoint) -> bool {
 }
 
 /// Who may open the admin endpoint (spec §5.2).
-fn access_for(cfg: &MeshdConfig) -> Access {
+fn access_for(cfg: &HostConfig) -> Access {
     #[cfg(windows)]
     {
         match &cfg.admin.windows_user_sid {
@@ -370,7 +390,7 @@ impl Inner {
     /// cannot start is returned as the error while the rest keeps running.
     async fn start_node(
         &self,
-        cfg: &MeshdConfig,
+        cfg: &HostConfig,
         how: How,
     ) -> Result<Option<GatewayError>, DaemonError> {
         let (handler, slot) = HttpFwdHandler::new();
@@ -426,7 +446,7 @@ impl Inner {
     async fn start_services(
         &self,
         node: &Node,
-        cfg: &MeshdConfig,
+        cfg: &HostConfig,
     ) -> Result<Services, ServicesError> {
         let sc = ServicesConfig {
             max_memory_mb: cfg.services.max_memory_mb,
@@ -553,10 +573,10 @@ mod tests {
     #[tokio::test]
     async fn reset_refused_while_the_node_is_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MeshdConfig {
+        let cfg = HostConfig {
             relay: "disabled".into(),
             discovery: false,
-            ..MeshdConfig::default()
+            ..HostConfig::default()
         };
         let daemon = Daemon::start(dir.path().to_path_buf(), cfg).await.unwrap();
         let inner = daemon.inner.clone();

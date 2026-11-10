@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::{
     Backend, Daemon, DaemonError, How, KEPT_ON_RESET, Running, SHUTDOWN_LIMIT, Stopped, lock,
 };
-use crate::config::{ConfigError, MeshdConfig};
+use crate::config::{ConfigError, HostConfig};
 use crate::paths::{logs_dir, tmp_dir};
 
 #[async_trait]
@@ -371,7 +371,7 @@ impl Daemon {
     }
 
     /// Saves `new` to `meshd.toml` and installs it into the locked `cfg`.
-    async fn save_info(&self, cfg: &mut MeshdConfig, new: MeshdConfig) -> Result<(), Fail> {
+    async fn save_info(&self, cfg: &mut HostConfig, new: HostConfig) -> Result<(), Fail> {
         save_config(&new, &self.inner.data_dir)
             .await
             .map_err(|e| Fail(ErrorCode::Internal, e))?;
@@ -411,7 +411,7 @@ impl Daemon {
 }
 
 /// Writes `meshd.toml` on a blocking thread.
-async fn save_config(cfg: &MeshdConfig, dir: &Path) -> Result<(), String> {
+async fn save_config(cfg: &HostConfig, dir: &Path) -> Result<(), String> {
     let (cfg, dir) = (cfg.clone(), dir.to_path_buf());
     match tokio::task::spawn_blocking(move || cfg.save(&dir)).await {
         Ok(r) => r.map_err(|e| e.to_string()),

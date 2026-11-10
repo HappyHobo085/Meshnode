@@ -555,4 +555,94 @@ mod extra {
         timeout(T, a.shutdown()).await.unwrap();
         timeout(T, b.shutdown()).await.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn colliding_extra_alpns_are_rejected() {
+        let cases: [(&str, Vec<&[u8]>); 4] = [
+            ("sync", vec![b"meshnode/sync/1"]),
+            ("join", vec![b"meshnode/join/1"]),
+            ("blobs", vec![iroh_blobs::ALPN]),
+            ("extra", vec![b"test/echo", b"test/echo"]),
+        ];
+        for (name, alpns) in cases {
+            let d = tempfile::tempdir().unwrap();
+            let mut cfg = test_cfg(d.path(), "a").0;
+            for alpn in alpns {
+                let handler: Arc<dyn DynProtocolHandler> = Arc::new(Echo);
+                cfg.extra_protocols.push((alpn.to_vec(), handler));
+            }
+            let r = Node::create_mesh(cfg).await;
+            assert!(
+                matches!(r, Err(NodeError::ProtocolConflict(_))),
+                "{name}: {:?}",
+                r.err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_to_self_refused() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = echo_pair(da.path(), db.path()).await;
+        let r = a.handle().connect(a.node_id(), ECHO).await;
+        assert!(matches!(r, Err(NodeError::ConnectToSelf)), "{:?}", r.err());
+        timeout(T, a.shutdown()).await.unwrap();
+        timeout(T, b.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn extra_connections_close_on_removal() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // Both nodes serve the echo protocol.
+        let mut ca = test_cfg(da.path(), "a").0;
+        let mut cb = test_cfg(db.path(), "b").0;
+        for c in [&mut ca, &mut cb] {
+            let handler: Arc<dyn DynProtocolHandler> = Arc::new(Echo);
+            c.extra_protocols.push((ECHO.to_vec(), handler));
+        }
+        let a = Node::create_mesh(ca).await.unwrap();
+        let b_id = id_of_dir(db.path());
+        a.store()
+            .set_add(MESH_NS, MEMBERS, member_bytes(&b_id, Role::Host).to_vec())
+            .await
+            .unwrap();
+        let genesis = read_genesis(da.path()).unwrap().unwrap();
+        let hints = vec![(a.node_id(), own_addr(&a).await)];
+        let b = Node::start_member_for_test(cb, genesis, hints)
+            .await
+            .unwrap();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        wait_until("a and b online", T, || async {
+            online(&a, bid) && online(&b, aid)
+        })
+        .await;
+
+        // a only knows b through the address b published; give it that address now.
+        a.add_hint(bid, own_addr(&b).await);
+        // a learns b's address from b's record only after a sync; hand it over now.
+        a.add_hint(bid, own_addr(&b).await);
+        // b -> a and a -> b, one connection each way, both used once.
+        let b_to_a = b.handle().connect(aid, ECHO).await.unwrap();
+        assert_eq!(echo_roundtrip(&b_to_a, b"x").await, b"x");
+        let a_to_b = a.handle().connect(bid, ECHO).await.unwrap();
+        assert_eq!(echo_roundtrip(&a_to_b, b"y").await, b"y");
+
+        a.remove(bid).await.unwrap();
+        // a closed both with REMOVED: b sees the code on the connection it dialled, a sees
+        // its own close on the one it dialled.
+        let err = timeout(T, b_to_a.closed()).await.expect("b->a stayed open");
+        match err {
+            iroh::endpoint::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(c.error_code, mesh_core::transport::REMOVED)
+            }
+            other => panic!("b->a: unexpected close {other:?}"),
+        }
+        let err = timeout(T, a_to_b.closed()).await.expect("a->b stayed open");
+        assert!(
+            matches!(err, iroh::endpoint::ConnectionError::LocallyClosed),
+            "a->b: {err:?}"
+        );
+        timeout(T, a.shutdown()).await.unwrap();
+        timeout(T, b.shutdown()).await.unwrap();
+    }
 }

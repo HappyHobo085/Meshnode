@@ -343,8 +343,8 @@ impl PeerManager {
     pub(crate) async fn connect(&self, id: NodeId, alpn: &[u8]) -> Result<Connection, NodeError> {
         let (addr, hint) = {
             let st = self.lock();
-            if st.stopped {
-                return Err(NodeError::Removed);
+            if st.stopped || self.0.cancel.is_cancelled() {
+                return Err(NodeError::ShuttingDown);
             }
             match st.slots.get(&id) {
                 Some(slot) => {

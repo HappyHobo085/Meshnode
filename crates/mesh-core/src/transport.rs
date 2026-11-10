@@ -103,18 +103,76 @@ impl Provisional {
     }
 }
 
+/// Connections of extra protocols, inbound and outbound. A connection whose peer stops
+/// being an effective member is closed with `REMOVED` (like the `sync/1` connections).
+#[derive(Debug)]
+pub(crate) struct ExtraConns {
+    conns: Mutex<Vec<Connection>>,
+    membership: watch::Receiver<Arc<MembershipSnapshot>>,
+}
+
+impl ExtraConns {
+    pub fn new(membership: watch::Receiver<Arc<MembershipSnapshot>>) -> Arc<Self> {
+        Arc::new(ExtraConns {
+            conns: Mutex::new(Vec::new()),
+            membership,
+        })
+    }
+
+    /// Tracks `conn` and closes it at once if its peer is no longer effective.
+    pub fn track(&self, conn: Connection) {
+        self.conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(conn);
+        self.sweep();
+    }
+
+    /// Closes the connections of non-effective peers and forgets closed ones.
+    pub fn sweep(&self) {
+        let snap = self.membership.borrow().clone();
+        let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        conns.retain(|c| {
+            if c.close_reason().is_some() {
+                return false;
+            }
+            if snap.is_effective(&node_id_of(c.remote_id())) {
+                return true;
+            }
+            c.close(REMOVED, b"removed");
+            false
+        });
+    }
+
+    /// Sweeps on every membership change until `cancel` fires.
+    pub async fn watch(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        let mut rx = self.membership.clone();
+        loop {
+            self.sweep();
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                r = rx.changed() => if r.is_err() { return },
+            }
+        }
+    }
+}
+
 /// Adapts a shared dyn handler (from `NodeConfig::extra_protocols`) so it can sit behind a
-/// [`Gate`].
+/// [`Gate`]; accepted connections are tracked for removal.
 #[derive(Debug, Clone)]
-pub(crate) struct Extra(pub Arc<dyn DynProtocolHandler>);
+pub(crate) struct Extra {
+    pub handler: Arc<dyn DynProtocolHandler>,
+    pub conns: Arc<ExtraConns>,
+}
 
 impl ProtocolHandler for Extra {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        self.0.accept(conn).await
+        self.conns.track(conn.clone());
+        self.handler.accept(conn).await
     }
 
     async fn shutdown(&self) {
-        self.0.shutdown().await
+        self.handler.shutdown().await
     }
 }
 

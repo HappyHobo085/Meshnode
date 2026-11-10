@@ -58,7 +58,7 @@ impl StaticSite {
         };
         let Some(hash) = self.files.get(&key) else {
             if !dir && self.is_dir(&key) {
-                return redirect(raw, req.uri().query());
+                return redirect(&key, req.uri().query());
             }
             return plain(StatusCode::NOT_FOUND, "Not found");
         };
@@ -153,9 +153,22 @@ fn decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// `301` to the slashed path, keeping the query. `raw` is the request's own (encoded) path.
-fn redirect(raw: &str, query: Option<&str>) -> Response<Bytes> {
-    let mut to = format!("{raw}/");
+/// `301` to the slashed path, keeping the query. The target is built from the normalised
+/// (decoded) `key`, each segment re-encoded, so it is always a single-slash absolute path
+/// (a request path of `//docs` must not become the protocol-relative `//docs/`).
+fn redirect(key: &str, query: Option<&str>) -> Response<Bytes> {
+    let mut to = String::new();
+    for seg in key.split('/') {
+        to.push('/');
+        for b in seg.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                to.push(char::from(b));
+            } else {
+                to.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    to.push('/');
     if let Some(q) = query {
         to.push('?');
         to.push_str(q);

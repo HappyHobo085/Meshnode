@@ -26,6 +26,7 @@ fn write_site(dir: &std::path::Path) {
         ("notes.txt", b"hi"),
         ("blob.bin", b"\x00\x01"),
         ("empty/readme.txt", b"r"),
+        ("we ird%/x.txt", b"w"),
     ];
     for (name, data) in files {
         let p = dir.join(name);
@@ -118,6 +119,15 @@ async fn static_site_index_etag_304_404_traversal_405_redirect() {
     let r = req(s, Method::GET, "/img?v=1&a=b", &[]).await;
     assert_eq!(r.status(), 301);
     assert_eq!(hdr(&r, "location"), Some("/img/?v=1&a=b"));
+    // The target is rebuilt from the normalised path: never protocol-relative.
+    let r = req(s, Method::GET, "//docs", &[]).await;
+    assert_eq!(r.status(), 301);
+    assert_eq!(hdr(&r, "location"), Some("/docs/"));
+    let r = req(s, Method::GET, "/we%20ird%25?q=1", &[]).await;
+    assert_eq!(r.status(), 301);
+    assert_eq!(hdr(&r, "location"), Some("/we%20ird%25/?q=1"));
+    let r = req(s, Method::GET, "/we%20ird%25/x.txt", &[]).await;
+    assert_eq!(r.body().as_ref(), b"w");
     // A directory with no index file is a 404.
     assert_eq!(req(s, Method::GET, "/empty/", &[]).await.status(), 404);
 

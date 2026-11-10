@@ -2229,6 +2229,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-admin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures-util",
+ "libc",
+ "mesh-core",
+ "mesh-proto",
+ "mesh-services",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "mesh-core"
 version = "0.1.0"
 dependencies = [

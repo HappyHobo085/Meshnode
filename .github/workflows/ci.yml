@@ -41,10 +41,15 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            apps/android/src-tauri
       - run: rustup target add aarch64-linux-android
       - run: cargo install cargo-ndk --locked
       - run: cargo ndk -t arm64-v8a build -p mesh-store
@@ -83,6 +88,8 @@ jobs:
       - run: cargo install cargo-ndk --locked
       # The committed UniFFI Kotlin bindings must match mesh-ffi's interface.
       - name: Bindings are up to date
+        env:
+          UNIFFI_NO_FORMAT: "1"
         run: |
           apps/android/gen-bindings.sh
           git diff --exit-code -- apps/android/src-tauri/gen/android/app/src/main/java/net/meshnode/ffi/mesh_ffi.kt

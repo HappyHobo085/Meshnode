@@ -33,8 +33,9 @@ if [ ! -f "$lib" ]; then
 fi
 
 # ktlint formats the output when it is installed; otherwise keep it unformatted.
+# UNIFFI_NO_FORMAT=1 forces unformatted output (CI, so a ktlint on the runner cannot cause drift).
 format=(--no-format)
-if command -v ktlint >/dev/null 2>&1; then
+if [ "${UNIFFI_NO_FORMAT:-}" != 1 ] && command -v ktlint >/dev/null 2>&1; then
     format=()
 fi
 

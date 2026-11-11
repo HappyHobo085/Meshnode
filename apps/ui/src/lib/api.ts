@@ -5,7 +5,12 @@
 // keys of `invoke`'s argument object in camelCase (`ttl_s` -> `ttlS`, `id_hex` -> `idHex`,
 // `stream_id` -> `streamId`, `on_event` -> `onEvent`). The command names stay snake_case.
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { Format, scan } from "@tauri-apps/plugin-barcode-scanner";
+import {
+  Format,
+  checkPermissions,
+  requestPermissions,
+  scan,
+} from "@tauri-apps/plugin-barcode-scanner";
 import type { ConfigEntry } from "./generated/ConfigEntry";
 import type { ConfigSetDto } from "./generated/ConfigSetDto";
 import type { ConnectionDto } from "./generated/ConnectionDto";
@@ -239,9 +244,23 @@ export const api = {
         opts,
         progress: progressChannel(onProgress),
       }),
-    /** Scan one QR code with the camera; resolves with its text. */
+    /**
+     * Scan one QR code with the camera; resolves with its text. The plugin's `scan` fails
+     * without the camera permission (it does not ask), so this asks first; a refusal is an
+     * `io` error telling the user to paste the invite.
+     */
     scan: async (): Promise<string> => {
       try {
+        let camera = await checkPermissions();
+        if (camera !== "granted") camera = await requestPermissions();
+        if (camera !== "granted") {
+          throw {
+            code: "io",
+            message: "Camera access is off — paste the invite instead",
+            hint: null,
+            reason: null,
+          } satisfies UiError;
+        }
         const result = await scan({ formats: [Format.QRCode] });
         return result.content;
       } catch (e) {

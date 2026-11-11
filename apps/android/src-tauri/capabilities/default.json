@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "default",
-  "description": "The main window: the app's commands only (the shared mesh-ui commands and the Android ones) and the barcode scanner's scan and camera-permission commands (QR scan on Join). No core permission is needed: the page uses no core plugin (window, event, path, ...). The folder picker plugin is called from Rust only, never from JS.",
+  "description": "The main window: the app's commands only (the shared mesh-ui commands and the Android ones) and the three barcode scanner commands the page calls on Join: check and request the camera permission, then scan. The plugin's scan does not ask for the camera itself. No core permission is needed: the page uses no core plugin (window, event, path, ...). The folder picker plugin is called from Rust only, never from JS.",
   "windows": [
     "main"
   ],
@@ -37,7 +37,6 @@
     "allow-pick-wasm",
     "allow-deploy-static-tree",
     "barcode-scanner:allow-scan",
-    "barcode-scanner:allow-cancel",
     "barcode-scanner:allow-check-permissions",
     "barcode-scanner:allow-request-permissions"
   ]

@@ -10,16 +10,22 @@ const core = vi.hoisted(() => {
   return { invoke: vi.fn(), Channel };
 });
 vi.mock("@tauri-apps/api/core", () => core);
-vi.mock("@tauri-apps/plugin-barcode-scanner", () => ({
-  scan: vi.fn().mockResolvedValue({ content: "mesh1ticket", format: "QR_CODE" }),
+const scanner = vi.hoisted(() => ({
+  scan: vi.fn(),
+  checkPermissions: vi.fn(),
+  requestPermissions: vi.fn(),
   Format: { QRCode: "QR_CODE" },
 }));
+vi.mock("@tauri-apps/plugin-barcode-scanner", () => scanner);
 
 import { api } from "./api";
 
 // A block body: a function returned from beforeEach would run as teardown.
 beforeEach(() => {
   core.invoke.mockReset();
+  scanner.scan.mockReset().mockResolvedValue({ content: "mesh1ticket", format: "QR_CODE" });
+  scanner.checkPermissions.mockReset().mockResolvedValue("granted");
+  scanner.requestPermissions.mockReset().mockResolvedValue("granted");
 });
 
 describe("api", () => {
@@ -101,5 +107,29 @@ describe("api", () => {
 
   it("android_scan_returns_the_content", async () => {
     await expect(api.android.scan()).resolves.toBe("mesh1ticket");
+    expect(scanner.scan).toHaveBeenCalledWith({ formats: ["QR_CODE"] });
+    // Already granted: no prompt.
+    expect(scanner.requestPermissions).not.toHaveBeenCalled();
+  });
+
+  // The Android plugin's `scan` does not ask for the camera (it fails without it), so the
+  // page asks first.
+  it("android_scan_asks_for_the_camera_first", async () => {
+    scanner.checkPermissions.mockResolvedValue("prompt");
+    await expect(api.android.scan()).resolves.toBe("mesh1ticket");
+    expect(scanner.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(scanner.requestPermissions.mock.invocationCallOrder[0]).toBeLessThan(
+      scanner.scan.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it("android_scan_denied_says_to_paste", async () => {
+    scanner.checkPermissions.mockResolvedValue("denied");
+    scanner.requestPermissions.mockResolvedValue("denied");
+    await expect(api.android.scan()).rejects.toMatchObject({
+      code: "io",
+      message: "Camera access is off — paste the invite instead",
+    });
+    expect(scanner.scan).not.toHaveBeenCalled();
   });
 });

@@ -17,6 +17,7 @@ vi.mock("../lib/api", async (importOriginal) => ({
   api,
 }));
 
+import { deployState, resetDeployForTests, startDeploy } from "../lib/deploy";
 import { members, services, status, toasts } from "../lib/stores";
 import Deploy from "./Deploy.svelte";
 
@@ -32,6 +33,8 @@ beforeEach(() => {
   status.set(running());
   members.set([DESK]);
   services.set([]);
+  toasts.set([]);
+  resetDeployForTests();
 });
 
 function open(onclose = vi.fn()) {
@@ -193,22 +196,78 @@ it("deploy_name_follows_the_daemon_rules", async () => {
   expect(screen.queryByRole("radio", { name: "All hosts" })).toBeNull();
 });
 
-it("deploy_closed_while_running_ends_with_a_toast_not_a_stale_screen", async () => {
+/** Picks C:/Sites/blog and presses Deploy; the upload stays pending until `finish`. */
+async function startBlog() {
   api.desktop.pickFolder.mockResolvedValue("C:/Sites/blog");
-  let finish: (s: unknown) => void = () => {};
-  api.desktop.deployStaticDir.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+  const done: { finish: (s: unknown) => void; fail: (e: unknown) => void } = {
+    finish: () => {},
+    fail: () => {},
+  };
+  api.desktop.deployStaticDir.mockReturnValue(
+    new Promise((resolve, reject) => {
+      done.finish = resolve;
+      done.fail = reject;
+    }),
+  );
   const view = render(Deploy, { open: true, onclose: vi.fn() });
   await fireEvent.click(await screen.findByRole("button", { name: /site folder/i }));
   await fireEvent.click(await screen.findByRole("button", { name: "Next" }));
   await fireEvent.click(screen.getByRole("button", { name: "Deploy blog" }));
   expect(await screen.findByRole("progressbar")).toBeInTheDocument();
+  return { view, done };
+}
 
-  // Closed and opened again: a fresh start, which the old deploy must not take over.
+it("deploy_reopened_while_sending_shows_it_and_cannot_start_another", async () => {
+  const { view, done } = await startBlog();
+
   await view.rerender({ open: false, onclose: vi.fn() });
   await view.rerender({ open: true, onclose: vi.fn() });
-  expect(await screen.findByRole("button", { name: /site folder/i })).toBeInTheDocument();
-  finish(service({ name: "blog" }));
+  // The running deploy, not a fresh first step that could start a second one.
+  expect(await screen.findByRole("progressbar", { name: "Deploying blog" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /site folder/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: /^Deploy / })).toBeNull();
+  // Nor can anything else start one meanwhile.
+  expect(
+    startDeploy({
+      name: "blog",
+      kind: "static",
+      path: "C:/Sites/blog",
+      opts: { limits: DEFAULT_LIMITS, placement: { kind: "allHosts" }, outbound: [] },
+      platform: "desktop-windows",
+    }),
+  ).toBe(false);
+  expect(api.desktop.deployStaticDir).toHaveBeenCalledTimes(1);
+
+  done.finish(service({ name: "blog" }));
+  // The sheet is open, so it says so itself.
+  expect(await screen.findByRole("heading", { name: "blog is deployed" })).toBeInTheDocument();
+});
+
+it("deploy_closed_while_sending_ends_with_a_toast", async () => {
+  const { view, done } = await startBlog();
+  await view.rerender({ open: false, onclose: vi.fn() });
+  done.finish(service({ name: "blog" }));
   await vi.waitFor(() => expect(get(toasts).map((t) => t.message)).toContain("Deployed blog"));
-  expect(screen.queryByRole("heading", { name: "blog is deployed" })).toBeNull();
-  expect(screen.getByRole("button", { name: /site folder/i })).toBeInTheDocument();
+  expect(get(deployState)).toBeNull();
+});
+
+it("deploy_fail_after_close_shows_in_the_reopened_sheet", async () => {
+  const { view, done } = await startBlog();
+  await view.rerender({ open: false, onclose: vi.fn() });
+  done.fail({
+    code: "invalidArgument",
+    message: "file too large: C:/Sites/blog/big.bin",
+    hint: "Leave large files out of the site folder.",
+    reason: null,
+  });
+  await vi.waitFor(() => expect(get(deployState)?.status).toBe("failed"));
+  expect(get(toasts)).toEqual([]);
+
+  await view.rerender({ open: true, onclose: vi.fn() });
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("Couldn't deploy blog");
+  expect(alert).toHaveTextContent("big.bin");
+  expect(alert).toHaveTextContent("Leave large files out of the site folder.");
+  // Back on its placement step, ready to try again.
+  expect(screen.getByRole("button", { name: "Deploy blog" })).toBeEnabled();
 });

@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
+  import { get } from "svelte/store";
   import {
     api,
     toUiError,
@@ -24,7 +25,8 @@
     placementReady,
     validServiceName,
   } from "../lib/service";
-  import { members, refreshNow, services, toast } from "../lib/stores";
+  import { deployState, dismissDeploy, startDeploy, watchDeploy } from "../lib/deploy";
+  import { members, services } from "../lib/stores";
   import PlacementEditor from "./PlacementEditor.svelte";
 
   interface Props {
@@ -34,7 +36,8 @@
   let { open, onclose }: Props = $props();
 
   type Kind = ServiceDto["kind"];
-  type Step = "source" | "name" | "placement" | "sending" | "done";
+  type Step = "source" | "name" | "placement";
+  type View = Step | "sending" | "done";
   const STEPS: { step: Step; label: string }[] = [
     { step: "source", label: "Choose" },
     { step: "name", label: "Name" },
@@ -58,31 +61,54 @@
   let placement = $state<PlacementDto>({ kind: "allHosts" });
   let placementTouched = $state(false);
   let picking = $state<Kind | null>(null);
-  let sent = $state(0);
-  let error = $state<UiError | null>(null);
-  /** Each deploy's id, so a late progress report from an earlier one is ignored. */
-  let run = 0;
+  let pickError = $state<UiError | null>(null);
+
+  // The deploy itself lives in a store (lib/deploy.ts), so closing this sheet or leaving the
+  // screen never loses it: a running deploy shows here whenever the sheet is open.
+  const current = $derived($deployState);
+  const view: View = $derived(
+    current?.status === "sending" ? "sending" : current?.status === "done" ? "done" : step,
+  );
+  const failure = $derived(current?.status === "failed" ? (current.error ?? null) : null);
 
   const existing = $derived($services.find((s) => s.name === name.trim()) ?? null);
   const hosts = $derived(hostMembers($members));
-  const stepIndex = $derived(STEPS.findIndex((s) => s.step === step));
+  const stepIndex = $derived(STEPS.findIndex((s) => s.step === view));
 
-  /** Back to the first step; a deploy still running finishes on its own (see `deploy`). */
   function reset() {
-    run++;
     step = "source";
     source = null;
     name = "";
     nameError = null;
     placement = { kind: "allHosts" };
     placementTouched = false;
-    sent = 0;
-    error = null;
+    pickError = null;
   }
 
-  // Every opening starts at the first step.
+  /** A failed deploy comes back as its placement step, with the error, ready to retry. */
+  function adopt() {
+    const d = get(deployState);
+    if (d?.status !== "failed") return;
+    source = { kind: d.kind, path: d.path };
+    name = d.name;
+    placement = d.opts.placement;
+    placementTouched = true;
+    step = "placement";
+  }
+
+  // Every opening starts at the first step, unless a failure is waiting to be seen.
   $effect(() => {
-    if (open) reset();
+    if (!open) return;
+    untrack(() => {
+      reset();
+      adopt();
+    });
+    return watchDeploy();
+  });
+
+  // A deploy that fails while the sheet is open lands back on its placement step.
+  $effect(() => {
+    if (open && $deployState?.status === "failed") untrack(adopt);
   });
 
   async function focus(id: string) {
@@ -92,7 +118,7 @@
 
   async function pick(kind: Kind) {
     picking = kind;
-    error = null;
+    pickError = null;
     try {
       const p = platform ?? (await platformReady);
       let path: string | null;
@@ -111,7 +137,7 @@
       void focus(nameId);
     } catch (e) {
       const err = toUiError(e);
-      if (err.code !== "pickerCancelled" && err.code !== "cancelled") error = err;
+      if (err.code !== "pickerCancelled" && err.code !== "cancelled") pickError = err;
     } finally {
       picking = null;
     }
@@ -133,45 +159,31 @@
 
   async function deploy() {
     if (!source) return;
-    const id = ++run;
-    const { kind, path } = source;
-    const target = name;
     const opts: DeployOptsDto = {
       // Redeploying keeps the service's limits and outbound list (edited in its detail).
       limits: existing?.limits ?? DEFAULT_LIMITS,
       placement,
       outbound: existing?.outbound ?? [],
     };
-    const onProgress = (n: number) => {
-      if (id === run) sent = n;
-    };
-    sent = 0;
-    error = null;
-    step = "sending";
-    try {
-      const p = platform ?? (await platformReady);
-      if (kind === "wasm") {
-        await api.deployWasmFile(path, target, opts);
-      } else if (p === "android") {
-        await api.android.deployStaticTree(path, target, opts, onProgress);
-      } else {
-        await api.desktop.deployStaticDir(path, target, opts, onProgress);
-      }
-      await refreshNow();
-      // Closed (or started over) while it ran: the sheet can't say so, a toast does.
-      if (id !== run || !open) toast(`Deployed ${target}`);
-      if (id === run) step = "done";
-    } catch (e) {
-      if (id !== run) return;
-      error = toUiError(e);
-      step = "placement";
-    }
+    const p = platform ?? (await platformReady);
+    // Refused while another deploy is sending (the sheet shows that one instead).
+    startDeploy({ name, kind: source.kind, path: source.path, opts, platform: p });
   }
 
-  const another = reset;
+  /** Start again from the first step, forgetting a finished deploy. */
+  function another() {
+    dismissDeploy();
+    reset();
+  }
+
+  function close() {
+    // "Done" has been seen; a failure stays (the Services list keeps showing it).
+    if (get(deployState)?.status === "done") dismissDeploy();
+    onclose();
+  }
 </script>
 
-<Sheet {open} title="Deploy a service" wide {onclose}>
+<Sheet {open} title="Deploy a service" wide onclose={close}>
   <div class="deploy">
     {#if stepIndex >= 0}
       <ol class="steps" aria-label="Steps">
@@ -189,7 +201,7 @@
       </ol>
     {/if}
 
-    {#if source && (step === "name" || step === "placement")}
+    {#if source && (view === "name" || view === "placement")}
       <div class="picked">
         <Icon name={source.kind === "static" ? "folder" : "file"} size={18} />
         <span class="picked-path mono truncate" title={source.path}>{displayPath(source.path)}</span
@@ -198,7 +210,7 @@
       </div>
     {/if}
 
-    {#if step === "source"}
+    {#if view === "source"}
       <div class="sources">
         <button
           type="button"
@@ -223,12 +235,12 @@
           <span class="source-help">A program that answers HTTP requests.</span>
         </button>
       </div>
-      {#if error}
+      {#if pickError}
         <p class="error" role="alert">
-          {error.message}{#if error.hint}<span class="hint">{error.hint}</span>{/if}
+          {pickError.message}{#if pickError.hint}<span class="hint">{pickError.hint}</span>{/if}
         </p>
       {/if}
-    {:else if step === "name"}
+    {:else if view === "name"}
       <form class="form" onsubmit={toPlacement} novalidate>
         <Field
           id={nameId}
@@ -248,7 +260,7 @@
           <Button variant="primary" type="submit">Next</Button>
         </div>
       </form>
-    {:else if step === "placement"}
+    {:else if view === "placement"}
       <div class="form">
         <div class="where">
           <h3>Where should <span class="mono">{name}</span> run?</h3>
@@ -262,11 +274,11 @@
             service={name}
           />
         </div>
-        {#if error}
+        {#if failure}
           <div class="failed" role="alert">
             <strong>Couldn't deploy {name}</strong>
-            <span class="failed-msg">{error.message}</span>
-            {#if error.hint}<span class="hint">{error.hint}</span>{/if}
+            <span class="failed-msg">{failure.message}</span>
+            {#if failure.hint}<span class="hint">{failure.hint}</span>{/if}
           </div>
         {/if}
         <div class="actions">
@@ -276,22 +288,24 @@
           </Button>
         </div>
       </div>
-    {:else if step === "sending" && source}
+    {:else if view === "sending" && current}
+      {@const progress =
+        current.kind === "static" ? `${bytes(current.bytes)} read` : "Sending the module"}
       <div class="sending" aria-live="polite">
-        <h3>Deploying <span class="mono">{name}</span></h3>
+        <h3>Deploying <span class="mono">{current.name}</span></h3>
         <div
           class="bar"
           role="progressbar"
-          aria-label="Deploying {name}"
-          aria-valuetext={source.kind === "static" ? `${bytes(sent)} read` : "Sending the module"}
+          aria-label="Deploying {current.name}"
+          aria-valuetext={progress}
         >
           <span class="bar-fill"></span>
         </div>
-        <p class="progress-text num">
-          {source.kind === "static" ? `${bytes(sent)} read` : "Sending the module"}
-        </p>
+        <p class="progress-text num">{progress}</p>
+        <p class="note">You can close this. It keeps going, and Services shows how it ends.</p>
       </div>
-    {:else if step === "done"}
+    {:else if view === "done" && current}
+      {@const name = current.name}
       <div class="done">
         <span class="tick"><Icon name="check" size={24} /></span>
         <h3>{name} is deployed</h3>
@@ -299,7 +313,7 @@
         <div class="actions">
           <Button variant="ghost" onclick={another}>Deploy another</Button>
           <a class="open" href={hrefOf({ name: "service", params: { name } })}>Open {name}</a>
-          <Button variant="primary" onclick={onclose}>Done</Button>
+          <Button variant="primary" onclick={close}>Done</Button>
         </div>
       </div>
     {/if}
@@ -529,6 +543,10 @@
       opacity: 0.45;
       animation: none;
     }
+  }
+  .note {
+    color: var(--ink-3);
+    font-size: var(--fs-sm);
   }
   .progress-text {
     color: var(--ink-2);

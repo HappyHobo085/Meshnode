@@ -5,6 +5,7 @@
   import { bytes } from "../lib/format";
   import { hrefOf, navigate } from "../lib/router";
   import { hostsOf, kindOf, listNames, localState } from "../lib/service";
+  import { deployState, dismissDeploy } from "../lib/deploy";
   import { members, services } from "../lib/stores";
   import Deploy from "./Deploy.svelte";
   import ServiceDetail from "./ServiceDetail.svelte";
@@ -56,6 +57,32 @@
       <Icon name="upload" size={18} />Deploy
     </Button>
   </header>
+
+  <!-- The deploy outlives its sheet: how it is going, or how it failed, stays in view here. -->
+  {#if $deployState?.status === "sending" && !deploying}
+    <div class="deploy-note" role="status">
+      <span class="note-spinner" aria-hidden="true"></span>
+      <p>
+        Deploying <strong class="mono">{$deployState.name}</strong><span class="num"
+          >{$deployState.kind === "static" ? `, ${bytes($deployState.bytes)} read` : ""}</span
+        >
+      </p>
+      <Button size="sm" variant="ghost" onclick={() => navigate({ name: "deploy" })}>Show</Button>
+    </div>
+  {:else if $deployState?.status === "failed" && $deployState.error && !deploying}
+    <div class="deploy-note failed" role="alert">
+      <span class="note-icon"><Icon name="alert" size={18} /></span>
+      <div class="note-text">
+        <strong>Couldn't deploy <span class="mono">{$deployState.name}</span></strong>
+        <span class="note-msg">{$deployState.error.message}</span>
+        {#if $deployState.error.hint}<span class="note-hint">{$deployState.error.hint}</span>{/if}
+      </div>
+      <div class="note-actions">
+        <Button size="sm" onclick={() => navigate({ name: "deploy" })}>Try again</Button>
+        <Button size="sm" variant="ghost" onclick={dismissDeploy}>Dismiss</Button>
+      </div>
+    </div>
+  {/if}
 
   {#if rows.length === 0}
     <section class="empty">
@@ -132,6 +159,82 @@
     margin-top: var(--s-1);
     color: var(--ink-3);
     font-size: var(--fs-sm);
+  }
+
+  .deploy-note {
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-3) var(--s-4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    font-size: var(--fs-sm);
+  }
+  .deploy-note > p {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+  }
+  .deploy-note strong {
+    color: var(--ink);
+    font-weight: var(--fw-semibold);
+  }
+  .deploy-note.failed {
+    align-items: flex-start;
+    border-color: transparent;
+    background: var(--danger-soft);
+  }
+  .note-spinner {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--signal);
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: note-spin 800ms linear infinite;
+  }
+  @keyframes note-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .note-icon {
+    display: grid;
+    flex: none;
+    padding-top: 1px;
+    color: var(--danger);
+  }
+  .note-text {
+    display: grid;
+    flex: 1;
+    gap: 2px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .failed .note-text strong {
+    color: var(--danger);
+  }
+  .note-msg {
+    color: var(--ink);
+  }
+  .note-hint {
+    color: var(--ink-2);
+  }
+  .note-actions {
+    display: flex;
+    flex: none;
+    gap: var(--s-2);
+  }
+  @media (max-width: 639px) {
+    .deploy-note.failed {
+      flex-wrap: wrap;
+    }
+    .note-actions {
+      width: 100%;
+      justify-content: flex-end;
+    }
   }
 
   .empty {

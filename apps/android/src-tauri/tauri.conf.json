@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "identifier": "net.meshnode.app",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": "../../ui/dist",
+    "beforeBuildCommand": "npm --prefix ../ui run build"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",

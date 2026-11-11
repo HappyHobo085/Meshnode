@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-power-policy-set"
+description = "Enables the power_policy_set command without any pre-configured scope."
+commands.allow = ["power_policy_set"]
+
+[[permission]]
+identifier = "deny-power-policy-set"
+description = "Denies the power_policy_set command without any pre-configured scope."
+commands.deny = ["power_policy_set"]

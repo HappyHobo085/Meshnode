@@ -11,3 +11,4 @@ apps/android/src-tauri/gen/android/**/build/
 apps/android/src-tauri/gen/android/.gradle/
 apps/android/src-tauri/target/
 apps/android/src-tauri/gen/android/.kotlin/
+/crates/mesh-ui/bindings/

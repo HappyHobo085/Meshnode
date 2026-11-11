@@ -12,6 +12,7 @@
   import FirstRun from "./routes/FirstRun.svelte";
   import Home from "./routes/Home.svelte";
   import Join from "./routes/Join.svelte";
+  import Services from "./routes/Services.svelte";
 
   interface NavItem {
     label: string;
@@ -112,6 +113,12 @@
         <Join />
       {:else if $route.name === "first-run"}
         <FirstRun />
+      {:else if $route.name === "services" || $route.name === "service" || $route.name === "deploy"}
+        <!-- One Services screen: the detail and deploy sheets open over its list. -->
+        <Services
+          detail={$route.name === "service" ? $route.params.name : null}
+          deploying={$route.name === "deploy"}
+        />
       {:else}
         <!-- The remaining screens arrive in the next tasks. -->
         <section class="placeholder" data-route={$route.name} data-platform={platform}>

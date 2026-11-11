@@ -73,6 +73,9 @@ const TINTED: [string, string][] = [
   ["ink-2", "signal-soft"], // selected role tile description
   ["danger", "danger-soft"], // Join error
   ["ink-2", "danger-soft"], // Join error hint
+  ["ok", "ok-soft"], // service state "Running here"
+  ["warn", "warn-soft"], // service state "Downloading here"
+  ["ink-2", "surface-2"], // service kind tile, outbound entries
 ];
 
 describe.each(THEMES)("%s theme", (_name, i) => {

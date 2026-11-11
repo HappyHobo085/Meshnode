@@ -115,6 +115,29 @@ fn dir_source_empty_folder_refused() {
 }
 
 #[test]
+fn dir_source_io_errors_name_the_folder_or_file() {
+    // A folder that can't be read (here: gone) is named.
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("no-such-folder");
+    let e = DirSource::new(missing.clone()).list().unwrap_err();
+    assert_eq!(e.code, UiErrorCode::Io);
+    assert!(
+        e.message.contains(&missing.display().to_string()),
+        "{}",
+        e.message
+    );
+    // A listed file that can't be read (here: removed after the listing) is named.
+    std::fs::create_dir_all(dir.path().join("site/css")).unwrap();
+    std::fs::write(dir.path().join("site/css/app.css"), "a{}").unwrap();
+    let mut s = DirSource::new(dir.path().join("site"));
+    s.list().unwrap();
+    std::fs::remove_file(dir.path().join("site/css/app.css")).unwrap();
+    let e = s.read("css/app.css").unwrap_err();
+    assert_eq!(e.code, UiErrorCode::Io);
+    assert!(e.message.contains("app.css"), "{}", e.message);
+}
+
+#[test]
 fn dir_source_oversize_names_file() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("big")).unwrap();

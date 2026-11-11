@@ -28,8 +28,8 @@ impl DirSource {
     }
 
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<FileMeta>) -> Result<(), UiError> {
-        for entry in fs::read_dir(dir).map_err(io_err)? {
-            let entry = entry.map_err(io_err)?;
+        for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+            let entry = entry.map_err(|e| io_err(dir, e))?;
             let name = entry.file_name();
             let name = name.to_str().ok_or_else(|| {
                 UiError::invalid(format!(
@@ -41,7 +41,7 @@ impl DirSource {
                 continue;
             }
             // `file_type` does not follow symlinks.
-            let ft = entry.file_type().map_err(io_err)?;
+            let ft = entry.file_type().map_err(|e| io_err(&entry.path(), e))?;
             if ft.is_symlink() {
                 continue;
             }
@@ -58,7 +58,10 @@ impl DirSource {
                         "The folder has more than {MAX_UPLOAD_FILES} files"
                     )));
                 }
-                let size = entry.metadata().map_err(io_err)?.len();
+                let size = entry
+                    .metadata()
+                    .map_err(|e| io_err(&entry.path(), e))?
+                    .len();
                 out.push(FileMeta { path: rel, size });
             }
         }
@@ -135,8 +138,12 @@ pub fn read_sized(
     Ok(out)
 }
 
-fn io_err(e: std::io::Error) -> UiError {
-    UiError::new(UiErrorCode::Io, e.to_string())
+/// An I/O failure on `path` (a folder or file of the deploy), naming it.
+fn io_err(path: &Path, e: std::io::Error) -> UiError {
+    UiError::new(
+        UiErrorCode::Io,
+        format!("Couldn't read {}: {e}", path.display()),
+    )
 }
 
 impl FileSource for DirSource {
@@ -154,6 +161,6 @@ impl FileSource for DirSource {
             }
             full.push(seg);
         }
-        fs::read(&full).map_err(io_err)
+        fs::read(&full).map_err(|e| io_err(&full, e))
     }
 }

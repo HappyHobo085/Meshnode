@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, type Platform } from "./lib/api";
+  import { takeOtherNodeNotice } from "./lib/connection";
   import Banner from "./lib/design/Banner.svelte";
   import Icon, { type IconName } from "./lib/design/Icon.svelte";
   import Monogram from "./lib/design/Monogram.svelte";
@@ -12,7 +13,11 @@
   import FirstRun from "./routes/FirstRun.svelte";
   import Home from "./routes/Home.svelte";
   import Join from "./routes/Join.svelte";
+  import Logs from "./routes/Logs.svelte";
+  import NoDaemon from "./routes/NoDaemon.svelte";
+  import NodeStopped from "./routes/NodeStopped.svelte";
   import Services from "./routes/Services.svelte";
+  import Settings from "./routes/Settings.svelte";
 
   interface NavItem {
     label: string;
@@ -51,6 +56,24 @@
     }
   });
 
+  // No daemon (desktop) and a stopped node (Android) each have their own screen with the
+  // way out; those screens return Home once a poll succeeds.
+  $effect(() => {
+    const name = $route.name;
+    const kind = $banner?.kind;
+    if (!platform) return;
+    if (platform !== "android" && kind === "unreachable" && name !== "no-daemon") {
+      navigate({ name: "no-daemon" }, { replace: true });
+    } else if (platform === "android" && kind === "stopped" && name !== "stopped") {
+      navigate({ name: "stopped" }, { replace: true });
+    }
+  });
+  /** The full-window screens explain the problem themselves; the banner would repeat it. */
+  const showBanner = $derived($route.name !== "no-daemon" && $route.name !== "stopped");
+
+  /** One-time notice: the service answers, and a separate per-user node runs too. */
+  let otherNode = $state(false);
+
   onMount(() => {
     const stopTheme = applyTheme();
     const stopPoller = startPoller();
@@ -59,6 +82,12 @@
       .then((p) => {
         platform = p;
         document.documentElement.dataset.platform = p;
+        if (p !== "android") {
+          api.desktop
+            .connection()
+            .then((c) => (otherNode = takeOtherNodeNotice(c)))
+            .catch(() => {});
+        }
       })
       .catch(() => {
         platform = null;
@@ -103,7 +132,17 @@
   {/if}
 
   <div class="main">
-    <Banner state={$banner} />
+    {#if showBanner}<Banner state={$banner} />{/if}
+    {#if otherNode}
+      <div class="notice" role="status">
+        <Icon name="info" size={18} />
+        <p>
+          A second, separate node is running as you on this computer. This app shows the system
+          service; Settings says which one is connected.
+        </p>
+        <button type="button" class="dismiss" onclick={() => (otherNode = false)}>Dismiss</button>
+      </div>
+    {/if}
     <main id="content" tabindex="-1">
       {#if $route.name === "home"}
         <Home />
@@ -119,11 +158,14 @@
           detail={$route.name === "service" ? $route.params.name : null}
           deploying={$route.name === "deploy"}
         />
-      {:else}
-        <!-- The remaining screens arrive in the next tasks. -->
-        <section class="placeholder" data-route={$route.name} data-platform={platform}>
-          <h1>{NAV.find((n) => n.match.includes($route.name))?.label ?? $route.name}</h1>
-        </section>
+      {:else if $route.name === "settings"}
+        <Settings />
+      {:else if $route.name === "logs"}
+        <Logs />
+      {:else if $route.name === "no-daemon"}
+        <NoDaemon />
+      {:else if $route.name === "stopped"}
+        <NodeStopped />
       {/if}
     </main>
   </div>
@@ -242,6 +284,44 @@
   .self-sub {
     font-size: var(--fs-xs);
     color: var(--ink-3);
+  }
+
+  .notice {
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-3) var(--s-4);
+    border-bottom: 1px solid var(--line);
+    background: var(--signal-soft);
+    color: var(--ink);
+    font-size: var(--fs-sm);
+  }
+  .notice > :global(.icon) {
+    flex: none;
+    color: var(--signal);
+  }
+  .notice p {
+    flex: 1;
+    min-width: 0;
+  }
+  .dismiss {
+    flex: none;
+    min-height: 34px;
+    padding: 0 var(--s-3);
+    border: 0;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--signal);
+    font-weight: var(--fw-medium);
+    cursor: pointer;
+  }
+  .dismiss:hover {
+    background: var(--surface-2);
+  }
+  @media (pointer: coarse) {
+    .dismiss {
+      min-height: var(--touch);
+    }
   }
 
   .main {

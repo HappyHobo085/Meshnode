@@ -16,3 +16,13 @@ if (typeof Element.prototype.animate !== "function") {
     return animation as unknown as Animation;
   };
 }
+
+// jsdom has no ResizeObserver, which `bind:clientHeight` uses. It never lays out, so a stub
+// that observes nothing is faithful: sizes stay 0.
+if (typeof globalThis.ResizeObserver !== "function") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+}

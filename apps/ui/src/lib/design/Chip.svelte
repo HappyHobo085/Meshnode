@@ -84,6 +84,16 @@
     .toggle {
       height: var(--touch);
     }
+    /* The remove button grows to the touch target; its chip grows with it. */
+    .remove {
+      width: var(--touch);
+      min-height: var(--touch);
+      margin: 0 calc(var(--s-3) * -1) 0 calc(var(--s-1) * -1);
+      border-radius: var(--r-pill);
+    }
+    .chip:has(.remove) {
+      height: var(--touch);
+    }
   }
   .remove {
     display: inline-grid;

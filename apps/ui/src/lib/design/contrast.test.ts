@@ -77,6 +77,10 @@ const TINTED: [string, string][] = [
   ["ok", "ok-soft"], // service state "Running here"
   ["warn", "warn-soft"], // service state "Downloading here"
   ["ink-2", "surface-2"], // service kind tile, outbound entries
+  ["ink", "warn-soft"], // log search highlight, "Disconnected" strip
+  ["ink-2", "warn-soft"], // "Restart Meshnode to apply" note, disconnected detail
+  ["danger", "surface-2"], // failed probe marks' legend, log error level on a hovered row
+  ["warn", "surface-2"], // log warn level on a hovered row
 ];
 
 describe.each(THEMES)("%s theme", (_name, i) => {

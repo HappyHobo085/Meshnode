@@ -9,6 +9,10 @@ import placementEditor from "../../routes/PlacementEditor.svelte?raw";
 import deploy from "../../routes/Deploy.svelte?raw";
 import services from "../../routes/Services.svelte?raw";
 import sheet from "./Sheet.svelte?raw";
+import app from "../../App.svelte?raw";
+import logs from "../../routes/Logs.svelte?raw";
+import settings from "../../routes/Settings.svelte?raw";
+import probeChart from "../../routes/ProbeChart.svelte?raw";
 
 /** The rules inside `@media (pointer: coarse) { … }` blocks of a component's <style>. */
 function coarseRules(source: string): string {
@@ -59,6 +63,15 @@ it.each([
   ["OutboundEditor", ".remove", outboundEditor],
   ["Deploy", ".change", deploy],
   ["Services", ".row", services],
+  ["DeviceCard", ".menu-btn", deviceCard],
+  ["DeviceCard", ".menu-item", deviceCard],
+  ["Logs", ".search", logs],
+  ["Logs", ".jump", logs],
+  ["Settings", ".segment", settings],
+  ["Settings", ".remove-port", settings],
+  ["ProbeChart", ".target", probeChart],
+  ["Chip", ".remove", chip],
+  ["App", ".dismiss", app],
 ])("%s %s meets the touch target on coarse pointers", (_name, selector, source) => {
   const rule = new RegExp(
     selector.replace(".", "\\.") + String.raw`\s*\{[^}]*(min-)?height:\s*var\(--touch\)`,

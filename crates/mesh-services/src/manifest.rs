@@ -2,7 +2,7 @@
 
 use mesh_core::membership::MESH_NS;
 use mesh_core::{NodeError, StoreHandle};
-use mesh_proto::{ServiceManifest, decode_raw};
+use mesh_proto::{ServiceManifest, decode_raw, valid_service_name};
 
 use crate::error::ServicesError;
 
@@ -41,6 +41,23 @@ pub fn data_ns(name: &str, gen_no: u64) -> String {
     }
 }
 
+/// The inverse of [`data_ns`]: `(name, generation)`, or `None` if `ns` is not a service's
+/// data namespace (unambiguous: service names hold no `.`).
+pub(crate) fn split_data_ns(ns: &str) -> Option<(&str, u64)> {
+    let (name, generation) = match ns.split_once('.') {
+        None => (ns, 0),
+        Some((name, text)) => {
+            let g: u64 = text.parse().ok()?;
+            // `data_ns` never writes `.0`, leading zeros or a sign.
+            if g == 0 || g.to_string() != text {
+                return None;
+            }
+            (name, g)
+        }
+    };
+    valid_service_name(name).then_some((name, generation))
+}
+
 /// The current data generation of `name`: the largest set member, 0 if there is none.
 pub async fn current_generation(store: &StoreHandle, name: &str) -> Result<u64, NodeError> {
     let key = gen_key(name);
@@ -71,4 +88,21 @@ pub(crate) async fn read_manifest(
     decode_raw(&raw)
         .map(Some)
         .map_err(|e| ServicesError::InvalidManifest(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{data_ns, split_data_ns};
+
+    #[test]
+    fn split_data_ns_inverts_data_ns() {
+        for (name, g) in [("web", 0), ("web", 1), ("a-b9", 42)] {
+            assert_eq!(split_data_ns(&data_ns(name, g)), Some((name, g)));
+        }
+        for ns in [
+            "_mesh", "web.0", "web.01", "web.+1", "web.x", "web.1.2", "Web", "",
+        ] {
+            assert_eq!(split_data_ns(ns), None, "{ns}");
+        }
+    }
 }

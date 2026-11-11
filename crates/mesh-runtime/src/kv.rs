@@ -1,6 +1,8 @@
-//! The storage behind `meshnode:kv/store`, supplied per request by the embedder.
+//! The storage behind `meshnode:kv/store` and `meshnode:kv/local`, supplied per request by
+//! the embedder.
 
-/// A service's key-value data. `mesh-services` implements it over the replicated store.
+/// A service's key-value data. `mesh-services` implements it over the replicated store
+/// (`store`) and the node-local `svc_local` table (`local`).
 #[async_trait::async_trait]
 pub trait KvBackend: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError>;
@@ -26,6 +28,18 @@ pub trait KvBackend: Send + Sync {
         start_after: Option<&[u8]>,
         limit: u32,
     ) -> Result<Vec<Vec<u8>>, KvError>;
+
+    /// The live node-local value of `key` (`meshnode:kv/local`; never replicated).
+    async fn local_get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError>;
+    /// Sets a node-local value expiring `ttl_ms` from now (0 = never). The inner `Err` is
+    /// a cap breach, returned to the guest; the outer one traps it like any backend error.
+    async fn local_set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> Result<Result<(), String>, KvError>;
+    async fn local_delete(&self, key: &str) -> Result<(), KvError>;
 }
 
 /// Why a KV call failed. The guest sees a trap; the request gets the mapped HTTP status.
@@ -58,12 +72,19 @@ mod mem {
         inner: Mutex<Inner>,
     }
 
+    /// The largest `local` value, as the node's store allows.
+    const LOCAL_MAX_VALUE: usize = 64 * 1024;
+
     #[derive(Default)]
     struct Inner {
         fail: Option<KvError>,
         max_value_len: Option<usize>,
         registers: BTreeMap<String, Register>,
         sets: BTreeMap<String, BTreeSet<Vec<u8>>>,
+        /// `local` entries: key -> (expiry ms, 0 = none; value).
+        local: BTreeMap<String, (u64, Vec<u8>)>,
+        /// The clock `local` expiries are measured with; set by [`MemKv::set_now_ms`].
+        now_ms: u64,
     }
 
     /// `value: None` is a deletion; `order` is set by ordered writes only.
@@ -85,6 +106,11 @@ mod mem {
         /// Makes writes of values longer than `len` bytes return [`KvError::Other`].
         pub fn set_max_value_len(&self, len: Option<usize>) {
             self.with(|i| i.max_value_len = len);
+        }
+
+        /// Sets the "now" that `local` TTLs are measured with (starts at 0).
+        pub fn set_now_ms(&self, now_ms: u64) {
+            self.with(|i| i.now_ms = now_ms);
         }
 
         /// The injected failure, if any.
@@ -210,12 +236,76 @@ mod mem {
                 })
             }))
         }
+
+        async fn local_get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+            self.check()?;
+            Ok(self.with(|i| {
+                i.local
+                    .get(key)
+                    .filter(|(expiry, _)| *expiry == 0 || i.now_ms < *expiry)
+                    .map(|(_, v)| v.clone())
+            }))
+        }
+
+        async fn local_set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl_ms: u64,
+        ) -> Result<Result<(), String>, KvError> {
+            self.check()?;
+            if value.len() > LOCAL_MAX_VALUE {
+                return Ok(Err(format!(
+                    "value of {} bytes exceeds {LOCAL_MAX_VALUE}",
+                    value.len()
+                )));
+            }
+            self.with(|i| {
+                let expiry = match ttl_ms {
+                    0 => 0,
+                    ttl => i.now_ms.saturating_add(ttl),
+                };
+                i.local.insert(key.to_string(), (expiry, value));
+            });
+            Ok(Ok(()))
+        }
+
+        async fn local_delete(&self, key: &str) -> Result<(), KvError> {
+            self.check()?;
+            self.with(|i| i.local.remove(key));
+            Ok(())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{KvBackend, MemKv};
+
+    #[tokio::test]
+    async fn mem_kv_local_ttl_and_isolation() {
+        let kv = MemKv::default();
+        kv.set_now_ms(100);
+        kv.local_set("n", b"1".to_vec(), 50).await.unwrap().unwrap();
+        kv.local_set("f", b"2".to_vec(), 0).await.unwrap().unwrap();
+        assert_eq!(
+            kv.get("n").await.unwrap(),
+            None,
+            "not in the replicated data"
+        );
+        kv.set_now_ms(149);
+        assert_eq!(kv.local_get("n").await.unwrap(), Some(b"1".to_vec()));
+        kv.set_now_ms(150);
+        assert_eq!(kv.local_get("n").await.unwrap(), None);
+        assert_eq!(kv.local_get("f").await.unwrap(), Some(b"2".to_vec()));
+        kv.local_delete("f").await.unwrap();
+        assert_eq!(kv.local_get("f").await.unwrap(), None);
+        let big = kv
+            .local_set("big", vec![0; 64 * 1024 + 1], 0)
+            .await
+            .unwrap();
+        assert!(big.is_err());
+    }
 
     #[tokio::test]
     async fn mem_kv_registers_and_sets() {

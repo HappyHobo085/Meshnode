@@ -11,7 +11,10 @@ use common::{T, fixture, test_cfg, wait_until};
 use mesh_core::{BlobHash, Node};
 use mesh_hlc::ManualClock;
 use mesh_proto::{Placement, ServiceKind, ServiceManifest};
-use mesh_services::{DeployOpts, LocalStatus, Services, ServicesConfig};
+use mesh_runtime::KvBackend;
+use mesh_services::{
+    DeployOpts, LocalStatus, ServiceKv, Services, ServicesConfig, current_generation, data_ns,
+};
 use tempfile::TempDir;
 
 const HOUR_MS: u64 = 3_600_000;
@@ -380,5 +383,80 @@ async fn gc_leaves_blobs_services_do_not_own() {
         !owned.contains(&v1.to_hex().to_string()),
         "a removed hash leaves the owned set: {owned}"
     );
+    t.shutdown().await;
+}
+
+/// The node's `svc_local` entries of namespace `ns` (live and expired).
+async fn local_rows(t: &One, ns: &str) -> usize {
+    let ns = ns.to_owned();
+    t.node
+        .store()
+        .call_unchecked(move |s| s.local_count_all(&ns))
+        .await
+        .unwrap() as usize
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_sweep_deletes_expired() {
+    let t = one(None).await;
+    let kv = ServiceKv::new(t.node.store().clone(), "web".into());
+    kv.local_set("short", b"1".to_vec(), HOUR_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    kv.local_set("long", b"2".to_vec(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    t.svc.gc_now().await.unwrap();
+    assert_eq!(local_rows(&t, "web").await, 2, "nothing expired yet");
+
+    t.clock.advance(HOUR_MS);
+    // Invisible as soon as it expires, deleted by the next GC pass.
+    assert_eq!(kv.local_get("short").await.unwrap(), None);
+    assert_eq!(local_rows(&t, "web").await, 2);
+    t.svc.gc_now().await.unwrap();
+    assert_eq!(local_rows(&t, "web").await, 1);
+    assert_eq!(kv.local_get("long").await.unwrap(), Some(b"2".to_vec()));
+    t.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_purge_unreachable() {
+    let t = one(None).await;
+    let store = t.node.store().clone();
+    let ns0 = data_ns("web", current_generation(&store, "web").await.unwrap());
+    let old = ServiceKv::new(store.clone(), ns0.clone());
+    old.local_set("nonce", b"1".to_vec(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let other = ServiceKv::new(store.clone(), "other".into());
+    other
+        .local_set("nonce", b"o".to_vec(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+
+    t.svc.purge("web").await.unwrap();
+    let gen1 = current_generation(&store, "web").await.unwrap();
+    assert_eq!(gen1, 1);
+    let new = ServiceKv::new(store.clone(), data_ns("web", gen1));
+    assert_eq!(
+        new.local_get("nonce").await.unwrap(),
+        None,
+        "unreachable after purge"
+    );
+    new.local_set("nonce", b"2".to_vec(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The GC pass deletes the old generation's entries, and only those.
+    assert_eq!(local_rows(&t, &ns0).await, 1);
+    t.svc.gc_now().await.unwrap();
+    assert_eq!(local_rows(&t, &ns0).await, 0);
+    assert_eq!(new.local_get("nonce").await.unwrap(), Some(b"2".to_vec()));
+    assert_eq!(other.local_get("nonce").await.unwrap(), Some(b"o".to_vec()));
     t.shutdown().await;
 }

@@ -2,7 +2,7 @@
 # main one), built for wasm32-wasip2 by `tests/common/mod.rs` into `<target>/fixtures`.
 [workspace]
 resolver = "3"
-members = ["echo", "bad", "counter", "spin", "hog", "outbound"]
+members = ["echo", "bad", "counter", "spin", "hog", "outbound", "local"]
 
 [workspace.package]
 edition = "2024"

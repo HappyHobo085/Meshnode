@@ -31,6 +31,7 @@ mod maint;
 pub mod merge;
 mod read;
 mod removal;
+mod svc_local;
 mod sync;
 mod tables;
 
@@ -42,6 +43,7 @@ pub use error::StoreError;
 pub use maint::{Export, SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
 pub use removal::{CUTOFF_EXEMPT_SET, RemovalReport};
+pub use svc_local::{LOCAL_MAX_KEY, LOCAL_MAX_KEYS, LOCAL_MAX_VALUE};
 pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;

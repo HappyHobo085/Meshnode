@@ -3,7 +3,7 @@
 //! Every local write of the public API goes through the write gate ([`StoreHandle::set`]
 //! and the other write methods): it is refused once this node is removed and while a
 //! re-bootstrap runs. [`StoreHandle::call`] only gets a read-only [`StoreReader`], so it
-//! cannot bypass the gate.
+//! cannot bypass the gate. Node-local entries (`local_*`) write no op and are not gated.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -202,6 +202,51 @@ impl StoreHandle {
         self.call(move |s| s.set_members(&ns, &set, start_after.as_deref(), limit))
             .await
     }
+
+    // Node-local entries (`svc_local`, see `mesh_store::Store::local_set`). They write no
+    // op, so they do not go through the write gate: the gate keeps a removed or
+    // re-bootstrapping node from issuing own ops, and a local entry is not one. Per-node
+    // bookkeeping such as replay nonces keeps working (and keeps refusing replays) while
+    // replicated writes are refused.
+
+    pub async fn local_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>, NodeError> {
+        let (ns, key) = (ns.to_owned(), key.to_owned());
+        self.call_raw(move |s| s.local_get(&ns, &key)).await
+    }
+
+    /// The inner `Err` is a cap breach (nothing written).
+    pub async fn local_set(
+        &self,
+        ns: &str,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> Result<Result<(), String>, NodeError> {
+        let (ns, key) = (ns.to_owned(), key.to_owned());
+        self.call_raw(move |s| s.local_set(&ns, &key, &value, ttl_ms))
+            .await
+    }
+
+    pub async fn local_delete(&self, ns: &str, key: &str) -> Result<(), NodeError> {
+        let (ns, key) = (ns.to_owned(), key.to_owned());
+        self.call_raw(move |s| s.local_delete(&ns, &key)).await
+    }
+
+    /// Deletes every local entry expired at `now_ms`; returns how many.
+    pub async fn local_sweep(&self, now_ms: u64) -> Result<usize, NodeError> {
+        self.call_raw(move |s| s.local_sweep(now_ms)).await
+    }
+
+    /// Deletes every local entry of `ns`; returns how many.
+    pub async fn local_drop_namespace(&self, ns: &str) -> Result<usize, NodeError> {
+        let ns = ns.to_owned();
+        self.call_raw(move |s| s.local_drop_namespace(&ns)).await
+    }
+
+    /// The namespaces holding local entries.
+    pub async fn local_namespaces(&self) -> Result<Vec<String>, NodeError> {
+        self.call_raw(|s| s.local_namespaces()).await
+    }
 }
 
 /// A read-only view of the store, as [`StoreHandle::call`] hands it out. Blocking: it is
@@ -302,5 +347,65 @@ impl StoreReader<'_> {
     #[cfg(feature = "test-hooks")]
     pub fn pending_len(&self) -> Result<u64, StoreError> {
         self.0.pending_len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ed25519_dalek::SigningKey;
+    use mesh_hlc::ManualClock;
+    use mesh_proto::MeshId;
+
+    use super::*;
+
+    fn handle(dir: &std::path::Path, clock: &ManualClock) -> StoreHandle {
+        let wall = DynClock(Arc::new(clock.clone()));
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let store = CoreStore::open(&dir.join("store.redb"), MeshId([5; 32]), key, wall).unwrap();
+        StoreHandle::new(Arc::new(store))
+    }
+
+    /// Local entries are node-local bookkeeping (e.g. replay nonces): they write no op,
+    /// so the write gate, which guards own ops, does not refuse them.
+    #[tokio::test]
+    async fn local_writes_bypass_the_write_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(1_700_000_000_000);
+        let h = handle(dir.path(), &clock);
+        h.local_set("svc", "a", b"1".to_vec(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+
+        h.refuse_writes_rebootstrapping(true);
+        assert!(matches!(
+            h.set("svc", "r", b"x".to_vec()).await,
+            Err(NodeError::Rebootstrapping)
+        ));
+        h.local_set("svc", "b", b"2".to_vec(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        h.refuse_writes_rebootstrapping(false);
+
+        h.refuse_writes_removed();
+        assert!(matches!(
+            h.set("svc", "r", b"x".to_vec()).await,
+            Err(NodeError::Removed)
+        ));
+        h.local_set("svc", "c", b"3".to_vec(), 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        h.local_delete("svc", "a").await.unwrap();
+        assert_eq!(h.local_get("svc", "a").await.unwrap(), None);
+        assert_eq!(h.local_get("svc", "b").await.unwrap(), Some(b"2".to_vec()));
+        clock.advance(1_000);
+        assert_eq!(h.local_get("svc", "c").await.unwrap(), None);
+        assert_eq!(h.local_sweep(1_700_000_001_000).await.unwrap(), 1);
+        // None of it wrote an op.
+        assert_eq!(h.call(|r| r.next_seq()).await.unwrap(), 1);
     }
 }

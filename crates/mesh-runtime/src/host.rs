@@ -34,7 +34,7 @@ mod bindings {
     });
 }
 
-use bindings::meshnode::kv::store;
+use bindings::meshnode::kv::{local, store};
 
 /// The store data of one request's instance.
 pub(crate) struct State {
@@ -250,6 +250,9 @@ fn link_world(l: &mut Linker<State>) -> wasmtime::Result<()> {
     // `wasi:http/types` and `wasi:http/outgoing-handler`.
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(l)?;
     store::add_to_linker::<State, HasSelf<State>>(l, |s| s)?;
+    // Linking an interface does not make guests import it: components that use only
+    // `store` still instantiate.
+    local::add_to_linker::<State, HasSelf<State>>(l, |s| s)?;
     Ok(())
 }
 
@@ -258,13 +261,45 @@ const MAX_LIST: u32 = 1000;
 
 /// Records the HTTP status for a backend error and turns it into a guest trap.
 fn kv_trap(status: &KvStatus, err: KvError) -> wasmtime::Error {
+    kv_trap_in("store", status, err)
+}
+
+/// [`kv_trap`] for a call of interface `meshnode:kv/<interface>`.
+fn kv_trap_in(interface: &str, status: &KvStatus, err: KvError) -> wasmtime::Error {
     let code = match &err {
         KvError::Full => StatusCode::INSUFFICIENT_STORAGE,
         KvError::Removed | KvError::Rebootstrapping => StatusCode::SERVICE_UNAVAILABLE,
         KvError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     status.0.store(code.as_u16(), Ordering::Relaxed);
-    wasmtime::format_err!("meshnode:kv/store: {err}")
+    wasmtime::format_err!("meshnode:kv/{interface}: {err}")
+}
+
+/// `meshnode:kv/local`. A cap breach is the guest's `err`; a backend failure traps.
+impl local::Host for State {
+    async fn get(&mut self, key: String) -> wasmtime::Result<Option<Vec<u8>>> {
+        self.kv
+            .local_get(&key)
+            .await
+            .map_err(|e| kv_trap_in("local", &self.kv_status, e))
+    }
+    async fn set(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> wasmtime::Result<Result<(), String>> {
+        self.kv
+            .local_set(&key, value, ttl_ms)
+            .await
+            .map_err(|e| kv_trap_in("local", &self.kv_status, e))
+    }
+    async fn delete(&mut self, key: String) -> wasmtime::Result<()> {
+        self.kv
+            .local_delete(&key)
+            .await
+            .map_err(|e| kv_trap_in("local", &self.kv_status, e))
+    }
 }
 
 impl store::Host for State {

@@ -14,6 +14,9 @@
 //! A pass holds the write side of `Shared::gc_lock`, which deploys hold (read side) from
 //! storing a blob until its manifest is written. Just before removing, it recomputes the
 //! referenced set, so a manifest that arrived from another node meanwhile also saves a blob.
+//!
+//! Each pass first sweeps the node-local service entries (`svc_local`): expired ones and
+//! those of purged data generations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -32,7 +35,7 @@ use tracing::{info, warn};
 
 use crate::deployer::Shared;
 use crate::error::ServicesError;
-use crate::manifest::read_manifest;
+use crate::manifest::{current_generation, read_manifest, split_data_ns};
 
 /// How long a blob must stay unreferenced before it is removed.
 const GRACE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -175,8 +178,42 @@ async fn hold_point(shared: &Shared) {
     let _ = hold.wait_for(|on| !*on).await;
 }
 
-/// One GC pass.
+/// Node-local service entries (`meshnode:kv/local`): deletes the expired ones, and every
+/// entry of a purged data generation (a namespace whose generation is below the service's
+/// current one). Generations only grow, so a stale view of them (e.g. mid re-bootstrap)
+/// can only spare entries, never delete reachable ones; this runs whatever the status.
+async fn sweep_local(shared: &Shared) -> Result<(), ServicesError> {
+    let store = shared.node.store();
+    let expired = store.local_sweep(shared.node.now_ms()).await?;
+    let mut purged = 0;
+    let mut current: BTreeMap<String, u64> = BTreeMap::new();
+    for ns in store.local_namespaces().await? {
+        let Some((name, generation)) = split_data_ns(&ns) else {
+            continue;
+        };
+        let cur = match current.get(name) {
+            Some(g) => *g,
+            None => {
+                let g = current_generation(store, name).await?;
+                current.insert(name.to_owned(), g);
+                g
+            }
+        };
+        if generation < cur {
+            purged += store.local_drop_namespace(&ns).await?;
+        }
+    }
+    if expired + purged > 0 {
+        info!(expired, purged, "swept node-local service entries");
+    }
+    Ok(())
+}
+
+/// One GC pass: node-local entries, then blobs.
 pub(crate) async fn run_once(shared: &Shared) -> Result<(), ServicesError> {
+    if let Err(e) = sweep_local(shared).await {
+        warn!(error = %e, "node-local entry sweep failed");
+    }
     let _exclusive = shared.gc_lock.write().await;
     let Some(keep) = referenced(shared).await? else {
         info!("blob GC skipped: node is not running");

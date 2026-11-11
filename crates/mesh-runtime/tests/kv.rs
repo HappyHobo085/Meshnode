@@ -187,3 +187,55 @@ async fn oversized_kv_value_gives_500() {
     );
     assert_eq!(get(&rt, &svc, &kv, "/").await, (200, "1".to_string()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_local_roundtrip() {
+    let rt = Runtime::new(RuntimeConfig::default()).unwrap();
+    let svc = rt.load([10; 32], &fixture("local")).await.unwrap();
+    let kv = Arc::new(MemKv::default());
+    kv.set_now_ms(1_000);
+    let ok = |s: &str| (200, s.to_string());
+
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=n").await.0, 404);
+    assert_eq!(get(&rt, &svc, &kv, "/lset?k=n&v=one").await, ok("ok"));
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=n").await, ok("one"));
+    // Local entries are not in the replicated store.
+    assert_eq!(get(&rt, &svc, &kv, "/get?k=n").await.0, 404);
+    assert_eq!(kv.get("n").await.unwrap(), None);
+    assert_eq!(kv.local_get("n").await.unwrap(), Some(b"one".to_vec()));
+
+    // TTL: visible before the deadline, gone at it.
+    assert_eq!(get(&rt, &svc, &kv, "/lset?k=t&v=x&ttl=500").await, ok("ok"));
+    kv.set_now_ms(1_499);
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=t").await, ok("x"));
+    kv.set_now_ms(1_500);
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=t").await.0, 404);
+
+    assert_eq!(get(&rt, &svc, &kv, "/ldel?k=n").await, ok("ok"));
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=n").await.0, 404);
+
+    // A cap breach is an `err` the guest sees, not a trap.
+    let big = Bytes::from(vec![b'x'; 64 * 1024 + 1]);
+    let (status, body) = call(&rt, &svc, &kv, "POST", "/lset?k=big", big).await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with("err: "), "{body}");
+    assert_eq!(kv.local_get("big").await.unwrap(), None);
+
+    // Backend failures trap with the mapped status, as for `store`.
+    kv.fail_with(Some(KvError::Rebootstrapping));
+    assert_eq!(get(&rt, &svc, &kv, "/lget?k=n").await.0, 503);
+    kv.fail_with(None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixtures_without_local_still_load() {
+    let rt = Runtime::new(RuntimeConfig::default()).unwrap();
+    for (i, name) in ["counter", "echo", "hog", "spin", "outbound"]
+        .iter()
+        .enumerate()
+    {
+        rt.load([i as u8 + 20; 32], &fixture(name))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}

@@ -241,6 +241,15 @@ impl KvBackend for StalledKv {
     ) -> Result<Vec<Vec<u8>>, KvError> {
         std::future::pending().await
     }
+    async fn local_get(&self, _: &str) -> Result<Option<Vec<u8>>, KvError> {
+        std::future::pending().await
+    }
+    async fn local_set(&self, _: &str, _: Vec<u8>, _: u64) -> Result<Result<(), String>, KvError> {
+        std::future::pending().await
+    }
+    async fn local_delete(&self, _: &str) -> Result<(), KvError> {
+        std::future::pending().await
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

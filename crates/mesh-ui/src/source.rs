@@ -37,7 +37,7 @@ impl DirSource {
                     entry.path().display()
                 ))
             })?;
-            if OS_FILES.contains(&name) {
+            if is_os_file(name) {
                 continue;
             }
             // `file_type` does not follow symlinks.
@@ -66,6 +66,75 @@ impl DirSource {
     }
 }
 
+/// A file the OS leaves in folders (`.DS_Store`, `Thumbs.db`, `desktop.ini`): never uploaded.
+pub fn is_os_file(name: &str) -> bool {
+    OS_FILES.contains(&name)
+}
+
+/// The upload rules every source applies to its listing, from the listed sizes and before
+/// any file is read: drops OS files, refuses an empty listing, sorts by path, and enforces
+/// mesh-admin's limits (files, bytes per file and in total) and path rules, naming the
+/// offending path.
+pub fn check_listing(files: Vec<FileMeta>) -> Result<Vec<FileMeta>, UiError> {
+    let mut files: Vec<FileMeta> = files
+        .into_iter()
+        .filter(|f| !is_os_file(f.path.rsplit('/').next().unwrap_or("")))
+        .collect();
+    if files.is_empty() {
+        return Err(UiError::invalid("The folder is empty"));
+    }
+    if files.len() > MAX_UPLOAD_FILES {
+        return Err(UiError::invalid(format!(
+            "The folder has more than {MAX_UPLOAD_FILES} files"
+        )));
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut total = 0u64;
+    for f in &files {
+        if f.size > MAX_UPLOAD_FILE {
+            return Err(UiError::invalid(format!(
+                "{} is larger than 64 MiB",
+                f.path
+            )));
+        }
+        total = total.saturating_add(f.size);
+    }
+    if total > MAX_UPLOAD_TOTAL {
+        return Err(UiError::invalid("The folder is larger than 1 GiB in total"));
+    }
+    validate_upload(&files).map_err(UiError::invalid)?;
+    Ok(files)
+}
+
+/// Reads the file `path`, listed with `size` bytes, through `read_at(offset, len)` (which
+/// returns at most `len` bytes, fewer only at the end) in chunks of at most `chunk` bytes.
+/// The result is allocated once at `size`; a file that is shorter or longer than listed (it
+/// changed since the listing) is refused, so no more than the listed bytes are ever held.
+pub fn read_sized(
+    path: &str,
+    size: u64,
+    chunk: usize,
+    mut read_at: impl FnMut(u64, usize) -> Result<Vec<u8>, UiError>,
+) -> Result<Vec<u8>, UiError> {
+    let changed = || UiError::invalid(format!("{path} changed while it was read"));
+    let len = usize::try_from(size).map_err(|_| changed())?;
+    let chunk = chunk.max(1);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let want = chunk.min(len - out.len());
+        let got = read_at(out.len() as u64, want)?;
+        if got.is_empty() || got.len() > want {
+            return Err(changed());
+        }
+        out.extend_from_slice(&got);
+    }
+    // One byte past the listed size must not exist.
+    if !read_at(size, 1)?.is_empty() {
+        return Err(changed());
+    }
+    Ok(out)
+}
+
 fn io_err(e: std::io::Error) -> UiError {
     UiError::new(UiErrorCode::Io, e.to_string())
 }
@@ -74,25 +143,7 @@ impl FileSource for DirSource {
     fn list(&mut self) -> Result<Vec<FileMeta>, UiError> {
         let mut files = Vec::new();
         Self::walk(&self.root, "", &mut files)?;
-        if files.is_empty() {
-            return Err(UiError::invalid("The folder is empty"));
-        }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut total = 0u64;
-        for f in &files {
-            if f.size > MAX_UPLOAD_FILE {
-                return Err(UiError::invalid(format!(
-                    "{} is larger than 64 MiB",
-                    f.path
-                )));
-            }
-            total = total.saturating_add(f.size);
-        }
-        if total > MAX_UPLOAD_TOTAL {
-            return Err(UiError::invalid("The folder is larger than 1 GiB in total"));
-        }
-        validate_upload(&files).map_err(UiError::invalid)?;
-        Ok(files)
+        check_listing(files)
     }
 
     fn read(&mut self, path: &str) -> Result<Vec<u8>, UiError> {

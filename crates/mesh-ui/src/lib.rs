@@ -15,6 +15,6 @@ pub use dto::*;
 pub use error::{JoinRefusalDto, UiError, UiErrorCode, hint_for};
 pub use pipe::PipeTransport;
 pub use qr::qr_svg;
-pub use source::{DirSource, FileSource};
+pub use source::{DirSource, FileSource, check_listing, is_os_file, read_sized};
 pub use streams::{StreamGuard, Streams};
-pub use transport::{AdminTransport, InProcessTransport, NoNode, TransportFn};
+pub use transport::{AdminTransport, InProcessTransport, NoNode, OnRuntime, TransportFn};

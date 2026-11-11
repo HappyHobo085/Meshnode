@@ -1,5 +1,6 @@
 //! How the UI reaches a daemon.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -105,6 +106,63 @@ impl AdminTransport for InProcessTransport {
         let _ = progress.send(total).await;
         let files = metas.into_iter().zip(datas).collect();
         Ok(self.0.deploy_static(name, opts, files).await)
+    }
+}
+
+/// Runs every call of `inner` on the runtime of `handle`, and awaits it from wherever it is
+/// called: an in-process daemon's requests spawn tasks that must live on the daemon's own
+/// runtime, not on the caller's (the Android webview's commands run on Tauri's). Dropping a
+/// call aborts it there, as dropping it in place would.
+pub struct OnRuntime {
+    handle: tokio::runtime::Handle,
+    inner: Arc<dyn AdminTransport>,
+}
+
+impl OnRuntime {
+    pub fn new(handle: tokio::runtime::Handle, inner: Arc<dyn AdminTransport>) -> OnRuntime {
+        OnRuntime { handle, inner }
+    }
+
+    async fn run<T, F>(&self, fut: F) -> Result<T, UiError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, UiError>> + Send + 'static,
+    {
+        struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+        impl<T> Drop for AbortOnDrop<T> {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let mut task = AbortOnDrop(self.handle.spawn(fut));
+        (&mut task.0)
+            .await
+            .map_err(|e| UiError::internal(e.to_string()))?
+    }
+}
+
+#[async_trait]
+impl AdminTransport for OnRuntime {
+    async fn request(&self, req: AdminRequest) -> Result<AdminResponse, UiError> {
+        let inner = self.inner.clone();
+        self.run(async move { inner.request(req).await }).await
+    }
+
+    async fn stream(&self, req: AdminRequest, tx: mpsc::Sender<String>) -> Result<(), UiError> {
+        let inner = self.inner.clone();
+        self.run(async move { inner.stream(req, tx).await }).await
+    }
+
+    async fn deploy_static(
+        &self,
+        name: String,
+        opts: DeployOpts,
+        src: Box<dyn FileSource>,
+        progress: mpsc::Sender<u64>,
+    ) -> Result<AdminResponse, UiError> {
+        let inner = self.inner.clone();
+        self.run(async move { inner.deploy_static(name, opts, src, progress).await })
+            .await
     }
 }
 

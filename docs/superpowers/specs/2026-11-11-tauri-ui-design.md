@@ -44,17 +44,22 @@ apps/ui/                        Svelte 5 + Vite + TS; one frontend, built to app
                                 NoDaemon (desktop), NodeStopped (Android)
   static/fonts/                 Inter, JetBrains Mono (woff2, SIL OFL licences checked in)
 crates/mesh-ui/                 shared command layer; depends on mesh-admin (requests and views), qrcode, ts-rs;
-                                tauri is an optional feature ("tauri") so its tests need no webview
+                                no tauri dependency, so its tests need no webview
+crates/mesh-ui-tauri/           (as built) the #[tauri::command] wrappers and Channel plumbing, shared by both
+                                shells; its own Cargo workspace (outside the root one)
 apps/desktop/src-tauri/         new Tauri 2 app, its own Cargo workspace and Cargo.lock (like apps/android)
 apps/android/src-tauri/         existing app; frontendDist moves to ../../ui/dist; the placeholder src/ is deleted
 apps/android/.../app/           Kotlin: a small Tauri plugin `FolderPicker` (SAF tree) (§7.2)
 ```
 
-- `mesh-ui` is a member of the root workspace (desktop CI builds and tests it without webview packages). Its
-  `tauri` feature, enabled by the two app workspaces, adds the `#[tauri::command]` wrappers and the `Channel`
-  plumbing; the logic below them is plain async Rust tested in the root workspace.
-- Both Tauri configs: `build.beforeBuildCommand = "npm --prefix ../../ui run build"`, `beforeDevCommand` runs
-  Vite's dev server, `frontendDist = "../../ui/dist"`. The CSP stays as in sub-spec 5 (no remote fonts, scripts
+- `mesh-ui` is a member of the root workspace (desktop CI builds and tests it without webview packages). The
+  `#[tauri::command]` wrappers and the `Channel` plumbing live in `crates/mesh-ui-tauri`, used by the two app
+  workspaces (as built; not a `tauri` feature of `mesh-ui`); the logic below them is plain async Rust tested in
+  the root workspace.
+- Both Tauri configs: `build.beforeBuildCommand = "npm --prefix ../ui run build"`, `beforeDevCommand` runs
+  Vite's dev server (`npm --prefix ../ui run dev`) (as built: Tauri runs the hooks from the project root, the
+  parent of `src-tauri`, so the path is `../ui`, not `../../ui`), `frontendDist = "../../ui/dist"` (relative to
+  `src-tauri`). The CSP stays as in sub-spec 5 (no remote fonts, scripts
   or images; `img-src 'self' data:`).
 
 ## 3. `mesh-ui` (the shared command layer)
@@ -104,7 +109,8 @@ pub trait AdminTransport: Send + Sync + 'static {
 - **QR:** `invite` renders the ticket text with the `qrcode` crate to a compact SVG string (error-correction M,
   quiet zone 4, `currentColor` modules so it themes). The page inserts it as an SVG element built from the
   string's path data — never `innerHTML` of untrusted input (the SVG is ours, but the rule is uniform).
-- **Streams:** each stream runs on its own task; the Tauri `Channel::send` failing (page gone) or an explicit
+- **Streams:** (as built) every stream message is a `StreamEvent` (`Item { value }`, `End`, `Error { error }`).
+  Each stream runs on its own task; the Tauri `Channel::send` failing (page gone) or an explicit
   `cancel(stream_id)` ends the task and drops the admin connection. At most 4 concurrent streams per window.
 - **DTOs** derive `serde::Serialize` and `ts_rs::TS` and are UI-shaped (ids as hex strings, times as ms numbers,
   enums as tagged unions). Admin view types are not exposed to TS directly.
@@ -187,10 +193,11 @@ service wins and the UI shows a one-time notice that a second, separate node is 
 - The placeholder page and its commands (`status`, `join`) are replaced by the shared `mesh-ui` commands over
   `InProcessTransport`; `service_start` / `service_stop` stay; new `power_policy_get` / `power_policy_set`
   (through `mesh_ffi::set_power_policy`, which persists to meshd.toml, unchanged).
-- **QR scan:** `tauri-plugin-barcode-scanner` (QR only). The camera permission is requested when the user taps
-  Scan; a denial shows "Camera access is off — paste the invite instead" with the paste field.
-- **When the node is stopped:** `status()` still answers (from `mesh_ffi::status`); the UI shows **Node stopped**
-  with **Start** (service control). Admin calls return `NotRunning`.
+- **QR scan:** `tauri-plugin-barcode-scanner` (QR only). The camera permission is requested explicitly before
+  scanning, when the user taps Scan (as built: an explicit permission request, not left to the scan call); a denial shows "Camera access is off — paste the invite instead" with the paste field.
+- **When the node is stopped:** (as built) the UI uses `node_running()` to know the node is stopped and shows
+  **Node stopped** with **Start** (service control). Admin calls, `status()` included, return `NotRunning`;
+  `status()` does not answer while the node is stopped.
 - Capabilities: only the commands and plugin permissions listed above; CSP unchanged.
 
 ## 6. Frontend

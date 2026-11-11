@@ -8,15 +8,17 @@ Step 2 is success criterion 2 of the master spec: pairing within 30 s, once on W
 
 Desktop (Windows, from the repo root; `D:` is FAT32, so keep the target directory off it):
 
+Once: `cargo install tauri-cli --version "=2.12.4" --locked` (provides `cargo tauri`; Node 24 and npm are needed too).
+
 ```
 set CARGO_TARGET_DIR=%LOCALAPPDATA%\meshnode-target
-cargo build -p meshd
+cargo build --release -p meshd
 cd apps\ui && npm ci && cd ..\..
 cd apps\desktop
 cargo tauri build --no-bundle
 ```
 
-`beforeBuildCommand` builds `apps/ui`. The app is `meshnode-desktop.exe` in the release folder of the target directory. Put `meshd.exe` next to it, or on `PATH`; otherwise use **Locate meshd…** in the UI. For live development: `cargo tauri dev` in `apps/desktop`.
+`beforeBuildCommand` builds `apps/ui`. Both binaries are then in `%LOCALAPPDATA%\meshnode-target\release`: `meshnode-desktop.exe` (the app) and `meshd.exe`, side by side, so the app finds the daemon without **Locate meshd…**. If you move the app, keep `meshd.exe` next to it, put it on `PATH`, or use **Locate meshd…**. For live development: `cargo tauri dev` in `apps/desktop`.
 
 Android: `apps/android/build-apk.sh` (debug, installable) and `apps/android/build-apk.sh --release` (stripped, unsigned, size only). The owner installs the debug APK with `adb install -r apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk` (not run by the agent).
 

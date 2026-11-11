@@ -45,6 +45,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      # tauri::generate_context!() needs frontendDist (apps/ui/dist), which is not checked in.
+      - name: Build the UI
+        working-directory: apps/ui
+        run: |
+          npm ci
+          npm run build
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -80,6 +91,7 @@ jobs:
 
   ts-types:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

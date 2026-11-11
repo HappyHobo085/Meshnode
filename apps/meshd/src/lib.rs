@@ -1,15 +1,11 @@
-//! `meshd`: the Meshnode desktop daemon (spec §6) — data directory and `meshd.toml`,
-//! logging, and the [`Daemon`] that runs a node, its services, the localhost gateway and
-//! the admin API.
+//! `meshd`: the Meshnode desktop daemon (spec §6) — the CLI and OS services around the
+//! platform-neutral [`mesh_host`] daemon.
 
-pub mod config;
-mod daemon;
-pub mod lock;
-pub mod logging;
-pub mod paths;
 pub mod service;
 
-pub use config::{ConfigError, MeshdConfig};
+pub use mesh_host::HostConfig as MeshdConfig;
 #[cfg(feature = "test-hooks")]
-pub use daemon::TestOptions;
-pub use daemon::{Daemon, DaemonError, wipe_identity};
+pub use mesh_host::TestOptions;
+pub use mesh_host::{
+    ConfigError, Daemon, DaemonError, config, lock, logging, paths, wipe_identity,
+};

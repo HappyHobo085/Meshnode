@@ -6,6 +6,9 @@ use crate::service::valid_service_name;
 use serde::{Deserialize, Serialize};
 
 pub const ALPN_HTTPFWD: &[u8] = b"meshnode/httpfwd/1";
+/// Reserved service name answered by every node (204) without consulting its services; not a
+/// valid user service name (see `valid_service_name`).
+pub const PING_SERVICE: &str = "_ping";
 pub const HTTPFWD_MAX_FRAME: usize = 64 * 1024 * 1024 + 64 * 1024;
 pub const MAX_HEADERS: usize = 128;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -67,7 +70,7 @@ struct RawForwardRequest {
 
 impl ForwardRequest {
     pub fn validate(&self) -> Result<(), ProtoError> {
-        if !valid_service_name(&self.service) {
+        if self.service != PING_SERVICE && !valid_service_name(&self.service) {
             return Err(ProtoError::Limit("service name"));
         }
         if !valid_token(&self.method) {
@@ -146,6 +149,15 @@ mod tests {
             headers: vec![("host".into(), b"web.mesh.localhost".to_vec())],
             body: vec![1, 2, 3],
         }
+    }
+
+    #[test]
+    fn ping_service_request_validates() {
+        let mut r = req();
+        r.service = PING_SERVICE.into();
+        r.validate().unwrap();
+        r.service = "_other".into();
+        assert!(r.validate().is_err());
     }
 
     fn resp() -> ForwardResponse {

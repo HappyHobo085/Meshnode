@@ -17,20 +17,21 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
+use mesh_hlc::WallClock;
 use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::config::Timings;
+use crate::config::{CatchUpHook, Timings};
 use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
@@ -43,7 +44,7 @@ use crate::sync::{PeerMetrics, SessionCmd};
 use crate::transport::{Provisional, SHUTDOWN, addr_from_bytes, endpoint_id_of, node_id_of};
 
 /// Upper bound on one dial attempt.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Two connections between a pair that start less than this apart are a simultaneous
 /// dial, settled by the lower-`NodeId` rule. A connection arriving later means the peer
 /// lost the current one (a restart or a crash), so the newer one wins (spec §6.1).
@@ -92,6 +93,81 @@ impl SignOut {
     }
 }
 
+/// A peer and its completed-round count when a catch-up started.
+pub(crate) type RoundMark = (NodeId, Arc<PeerMetrics>, u64);
+
+/// The longest a catch-up's host hook guard is held (spec §5.3: Balanced holds the
+/// catch-up wake lock for at most 60 s).
+const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
+
+/// The incoming-traffic catch-up (Android): peer traffic after at least `after` of
+/// silence on the wall clock starts a round with every connected peer. The wall clock,
+/// not the monotonic one, because monotonic time stops while a phone sleeps.
+pub(crate) struct CatchUp {
+    wall: Arc<dyn WallClock>,
+    /// The silence in ms; `OFF` = turned off.
+    after_ms: AtomicU64,
+    /// Wall time of the latest incoming connection or `sync/1` message.
+    last_ms: AtomicU64,
+}
+
+impl CatchUp {
+    const OFF: u64 = u64::MAX;
+    /// The shortest silence honoured: a shorter one (even zero) is raised to this, so
+    /// steady traffic cannot start a round on every message.
+    const MIN_AFTER: Duration = Duration::from_secs(1);
+
+    pub fn new(wall: Arc<dyn WallClock>, after: Option<Duration>) -> CatchUp {
+        let now = wall.now_ms();
+        let c = CatchUp {
+            wall,
+            after_ms: AtomicU64::new(Self::OFF),
+            last_ms: AtomicU64::new(now),
+        };
+        c.set(after);
+        c
+    }
+
+    /// `Some(silence)` turns it on (clamped to at least [`CatchUp::MIN_AFTER`]), `None` off.
+    pub fn set(&self, after: Option<Duration>) {
+        let ms = after.map_or(Self::OFF, |d| {
+            u64::try_from(d.max(Self::MIN_AFTER).as_millis())
+                .unwrap_or(Self::OFF)
+                .min(Self::OFF - 1)
+        });
+        self.after_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Records incoming traffic now; true if it ends a silence long enough for a catch-up.
+    /// Only the first event after the silence sees the old time, so a burst (or traffic
+    /// from several peers at once) yields a single catch-up.
+    fn traffic(&self) -> bool {
+        let now = self.wall.now_ms();
+        let prev = self.last_ms.swap(now, Ordering::Relaxed);
+        let after = self.after_ms.load(Ordering::Relaxed);
+        after != Self::OFF && now.saturating_sub(prev) >= after
+    }
+}
+
+/// What a session calls for every `sync/1` message it reads (see [`CatchUp`]). Holds the
+/// manager weakly: sessions live inside it.
+#[derive(Clone)]
+pub(crate) struct IncomingHook {
+    catch_up: Arc<CatchUp>,
+    peers: Weak<Shared>,
+}
+
+impl IncomingHook {
+    pub fn traffic(&self) {
+        if self.catch_up.traffic()
+            && let Some(sh) = self.peers.upgrade()
+        {
+            debug!("peer traffic after a long silence; catching up");
+            PeerManager(sh).catch_up(None);
+        }
+    }
+}
+
 /// What every session of this node shares.
 pub(crate) struct PeerEnv {
     pub store: StoreHandle,
@@ -108,6 +184,9 @@ pub(crate) struct PeerEnv {
     pub serve_paused: Arc<AtomicBool>,
     /// A session found the store stale (spec §7); the re-bootstrap hook.
     pub stale: mpsc::Sender<NodeId>,
+    pub catch_up: Arc<CatchUp>,
+    /// The host's hook for the catch-up's duration (see [`crate::NodeConfig::on_catch_up`]).
+    pub on_catch_up: Option<CatchUpHook>,
 }
 
 #[derive(Clone)]
@@ -338,9 +417,14 @@ impl PeerManager {
         }
     }
 
-    /// Dials `id` on `alpn` with the address knowledge the slots use, within the dial
-    /// timeout. The connection is the caller's; it does not touch the `sync/1` slot.
-    pub(crate) async fn connect(&self, id: NodeId, alpn: &[u8]) -> Result<Connection, NodeError> {
+    /// Dials `id` on `alpn` with the address knowledge the slots use, within `limit`.
+    /// The connection is the caller's; it does not touch the `sync/1` slot.
+    pub(crate) async fn connect_within(
+        &self,
+        id: NodeId,
+        alpn: &[u8],
+        limit: Duration,
+    ) -> Result<Connection, NodeError> {
         let (addr, hint) = {
             let st = self.lock();
             if st.stopped || self.0.cancel.is_cancelled() {
@@ -359,7 +443,7 @@ impl PeerManager {
         };
         let target = dial_target(id, [addr, hint], self.0.env.discovery)
             .ok_or_else(|| NodeError::Iroh("no known address for peer".into()))?;
-        match timeout(DIAL_TIMEOUT, self.0.env.endpoint.connect(target, alpn)).await {
+        match timeout(limit, self.0.env.endpoint.connect(target, alpn)).await {
             Ok(Ok(c)) => Ok(c),
             Ok(Err(e)) => Err(NodeError::Iroh(e.to_string())),
             Err(_) => Err(NodeError::Iroh("dial timed out".into())),
@@ -382,6 +466,150 @@ impl PeerManager {
                 let _ = tx.try_send(SessionCmd::StartRound);
             }
         }
+    }
+
+    /// Every connected peer with its completed-round count now: what
+    /// [`PeerManager::wait_rounds`] waits on.
+    pub(crate) fn round_marks(&self) -> Vec<RoundMark> {
+        self.connected_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let m = self.metrics(&id)?;
+                let at = m.rounds_completed.load(Ordering::SeqCst);
+                Some((id, m, at))
+            })
+            .collect()
+    }
+
+    /// Waits until every peer in `pending` has completed a round past its mark or
+    /// disconnected, until `deadline` or shutdown. `rx` was subscribed before the marks
+    /// were taken (the round counters decide; events only wake the loop, so a lag loses
+    /// nothing). Returns the rounds completed and the peers still pending. Holds the
+    /// manager weakly: a node that goes away ends the wait.
+    pub(crate) async fn wait_rounds(
+        &self,
+        pending: Vec<RoundMark>,
+        deadline: Instant,
+        rx: broadcast::Receiver<NodeEvent>,
+    ) -> (usize, usize) {
+        Self::wait_rounds_weak(Arc::downgrade(&self.0), pending, None, deadline, rx).await
+    }
+
+    /// [`PeerManager::wait_rounds`]. `accepted` is a connection just taken from a peer in
+    /// `pending` whose session may not run yet: while that connection is open (and the
+    /// peer's slot is still the marked one), the peer counts as connected.
+    async fn wait_rounds_weak(
+        peers: Weak<Shared>,
+        mut pending: Vec<RoundMark>,
+        mut accepted: Option<(NodeId, Connection)>,
+        deadline: Instant,
+        mut rx: broadcast::Receiver<NodeEvent>,
+    ) -> (usize, usize) {
+        let mut rounds = 0;
+        let mut stop = false;
+        loop {
+            let Some(sh) = peers.upgrade() else {
+                break;
+            };
+            let pm = PeerManager(sh);
+            let live = pm.connected_ids();
+            let cancel = pm.0.cancel.clone();
+            // Once the accepted connection is closed (refused, replaced or ended), only a
+            // live session keeps its peer pending.
+            if accepted
+                .as_ref()
+                .is_some_and(|(_, c)| c.close_reason().is_some())
+            {
+                accepted = None;
+            }
+            pending.retain(|(id, m, at)| {
+                if m.rounds_completed.load(Ordering::SeqCst) > *at {
+                    rounds += 1;
+                    false
+                } else {
+                    // A peer that disconnected (or stopped being a target) is done.
+                    live.contains(id)
+                        || accepted.as_ref().is_some_and(|(a, _)| {
+                            a == id && pm.metrics(id).is_some_and(|x| Arc::ptr_eq(&x, m))
+                        })
+                }
+            });
+            // Not held across the wait: the task must not keep the manager alive.
+            drop(pm);
+            if pending.is_empty() || stop {
+                break;
+            }
+            let conn = accepted.as_ref().map(|(_, c)| c.clone());
+            // Past the deadline (or on shutdown) one last look, then give up.
+            stop = tokio::select! {
+                _ = cancel.cancelled() => true,
+                // The accepted connection closing is no event: look again.
+                () = async {
+                    match &conn {
+                        Some(c) => drop(c.closed().await),
+                        None => std::future::pending().await,
+                    }
+                } => false,
+                r = timeout_at(deadline, rx.recv()) => match r {
+                    Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => false,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => true,
+                },
+            };
+        }
+        (rounds, pending.len())
+    }
+
+    /// The incoming-traffic catch-up: a round with every connected peer. With a host hook
+    /// its guard is held, on a task, until those rounds end (see
+    /// [`crate::NodeConfig::on_catch_up`]). `accepted` is the incoming connection that
+    /// triggered it, if any. Its peer may have no session yet (it redialled after the old
+    /// link died), so it is marked as well and waited on until its first round, or until
+    /// that connection closed with no session left.
+    fn catch_up(&self, accepted: Option<(NodeId, Connection)>) {
+        let Some(hook) = self.0.env.on_catch_up.clone() else {
+            self.start_round_all();
+            return;
+        };
+        let rx = self.0.env.events.subscribe();
+        let mut pending = self.round_marks();
+        if let Some((peer, _)) = &accepted
+            && !pending.iter().any(|(id, _, _)| id == peer)
+            && let Some(m) = self.metrics(peer)
+        {
+            let at = m.rounds_completed.load(Ordering::SeqCst);
+            pending.push((*peer, m, at));
+        }
+        let guard = hook();
+        self.start_round_all();
+        let peers = Arc::downgrade(&self.0);
+        let deadline = Instant::now() + CATCH_UP_LIMIT;
+        self.lock().tasks.spawn(async move {
+            let _guard = guard;
+            Self::wait_rounds_weak(peers, pending, accepted, deadline, rx).await;
+        });
+    }
+
+    /// Turns the incoming-traffic catch-up on (`Some(silence)`) or off.
+    pub fn set_catch_up(&self, after: Option<Duration>) {
+        self.0.env.catch_up.set(after);
+    }
+
+    /// The hook a session reports its incoming messages to.
+    fn incoming_hook(sh: &Arc<Shared>) -> IncomingHook {
+        IncomingHook {
+            catch_up: sh.env.catch_up.clone(),
+            peers: Arc::downgrade(sh),
+        }
+    }
+
+    /// The peers a session runs with now.
+    pub fn connected_ids(&self) -> Vec<NodeId> {
+        self.lock()
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.lock().live.is_some())
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     pub fn reset_backoff_all(&self) {
@@ -440,8 +668,15 @@ impl PeerManager {
             None => self.spawn_slot(&mut st, peer, None),
         };
         st.track(conn.clone());
-        slot.lock().incoming.push(conn);
+        slot.lock().incoming.push(conn.clone());
         slot.kick.notify_one();
+        drop(st);
+        // Recorded only for connections taken (a refused or partitioned peer's redials
+        // returned above and do not reset the silence).
+        if self.0.env.catch_up.traffic() {
+            debug!("incoming connection after a long silence; catching up");
+            self.catch_up(Some((peer, conn)));
+        }
     }
 
     /// Stops every task and refuses new peers for good (this node was removed).
@@ -520,5 +755,59 @@ impl ProtocolHandler for SyncHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         self.0.accept(conn);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_hlc::ManualClock;
+
+    const T0: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn catch_up_fires_once_per_silence() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), Some(Duration::from_secs(60)));
+        assert!(!c.traffic(), "no silence yet");
+        clock.advance(59_999);
+        assert!(!c.traffic(), "silence too short");
+        clock.advance(60_000);
+        // A burst in the same silence: only the first event triggers.
+        assert!(c.traffic());
+        assert!(!c.traffic());
+        clock.advance(10);
+        assert!(!c.traffic());
+    }
+
+    #[test]
+    fn catch_up_ignores_a_wall_clock_stepping_back() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), Some(Duration::from_secs(60)));
+        clock.set(T0 - 3_600_000);
+        assert!(!c.traffic(), "a backwards step is no silence");
+        clock.set(0);
+        assert!(!c.traffic());
+        // Silence counts again from the stepped-back time.
+        clock.advance(60_000);
+        assert!(c.traffic());
+    }
+
+    #[test]
+    fn catch_up_off_and_clamped() {
+        let clock = ManualClock::new(T0);
+        let c = CatchUp::new(Arc::new(clock.clone()), None);
+        clock.advance(3_600_000);
+        assert!(!c.traffic(), "off");
+        // Zero is raised to one second: back-to-back traffic does not trigger.
+        c.set(Some(Duration::ZERO));
+        clock.advance(999);
+        assert!(!c.traffic());
+        clock.advance(1_000);
+        assert!(c.traffic());
+        // Toggling back off stops it.
+        c.set(None);
+        clock.advance(3_600_000);
+        assert!(!c.traffic());
     }
 }

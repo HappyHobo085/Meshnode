@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mesh_core::frame::{FrameError, read_frame, write_frame};
 use tokio::io::AsyncReadExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,8 @@ use tracing::{debug, warn};
 use crate::AdminError;
 use crate::proto::{
     AdminRequest, AdminResponse, DaemonState, ErrorCode, FileData, FileMeta, Hello, MAX_FRAME,
-    MAX_LOG_LINES, PROTOCOL_VERSION, validate_upload,
+    MAX_LOG_LINES, MAX_PROBE_COUNT, MAX_PROBE_TIMEOUT_MS, MIN_PROBE_TIMEOUT_MS, PROTOCOL_VERSION,
+    validate_upload,
 };
 use crate::transport::{self, Access, AdminIo, AdminStream, Endpoint, Listener};
 
@@ -85,7 +86,7 @@ pub enum UploadError {
 
 /// The connection as seen by [`AdminBackend::handle`] during one request.
 pub struct RequestIo<'a> {
-    conn: &'a mut dyn AdminIo,
+    src: Source<'a>,
     /// Declared files of a `DeployStatic` not read yet.
     files: VecDeque<FileMeta>,
     /// Set once the upload broke; the connection then closes after this request.
@@ -93,6 +94,58 @@ pub struct RequestIo<'a> {
     /// The client left, or sent bytes it should not have: close without answering.
     gone: bool,
     upload_frame_timeout: Duration,
+}
+
+/// Where a request's uploaded files come from and its log lines go.
+enum Source<'a> {
+    /// A socket / named-pipe connection.
+    Conn(&'a mut dyn AdminIo),
+    /// The in-process transport: file bytes already in memory, lines to a channel.
+    Memory {
+        data: VecDeque<Vec<u8>>,
+        lines: mpsc::Sender<Vec<String>>,
+    },
+}
+
+impl<'a> RequestIo<'a> {
+    pub(crate) fn for_conn(
+        conn: &'a mut dyn AdminIo,
+        req: &AdminRequest,
+        upload_frame_timeout: Duration,
+    ) -> Self {
+        RequestIo {
+            src: Source::Conn(conn),
+            files: declared_files(req),
+            failed: None,
+            gone: false,
+            upload_frame_timeout,
+        }
+    }
+
+    pub(crate) fn in_memory(
+        req: &AdminRequest,
+        data: Vec<Vec<u8>>,
+        lines: mpsc::Sender<Vec<String>>,
+    ) -> Self {
+        RequestIo {
+            src: Source::Memory {
+                data: data.into(),
+                lines,
+            },
+            files: declared_files(req),
+            failed: None,
+            gone: false,
+            upload_frame_timeout: UPLOAD_FRAME_TIMEOUT,
+        }
+    }
+}
+
+/// Declared files of a `DeployStatic`; empty for any other request.
+fn declared_files(req: &AdminRequest) -> VecDeque<FileMeta> {
+    match req {
+        AdminRequest::DeployStatic { files, .. } => files.iter().cloned().collect(),
+        _ => VecDeque::new(),
+    }
 }
 
 impl RequestIo<'_> {
@@ -105,10 +158,27 @@ impl RequestIo<'_> {
         let Some(meta) = self.files.pop_front() else {
             return Ok(None);
         };
+        let conn = match &mut self.src {
+            Source::Conn(conn) => conn,
+            Source::Memory { data, .. } => {
+                let err = match data.pop_front() {
+                    Some(b) if b.len() as u64 == meta.size => return Ok(Some((meta, b))),
+                    Some(b) => UploadError::Invalid(format!(
+                        "file {:?} was declared as {} bytes but {} arrived",
+                        meta.path,
+                        meta.size,
+                        b.len()
+                    )),
+                    None => UploadError::Invalid(format!("no data for {:?}", meta.path)),
+                };
+                self.failed = Some(err.clone());
+                return Err(err);
+            }
+        };
         let max = meta.size as usize + FILE_FRAME_ENVELOPE;
         let read = timeout(
             self.upload_frame_timeout,
-            read_frame::<_, FileData>(&mut self.conn, max),
+            read_frame::<_, FileData>(conn, max),
         );
         let Ok(read) = read.await else {
             let err = UploadError::Connection(format!("no data for {:?} in time", meta.path));
@@ -151,7 +221,13 @@ impl RequestIo<'_> {
 
     /// Sends one `LogLines` frame. An error means the client is gone.
     pub async fn send_lines(&mut self, lines: Vec<String>) -> io::Result<()> {
-        let r = write_frame(&mut self.conn, &AdminResponse::LogLines(lines)).await;
+        let r = match &mut self.src {
+            Source::Conn(conn) => write_frame(conn, &AdminResponse::LogLines(lines)).await,
+            Source::Memory { lines: tx, .. } => tx
+                .send(lines)
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe)),
+        };
         if r.is_err() {
             self.gone = true;
         }
@@ -162,9 +238,15 @@ impl RequestIo<'_> {
     /// the client sends nothing. Cancel-safe.
     pub async fn client_gone(&mut self) {
         if !self.gone {
-            // EOF, an error, or a byte the client may not send now: either way it is done.
-            let mut b = [0u8; 1];
-            let _ = self.conn.read(&mut b).await;
+            match &mut self.src {
+                Source::Conn(conn) => {
+                    // EOF, an error, or a byte the client may not send now: either way it
+                    // is done.
+                    let mut b = [0u8; 1];
+                    let _ = conn.read(&mut b).await;
+                }
+                Source::Memory { lines, .. } => lines.closed().await,
+            }
             self.gone = true;
         }
     }
@@ -223,7 +305,7 @@ fn windows_file_name(seg: &str) -> bool {
         && !seg.bytes().any(|b| b < 0x20)
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
     Reply(AdminResponse),
     /// The response, then close: the rest of the request's frames cannot be trusted.
     ReplyAndClose(AdminResponse),
@@ -393,7 +475,8 @@ async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend, timeouts: Serv
                 return;
             }
         };
-        let (resp, close) = match handle_one(&mut conn, backend, req, timeouts).await {
+        let io = RequestIo::for_conn(&mut conn, &req, timeouts.upload_frame);
+        let (resp, close) = match dispatch(backend, req, io).await {
             Outcome::Reply(r) => (r, false),
             Outcome::ReplyAndClose(r) => (r, true),
             Outcome::Close => return,
@@ -404,11 +487,24 @@ async fn serve(mut conn: AdminStream, backend: &dyn AdminBackend, timeouts: Serv
     }
 }
 
-async fn handle_one(
-    conn: &mut AdminStream,
+/// Requests that carry an upload or stream lines, so a plain `request` call cannot serve
+/// them. Both clients refuse them through this one predicate; `Probe` streams lines
+/// like `LogsTail`.
+pub(crate) fn needs_own_method(req: &AdminRequest) -> bool {
+    matches!(
+        req,
+        AdminRequest::DeployStatic { .. }
+            | AdminRequest::LogsTail { .. }
+            | AdminRequest::Probe { .. }
+    )
+}
+
+/// The one dispatch both transports use: state gating and argument checks, then the
+/// backend, then whatever the upload still owes. `io` must have been built from `req`.
+pub(crate) async fn dispatch(
     backend: &dyn AdminBackend,
     req: AdminRequest,
-    timeouts: ServerTimeouts,
+    mut io: RequestIo<'_>,
 ) -> Outcome {
     if let Err((code, message)) = check(backend.state(), &req) {
         let resp = AdminResponse::Error { code, message };
@@ -419,17 +515,6 @@ async fn handle_one(
             Outcome::Reply(resp)
         };
     }
-    let files = match &req {
-        AdminRequest::DeployStatic { files, .. } => files.iter().cloned().collect(),
-        _ => VecDeque::new(),
-    };
-    let mut io = RequestIo {
-        conn: &mut **conn,
-        files,
-        failed: None,
-        gone: false,
-        upload_frame_timeout: timeouts.upload_frame,
-    };
     let resp = backend.handle(req, &mut io).await;
     io.finish(resp).await
 }
@@ -456,6 +541,16 @@ fn check(state: DaemonState, req: &AdminRequest) -> Result<(), (ErrorCode, Strin
         R::LogsTail { lines, .. } if *lines > MAX_LOG_LINES => {
             return invalid(format!(
                 "at most {MAX_LOG_LINES} log lines can be asked for"
+            ));
+        }
+        R::Probe { count, .. } if !(1..=MAX_PROBE_COUNT).contains(count) => {
+            return invalid(format!("count must be between 1 and {MAX_PROBE_COUNT}"));
+        }
+        R::Probe { timeout_ms, .. }
+            if !(MIN_PROBE_TIMEOUT_MS..=MAX_PROBE_TIMEOUT_MS).contains(timeout_ms) =>
+        {
+            return invalid(format!(
+                "the timeout must be between {MIN_PROBE_TIMEOUT_MS} and {MAX_PROBE_TIMEOUT_MS} ms"
             ));
         }
         R::DeployStatic { files, .. } => validate_upload(files).or_else(invalid)?,

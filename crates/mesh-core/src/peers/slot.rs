@@ -280,6 +280,7 @@ impl SlotTask {
             metrics: self.slot.metrics.clone(),
             serve_paused: env.serve_paused.clone(),
             signout: env.signout.clone(),
+            incoming: Some(super::PeerManager::incoming_hook(&self.sh)),
         };
         {
             let mut s = self.slot.lock();

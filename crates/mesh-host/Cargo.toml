@@ -1,0 +1,45 @@
+[package]
+name = "mesh-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-admin = { path = "../mesh-admin" }
+mesh-core = { path = "../mesh-core" }
+mesh-gateway = { path = "../mesh-gateway" }
+mesh-proto = { path = "../mesh-proto" }
+mesh-services = { path = "../mesh-services" }
+async-trait.workspace = true
+bytes.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[features]
+# Test-only helpers: `Daemon::start_with` (fast node timings, loopback binding, quick
+# deployer rescans).
+test-hooks = [
+    "mesh-core/test-hooks",
+    "mesh-gateway/test-hooks",
+    "mesh-services/test-hooks",
+]
+
+[dev-dependencies]
+mesh-hlc = { path = "../mesh-hlc" }
+mesh-host = { path = ".", features = ["test-hooks"] }
+mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

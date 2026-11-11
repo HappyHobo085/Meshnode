@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshnode</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <h1>Meshnode</h1>
+
+  <dl>
+    <dt>State</dt><dd id="state">…</dd>
+    <dt>Node id</dt><dd id="node">–</dd>
+    <dt>Mesh</dt><dd id="mesh">–</dd>
+    <dt>Peers online</dt><dd id="peers">–</dd>
+    <dt>Services hosted</dt><dd id="services">–</dd>
+    <dt>Last error</dt><dd id="last-error">–</dd>
+  </dl>
+
+  <h2>Service</h2>
+  <button id="start" type="button">Start</button>
+  <button id="stop" type="button">Stop</button>
+
+  <h2>Join a mesh</h2>
+  <label for="invite">Invite</label>
+  <textarea id="invite" autocomplete="off" spellcheck="false"></textarea>
+  <label for="name">Name of this node</label>
+  <input id="name" type="text" autocomplete="off">
+  <button id="join" type="button">Join</button>
+
+  <p id="message" role="status"></p>
+
+</body>
+</html>

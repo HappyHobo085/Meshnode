@@ -646,3 +646,309 @@ mod extra {
         timeout(T, b.shutdown()).await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------- catch-up and wake
+
+mod catch_up {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use mesh_core::{CatchUpHook, NodeHandle, Timings};
+    use mesh_hlc::ManualClock;
+    use tokio::sync::broadcast;
+
+    const MINUTE: u64 = 60_000;
+
+    /// Connected `a` and `b` with only the incoming-traffic catch-up able to start a round
+    /// once the first one is over: the periodic round and the session's own silence rule
+    /// are an hour away. Returns `b`'s wall clock.
+    async fn quiet_pair(
+        da: &Path,
+        db: &Path,
+        after: Option<Duration>,
+    ) -> (Node, Node, ManualClock) {
+        quiet_pair_with(da, db, after, None).await
+    }
+
+    /// [`quiet_pair`] with `b`'s catch-up hook.
+    async fn quiet_pair_with(
+        da: &Path,
+        db: &Path,
+        after: Option<Duration>,
+        hook_b: Option<CatchUpHook>,
+    ) -> (Node, Node, ManualClock) {
+        let hour = Duration::from_secs(3600);
+        let timings = Timings {
+            sync_interval: hour,
+            silence: hour,
+            ..Timings::fast_for_tests()
+        };
+        let mut ca = test_cfg(da, "a").0;
+        ca.timings = timings.clone();
+        ca.catch_up_on_incoming_after = after;
+        let (mut cb, clock_b) = test_cfg(db, "b");
+        cb.timings = timings;
+        cb.catch_up_on_incoming_after = after;
+        cb.on_catch_up = hook_b;
+
+        let a = Node::create_mesh(ca).await.unwrap();
+        let b_id = id_of_dir(db);
+        a.store()
+            .set_add(MESH_NS, MEMBERS, member_bytes(&b_id, Role::Host).to_vec())
+            .await
+            .unwrap();
+        let genesis = read_genesis(da).unwrap().unwrap();
+        let hints = vec![(a.node_id(), own_addr(&a).await)];
+        let b = Node::start_member_for_test(cb, genesis, hints)
+            .await
+            .unwrap();
+        assert!(a.wait_first_sync(T).await && b.wait_first_sync(T).await);
+        wait_until("connected", T, || async {
+            online(&a, b_id) && online(&b, a.node_id())
+        })
+        .await;
+        converged(&[&a, &b], T).await;
+        (a, b, clock_b)
+    }
+
+    /// Whether a `RoundComplete` arrives on `rx` within `within`.
+    async fn round_within(rx: &mut broadcast::Receiver<NodeEvent>, within: Duration) -> bool {
+        let fut = async {
+            loop {
+                match rx.recv().await {
+                    Ok(NodeEvent::RoundComplete(_)) => return,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+                }
+            }
+        };
+        timeout(within, fut).await.is_ok()
+    }
+
+    /// `a` writes a key and `b` receives it (inbound `sync/1` traffic on `b`).
+    async fn traffic_to_b(a: &Node, b: &Node, key: &str) {
+        a.store().set("app", key, b"v".to_vec()).await.unwrap();
+        wait_until("key replicated to b", T, || async {
+            b.store().get("app", key).await.unwrap().is_some()
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_after_silence_triggers_catch_up() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, clock_b) = quiet_pair(da.path(), db.path(), Some(Duration::from_secs(60))).await;
+        let mut eb = b.subscribe();
+        clock_b.advance(MINUTE + 1_000);
+        a.store().set("app", "k", b"v".to_vec()).await.unwrap();
+        assert!(
+            round_within(&mut eb, Duration::from_secs(10)).await,
+            "no catch-up round after 61 s of silence"
+        );
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    /// Records the start of each catch-up, the drop of the guard its hook returned, and
+    /// how many rounds `b` had completed with `a` at that drop.
+    #[derive(Clone, Default)]
+    struct Probe {
+        log: Arc<StdMutex<Vec<&'static str>>>,
+        /// `b`, once it exists. Taken out before shutdown: the hook lives inside `b`.
+        b: Arc<StdMutex<Option<NodeHandle>>>,
+        rounds_at_end: Arc<StdMutex<Vec<u64>>>,
+    }
+
+    impl Probe {
+        fn hook(&self, a: NodeId) -> CatchUpHook {
+            let p = self.clone();
+            Arc::new(move || {
+                p.log.lock().unwrap().push("start");
+                Box::new(Phase(p.clone(), a))
+            })
+        }
+
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn rounds_with(&self, a: NodeId) -> u64 {
+            self.b
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .rounds_with_for_test(a)
+        }
+    }
+
+    struct Phase(Probe, NodeId);
+
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            if let Some(b) = self.0.b.lock().unwrap().as_ref() {
+                let n = b.rounds_with_for_test(self.1);
+                self.0.rounds_at_end.lock().unwrap().push(n);
+            }
+            self.0.log.lock().unwrap().push("end");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_catch_up_holds_the_hook_guard_until_rounds_complete() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a_id = id_of_dir(da.path());
+        let probe = Probe::default();
+        let (a, b, clock_b) = quiet_pair_with(
+            da.path(),
+            db.path(),
+            Some(Duration::from_secs(60)),
+            Some(probe.hook(a_id)),
+        )
+        .await;
+        assert!(probe.log().is_empty(), "{:?}", probe.log());
+        *probe.b.lock().unwrap() = Some(b.handle());
+        let before = probe.rounds_with(a_id);
+        let mut eb = b.subscribe();
+        clock_b.advance(MINUTE + 1_000);
+        a.store().set("app", "k", b"v".to_vec()).await.unwrap();
+        assert!(
+            round_within(&mut eb, Duration::from_secs(10)).await,
+            "no catch-up round after 61 s of silence"
+        );
+        wait_until("the catch-up guard dropped", T, || async {
+            probe.log().len() == 2
+        })
+        .await;
+        assert_eq!(probe.log(), ["start", "end"]);
+        // Held until the round, not dropped at once.
+        let at_end = probe.rounds_at_end.lock().unwrap().clone();
+        assert!(
+            at_end[0] > before,
+            "guard dropped before a round: {at_end:?} vs {before}"
+        );
+        probe.b.lock().unwrap().take();
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    /// The other trigger: after the link died, the peer redials the silent node. That peer
+    /// has no session yet when the connection is accepted; the guard must still be held
+    /// until its first round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_connection_after_silence_holds_the_guard_until_its_first_round() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a_id = id_of_dir(da.path());
+        let probe = Probe::default();
+        let (a, b, clock_b) = quiet_pair_with(
+            da.path(),
+            db.path(),
+            Some(Duration::from_secs(60)),
+            Some(probe.hook(a_id)),
+        )
+        .await;
+        let b_id = b.node_id();
+        // `a` drops the link and refuses `b`'s redials: nothing reaches `b`.
+        a.partition(&[b_id]);
+        wait_until("link down", T, || async {
+            !online(&a, b_id) && !online(&b, a_id)
+        })
+        .await;
+        *probe.b.lock().unwrap() = Some(b.handle());
+        let before = probe.rounds_with(a_id);
+        clock_b.advance(MINUTE + 1_000);
+        // `b`'s redial backoff reaches its 1 s cap, so `a` dials first after the heal.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(probe.log().is_empty(), "{:?}", probe.log());
+        a.heal();
+        wait_until("the catch-up guard dropped", T, || async {
+            probe.log().len() == 2
+        })
+        .await;
+        assert_eq!(probe.log(), ["start", "end"]);
+        let at_end = probe.rounds_at_end.lock().unwrap().clone();
+        assert!(
+            at_end[0] > before,
+            "guard dropped before the redialling peer's first round: {at_end:?} vs {before}"
+        );
+        probe.b.lock().unwrap().take();
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_within_silence_does_not() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, clock_b) = quiet_pair(da.path(), db.path(), Some(Duration::from_secs(60))).await;
+        let mut eb = b.subscribe();
+        clock_b.advance(MINUTE / 2);
+        traffic_to_b(&a, &b, "k").await;
+        assert!(
+            !round_within(&mut eb, Duration::from_secs(2)).await,
+            "a round after only 30 s of silence"
+        );
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn catch_up_toggle_off() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, clock_b) = quiet_pair(da.path(), db.path(), Some(Duration::from_secs(60))).await;
+        b.set_catch_up_on_incoming(None);
+        let mut eb = b.subscribe();
+        clock_b.advance(MINUTE + 1_000);
+        traffic_to_b(&a, &b, "k").await;
+        assert!(
+            !round_within(&mut eb, Duration::from_secs(2)).await,
+            "a catch-up round although it was turned off"
+        );
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_completes_rounds_with_connected_peers() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // No periodic round and no catch-up: only `wake` can start one.
+        let (a, b, _) = quiet_pair(da.path(), db.path(), None).await;
+        let out = timeout(T, b.wake(Duration::from_secs(10))).await.unwrap();
+        assert_eq!(out.peers, 1, "{out:?}");
+        assert_eq!(out.rounds_completed, 1, "{out:?}");
+        assert!(!out.timed_out, "{out:?}");
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_times_out_when_rounds_cannot_finish_in_time() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, _) = quiet_pair(da.path(), db.path(), None).await;
+        // No round is in progress (quiet timings) and none can cross the network in a
+        // zero limit, while the peer stays connected: wake must give up, not wait.
+        let out = timeout(Duration::from_secs(1), b.wake(Duration::ZERO))
+            .await
+            .expect("wake waited past its limit");
+        assert_eq!(out.peers, 1, "{out:?}");
+        assert_eq!(out.rounds_completed, 0, "{out:?}");
+        assert!(out.timed_out, "{out:?}");
+        // A huge limit does not overflow, and the round completes.
+        let out = timeout(T, b.wake(Duration::MAX)).await.unwrap();
+        assert!(!out.timed_out, "{out:?}");
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_with_no_peers_returns_immediately() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Node::create_mesh(test_cfg(d.path(), "a").0).await.unwrap();
+        let out = timeout(Duration::from_secs(1), a.wake(Duration::from_secs(10)))
+            .await
+            .expect("wake without peers waited");
+        assert_eq!(out.peers, 0, "{out:?}");
+        assert_eq!(out.rounds_completed, 0, "{out:?}");
+        assert!(!out.timed_out, "{out:?}");
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+}

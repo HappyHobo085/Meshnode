@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "net.meshnode.ffi"
+cdylib_name = "meshnode_app"
+# Android mode: the cleaner is chosen by SDK_INT (android.system.SystemCleaner from API 34,
+# UPSIDE_DOWN_CAKE; JNA's below), which also keeps Android lint's NewApi check clean at
+# minSdk 29.
+android = true

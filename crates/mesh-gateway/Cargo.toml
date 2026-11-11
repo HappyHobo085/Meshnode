@@ -34,4 +34,5 @@ mesh-services = { path = "../mesh-services", features = ["test-hooks"] }
 mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
 mesh-hlc = { path = "../mesh-hlc" }
 blake3.workspace = true
+ed25519-dalek.workspace = true
 tempfile.workspace = true

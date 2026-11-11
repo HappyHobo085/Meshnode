@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use mesh_admin::MAX_LOG_LINES;
+use mesh_admin::{MAX_LOG_LINES, MAX_PROBE_COUNT, MAX_PROBE_TIMEOUT_MS, MIN_PROBE_TIMEOUT_MS};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -115,6 +115,21 @@ pub enum Command {
         #[arg(short = 'f', long)]
         follow: bool,
     },
+    /// Measure the round-trip time to a member (a unique prefix of its id) with `_ping`
+    /// requests sent straight to it.
+    Probe {
+        node: String,
+        /// How many samples to take.
+        #[arg(long, default_value_t = 20,
+              value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_PROBE_COUNT)))]
+        count: u32,
+        /// Time between samples (such as 100ms, 5s or 1m).
+        #[arg(long, default_value = "5s", value_parser = parse_interval_ms)]
+        interval: u32,
+        /// How long one sample may take, connecting included (1s to 2m).
+        #[arg(long, default_value = "30s", value_parser = parse_probe_timeout_ms)]
+        timeout: u32,
+    },
     /// Install or control meshd as an OS service (needs root / Administrator, except
     /// status).
     #[command(subcommand)]
@@ -225,9 +240,56 @@ pub fn parse_ttl(s: &str) -> Result<u32, String> {
     u32::try_from(secs).map_err(|_| "the ttl is too long".into())
 }
 
+/// `100ms`, `5s`, `1m` or a plain number of seconds, as milliseconds.
+pub fn parse_interval_ms(s: &str) -> Result<u32, String> {
+    let bad = || format!("{s:?} is not a duration such as 100ms, 5s or 1m");
+    let t = s.trim();
+    let (digits, unit) = match t.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => t.split_at(i),
+        None => (t, "s"),
+    };
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    let mult = match unit {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        _ => return Err(bad()),
+    };
+    u32::try_from(n.saturating_mul(mult)).map_err(|_| "the interval is too long".into())
+}
+
+/// A sample timeout in milliseconds, within what the daemon accepts.
+fn parse_probe_timeout_ms(s: &str) -> Result<u32, String> {
+    let ms = parse_interval_ms(s)?;
+    if (MIN_PROBE_TIMEOUT_MS..=MAX_PROBE_TIMEOUT_MS).contains(&ms) {
+        Ok(ms)
+    } else {
+        Err("the timeout must be between 1s and 2m".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_timeout_range() {
+        assert_eq!(parse_probe_timeout_ms("1s"), Ok(1000));
+        assert_eq!(parse_probe_timeout_ms("2m"), Ok(120_000));
+        assert!(parse_probe_timeout_ms("500ms").is_err());
+        assert!(parse_probe_timeout_ms("3m").is_err());
+    }
+
+    #[test]
+    fn interval_forms() {
+        assert_eq!(parse_interval_ms("100ms"), Ok(100));
+        assert_eq!(parse_interval_ms("5s"), Ok(5000));
+        assert_eq!(parse_interval_ms("2"), Ok(2000));
+        assert_eq!(parse_interval_ms("1m"), Ok(60_000));
+        for bad in ["", "ms", "5x", "-1", "99999999999m"] {
+            assert!(parse_interval_ms(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn ttl_forms() {

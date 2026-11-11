@@ -2,7 +2,7 @@
 //! read side of membership and peer state.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
     encode_info, encode_removal, info_key, member_bytes,
 };
-use crate::peers::{PeerEnv, PeerManager, SignOut, SyncHandler};
+use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
 use crate::transport::{
     ALPN_JOIN, ALPN_SYNC, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
@@ -73,6 +73,18 @@ pub struct MemberStatus {
     pub last_seen_ms: Option<u64>,
     /// Ops this node holds that the member may lack.
     pub lag: u64,
+}
+
+/// What [`Node::wake`] saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeOutcome {
+    /// Peers connected when `wake` was called.
+    pub peers: usize,
+    /// Of those, the ones that completed a round before `wake` returned.
+    pub rounds_completed: usize,
+    /// `limit` passed (or the node shut down) with some of them neither done nor
+    /// disconnected.
+    pub timed_out: bool,
 }
 
 /// A running mesh node. Call [`Node::shutdown`] to stop it; dropping it only cancels its
@@ -116,6 +128,9 @@ pub(crate) struct Inner {
     pub(crate) force_lagged: Arc<Notify>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     lose_events: Arc<AtomicBool>,
+    /// Test hook: iroh `Endpoint::network_change` calls completed.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    network_changes: AtomicU64,
 }
 
 impl Inner {
@@ -200,6 +215,17 @@ impl NodeHandle {
         peer: NodeId,
         alpn: &[u8],
     ) -> Result<iroh::endpoint::Connection, NodeError> {
+        self.connect_within(peer, alpn, crate::peers::DIAL_TIMEOUT)
+            .await
+    }
+
+    /// [`NodeHandle::connect`] with its own dial timeout instead of the default 30 s.
+    pub async fn connect_within(
+        &self,
+        peer: NodeId,
+        alpn: &[u8],
+        limit: Duration,
+    ) -> Result<iroh::endpoint::Connection, NodeError> {
         if peer == self.inner.me {
             return Err(NodeError::ConnectToSelf);
         }
@@ -207,7 +233,7 @@ impl NodeHandle {
         if !snap.is_effective(&peer) {
             return Err(NodeError::NotEffective);
         }
-        let conn = self.inner.peers.connect(peer, alpn).await?;
+        let conn = self.inner.peers.connect_within(peer, alpn, limit).await?;
         // Closed with `REMOVED` if the peer stops being effective.
         self.inner.extra_conns.track(conn.clone());
         Ok(conn)
@@ -454,6 +480,11 @@ pub(crate) async fn start(
             signout: signout.clone(),
             serve_paused: serve_paused.clone(),
             stale: stale_tx,
+            catch_up: Arc::new(CatchUp::new(
+                cfg.wall.clone(),
+                cfg.catch_up_on_incoming_after,
+            )),
+            on_catch_up: cfg.on_catch_up.clone(),
         },
         cancel.child_token(),
     );
@@ -584,6 +615,7 @@ pub(crate) async fn start(
         rebootstrap: tokio::sync::Mutex::new(()),
         crash_after_reset: AtomicBool::new(false),
         hold_before_reset: watch::Sender::new(false),
+        network_changes: AtomicU64::new(0),
         tasks: Mutex::new(tasks),
         cancel,
         force_lagged,
@@ -756,10 +788,46 @@ impl Node {
     /// The network changed (Android hook): tell iroh and redial every peer now.
     pub fn network_change(&self) {
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let ep = self.inner.endpoint.clone();
-            rt.spawn(async move { ep.network_change().await });
+            let inner = self.inner.clone();
+            rt.spawn(async move {
+                inner.endpoint.network_change().await;
+                inner.network_changes.fetch_add(1, Ordering::SeqCst);
+            });
         }
         self.inner.peers.reset_backoff_all();
+    }
+
+    /// Turns the incoming-traffic catch-up on (`Some(silence)`) or off at runtime (see
+    /// [`NodeConfig::catch_up_on_incoming_after`]).
+    pub fn set_catch_up_on_incoming(&self, after: Option<Duration>) {
+        self.inner.peers.set_catch_up(after);
+    }
+
+    /// Catches up after a sleep (Android): [`Node::network_change`], then
+    /// [`Node::sync_now`], then waits until every peer connected at the call has completed
+    /// a round or disconnected, for at most `limit`. A round already in progress at the
+    /// call counts once it completes; a peer that disconnects counts as done (not as a
+    /// round). `timed_out` is also true when the node is shut down with peers pending.
+    pub async fn wake(&self, limit: Duration) -> WakeOutcome {
+        // A huge `limit` must not overflow: about 30 years is "forever".
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(limit)
+            .or_else(|| now.checked_add(Duration::from_secs(30 * 365 * 24 * 3600)))
+            .unwrap_or(now);
+        // Subscribed before anything starts, so no completion is missed.
+        let rx = self.inner.events.subscribe();
+        let peers = &self.inner.peers;
+        let pending = peers.round_marks();
+        let total = pending.len();
+        self.network_change();
+        self.sync_now();
+        let (rounds, left) = peers.wait_rounds(pending, deadline, rx).await;
+        WakeOutcome {
+            peers: total,
+            rounds_completed: rounds,
+            timed_out: left > 0,
+        }
     }
 
     /// Removes member `id` (spec §4). Takes effect on each node once it receives the
@@ -874,6 +942,17 @@ impl Drop for Node {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+impl NodeHandle {
+    /// Rounds this node completed with `peer` so far (0 without a slot for it).
+    pub fn rounds_with_for_test(&self, peer: NodeId) -> u64 {
+        self.inner
+            .peers
+            .metrics(&peer)
+            .map_or(0, |m| m.rounds_completed.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 impl Node {
     /// Starts a member without `join` (the founder adds its `members` record itself).
     pub async fn start_member_for_test(
@@ -905,6 +984,11 @@ impl Node {
 
     pub fn heal(&self) {
         self.inner.peers.heal();
+    }
+
+    /// iroh `Endpoint::network_change` calls completed through [`Node::network_change`].
+    pub fn network_changes_for_test(&self) -> u64 {
+        self.inner.network_changes.load(Ordering::SeqCst)
     }
 
     /// Runs one maintenance job now.

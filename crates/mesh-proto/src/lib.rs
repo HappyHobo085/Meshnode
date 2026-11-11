@@ -10,12 +10,15 @@ mod ticket;
 
 pub use httpfwd::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
-    MAX_HEADERS, MAX_PATH, is_hop_by_hop,
+    MAX_HEADERS, MAX_PATH, PING_SERVICE, is_hop_by_hop,
 };
 pub use ids::{MeshId, NodeAddrBytes, NodeId, Role};
 pub use join::{JoinRequest, JoinResponse, MemberInfo, MeshGenesis, RefuseReason, RemovalRecord};
 pub use op::{OpBody, Payload, SignedOp};
-pub use service::{Limits, Placement, ServiceKind, ServiceManifest, valid_service_name};
+pub use service::{
+    Limits, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, Placement, ServiceKind, ServiceManifest,
+    valid_service_name,
+};
 pub use sync::{MAX_BATCH_BYTES, MAX_BATCH_OPS, SyncMsg, VersionVector, batch_ops};
 pub use ticket::InviteTicket;
 

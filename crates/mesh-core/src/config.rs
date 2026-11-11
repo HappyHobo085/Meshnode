@@ -1,5 +1,6 @@
 //! Node configuration and timings.
 
+use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,6 +8,10 @@ use std::time::Duration;
 
 use iroh::protocol::DynProtocolHandler;
 use mesh_hlc::{SystemClock, WallClock};
+
+/// Called when the incoming-traffic catch-up starts its rounds (see
+/// [`NodeConfig::on_catch_up`]); the value it returns is held until they end.
+pub type CatchUpHook = Arc<dyn Fn() -> Box<dyn Any + Send> + Send + Sync>;
 
 /// Wrapper that lets a shared `dyn WallClock` be used as the store's clock type.
 #[derive(Clone)]
@@ -87,6 +92,16 @@ pub struct NodeConfig {
     pub wall: Arc<dyn WallClock>,
     /// Further protocols (ALPN, handler), served behind the membership gate like `sync/1`.
     pub extra_protocols: Vec<(Vec<u8>, Arc<dyn DynProtocolHandler>)>,
+    /// Incoming peer traffic (an accepted `sync/1` connection or message) after at least
+    /// this much silence, measured on `wall`, starts a round with every connected peer: a
+    /// phone that slept catches up. `None` (the default) turns it off; see
+    /// `Node::set_catch_up_on_incoming`.
+    pub catch_up_on_incoming_after: Option<Duration>,
+    /// Called each time the incoming-traffic catch-up starts a round with every connected
+    /// peer; the value returned (a host's wake-lock guard) is dropped once each of those
+    /// peers completed a round or disconnected, after at most 60 s, or at shutdown.
+    /// `None` (the default): nothing is called.
+    pub on_catch_up: Option<CatchUpHook>,
 }
 
 impl NodeConfig {
@@ -102,6 +117,8 @@ impl NodeConfig {
             timings: Timings::default(),
             wall: Arc::new(SystemClock),
             extra_protocols: Vec::new(),
+            catch_up_on_incoming_after: None,
+            on_catch_up: None,
         }
     }
 }

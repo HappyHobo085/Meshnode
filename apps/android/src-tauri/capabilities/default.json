@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "The placeholder page's window: only the app's four commands. No core permission is needed: invoking an app command is checked against these permissions alone, and the page uses no core plugin (window, event, path, ...).",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-status",
+    "allow-join",
+    "allow-service-start",
+    "allow-service-stop"
+  ]
+}

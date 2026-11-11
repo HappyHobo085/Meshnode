@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,7 +12,7 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, heade
 use iroh::endpoint::{RecvStream, SendStream, VarInt};
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_core::{AcceptError, Connection, ProtocolHandler};
-use mesh_proto::{ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, is_hop_by_hop};
+use mesh_proto::{ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, PING_SERVICE, is_hop_by_hop};
 use mesh_services::Services;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -49,6 +49,44 @@ pub struct HttpFwdSlot {
     slot: Arc<SlotInner>,
 }
 
+/// An inbound stream starting or finishing being served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Activity {
+    /// A stream was accepted; it is read and answered from now on.
+    Start,
+    /// That stream is done: its response was written, or it failed, was reset or timed out.
+    /// Every `Start` is followed by exactly one `End`.
+    End,
+}
+
+type ActivityFn = Arc<dyn Fn(Activity) + Send + Sync>;
+
+/// Reports `Start` on creation and `End` on drop, so that every exit path of
+/// [`serve_stream`] is balanced.
+struct ActivityGuard(Option<ActivityFn>);
+
+impl ActivityGuard {
+    fn start(slot: &SlotInner) -> ActivityGuard {
+        let f = slot
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(f) = &f {
+            f(Activity::Start);
+        }
+        ActivityGuard(f)
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            f(Activity::End);
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
     /// Weak: the handler lives in the node's router, and `Services` hold the node's
@@ -56,6 +94,11 @@ struct SlotInner {
     services: OnceLock<Weak<Services>>,
     /// Set by [`HttpFwdSlot::detach`]: new requests no longer reach the services.
     detached: AtomicBool,
+    /// Set by [`HttpFwdSlot::set_paused`]: new requests are answered like `detached` ones,
+    /// except `_ping`.
+    paused: AtomicBool,
+    /// Called when inbound streams start and finish being served.
+    activity: Mutex<Option<ActivityFn>>,
     /// Requests answered (test hook).
     served: AtomicU64,
 }
@@ -83,6 +126,19 @@ impl HttpFwdSlot {
     /// in flight still hold the services.
     pub fn detach(&self) {
         self.slot.detached.store(true, Ordering::SeqCst);
+    }
+
+    /// While paused, new requests are answered `503 Service not yet replicated` (as after
+    /// [`detach`](Self::detach), but reversible); `_ping` is still answered.
+    pub fn set_paused(&self, paused: bool) {
+        self.slot.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Calls `f` with [`Activity::Start`] when an inbound stream begins being served and
+    /// [`Activity::End`] when it is done, whichever way. Replaces any earlier callback; it
+    /// runs on the serving task, so it must not block.
+    pub fn set_activity(&self, f: Arc<dyn Fn(Activity) + Send + Sync>) {
+        *self.slot.activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
     /// Requests this handler has answered, including the `503`s before attach.
@@ -134,6 +190,7 @@ impl ProtocolHandler for HttpFwdHandler {
 }
 
 async fn serve_stream(slot: &SlotInner, mut send: SendStream, mut recv: RecvStream) {
+    let _activity = ActivityGuard::start(slot);
     let req = match timeout(
         READ_TIMEOUT,
         read_frame::<_, ForwardRequest>(&mut recv, HTTPFWD_MAX_FRAME),
@@ -158,21 +215,27 @@ async fn serve_stream(slot: &SlotInner, mut send: SendStream, mut recv: RecvStre
         }
     };
     let service = req.service.clone();
-    let services = if slot.detached.load(Ordering::SeqCst) {
-        None
+    let resp = if service == PING_SERVICE {
+        // Before the services lookup: answered whatever the state.
+        no_content()
     } else {
-        slot.services.get().and_then(Weak::upgrade)
-    };
-    let resp = match services {
-        None => not_replicated(),
-        Some(services) => match to_request(req) {
-            Ok(r) => services.handle(&service, r).await,
-            Err(e) => {
-                debug!(service, error = %e, "httpfwd request not convertible");
-                reset(&mut send, &mut recv, BAD_REQUEST);
-                return;
-            }
-        },
+        let services = if slot.detached.load(Ordering::SeqCst) || slot.paused.load(Ordering::SeqCst)
+        {
+            None
+        } else {
+            slot.services.get().and_then(Weak::upgrade)
+        };
+        match services {
+            None => not_replicated(),
+            Some(services) => match to_request(req) {
+                Ok(r) => services.handle(&service, r).await,
+                Err(e) => {
+                    debug!(service, error = %e, "httpfwd request not convertible");
+                    reset(&mut send, &mut recv, BAD_REQUEST);
+                    return;
+                }
+            },
+        }
     };
     slot.served.fetch_add(1, Ordering::SeqCst);
     let frame = from_response(resp);
@@ -199,6 +262,12 @@ async fn serve_stream(slot: &SlotInner, mut send: SendStream, mut recv: RecvStre
 fn reset(send: &mut SendStream, recv: &mut RecvStream, code: VarInt) {
     let _ = send.reset(code);
     let _ = recv.stop(code);
+}
+
+fn no_content() -> Response<Bytes> {
+    let mut resp = Response::new(Bytes::new());
+    *resp.status_mut() = StatusCode::NO_CONTENT;
+    resp
 }
 
 fn not_replicated() -> Response<Bytes> {

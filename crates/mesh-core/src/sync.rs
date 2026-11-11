@@ -79,6 +79,8 @@ pub struct SessionCtx {
     pub(crate) metrics: Arc<PeerMetrics>,
     pub(crate) serve_paused: Arc<AtomicBool>,
     pub(crate) signout: Arc<crate::peers::SignOut>,
+    /// Told of every message read (the node's incoming-traffic catch-up).
+    pub(crate) incoming: Option<crate::peers::IncomingHook>,
 }
 
 /// The other ends of a test session's channels.
@@ -117,6 +119,7 @@ impl SessionCtx {
             metrics: metrics.clone(),
             serve_paused: serve_paused.clone(),
             signout: Arc::default(),
+            incoming: None,
         };
         let handles = TestHandles {
             cmds: cmd_tx,
@@ -232,6 +235,7 @@ struct Parts {
     metrics: Arc<PeerMetrics>,
     serve_paused: Arc<AtomicBool>,
     signout: Arc<crate::peers::SignOut>,
+    incoming: Option<crate::peers::IncomingHook>,
 }
 
 /// Runs one session until the stream closes or an error ends it. The dialer starts a
@@ -254,6 +258,7 @@ where
         metrics,
         serve_paused,
         signout,
+        incoming,
     } = ctx;
     let s = Session {
         ctx: Parts {
@@ -268,6 +273,7 @@ where
             metrics,
             serve_paused,
             signout,
+            incoming,
         },
         st: Mutex::new(State::default()),
         kick: Notify::new(),
@@ -365,6 +371,9 @@ impl Session {
             let is_hello = matches!(msg, SyncMsg::Hello { .. });
             if let Err(end) = self.on_message(msg).await {
                 return end;
+            }
+            if let Some(hook) = &self.ctx.incoming {
+                hook.traffic();
             }
             // Android rule (master §10.2): traffic after a long silence starts a round,
             // unless the peer is starting one itself.

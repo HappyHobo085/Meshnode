@@ -1,0 +1,41 @@
+[package]
+name = "meshnode-android"
+version = "0.1.0"
+description = "Meshnode for Android: the Tauri shell and the one native library (mesh-ffi)"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace (the root workspace excludes apps/android): the Tauri and Android
+# dependency tree stays out of the desktop builds.
+[workspace]
+
+[lib]
+# The one native library of the app (`libmeshnode_app.so`): Tauri's runtime, the Tauri
+# commands and mesh-ffi's UniFFI scaffolding, used by the Kotlin service too.
+name = "meshnode_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mesh-ffi = { path = "../../../crates/mesh-ffi" }
+mesh-admin = { path = "../../../crates/mesh-admin" }
+postcard = { version = "1", features = ["alloc", "use-std"] }
+tauri = { version = "2", features = [] }
+
+# The `.so` shipped in release APKs. Never `panic = "abort"`: mesh-ffi catches panics
+# at the FFI boundary (catch_unwind).
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = "s"
+
+# Patched copy: initialisation is idempotent and race-free, so tao and mesh-ffi can both
+# set the Android context (see patches/ndk-context/README.md). Repeats the root workspace's
+# patch.
+[patch.crates-io]
+ndk-context = { path = "../../../patches/ndk-context" }

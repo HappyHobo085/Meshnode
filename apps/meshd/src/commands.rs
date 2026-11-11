@@ -105,6 +105,12 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             say!("Removed {}.", id.short());
             Ok(())
         }
+        Command::Probe {
+            node,
+            count,
+            interval,
+            timeout,
+        } => probe(&data, node, count, interval, timeout).await,
         Command::Deploy(d) => deploy(&data, d).await,
         Command::SetPlacement { name, placement } => {
             let placement = placement_of(&data, &placement).await?;
@@ -562,6 +568,50 @@ async fn logs(data: &Path, lines: u32, follow: bool) -> Result<(), CliError> {
             _ = &mut stop => return Ok(()),
         }
     }
+}
+
+// --- probe ---------------------------------------------------------------------------------
+
+async fn probe(
+    data: &Path,
+    node: String,
+    count: u32,
+    interval_ms: u32,
+    timeout_ms: u32,
+) -> Result<(), CliError> {
+    let mut client = connect(data).await?;
+    let stream = client.probe(node, count, interval_ms, timeout_ms);
+    tokio::pin!(stream);
+    let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
+    let (mut ms, mut seen) = (Vec::new(), 0usize);
+    let mut total = count as usize;
+    loop {
+        tokio::select! {
+            item = stream.next() => match item {
+                Some(Ok(batch)) => {
+                    for l in batch {
+                        say!("{l}");
+                        seen += 1;
+                        ms.extend(output::probe_sample(&l));
+                    }
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            },
+            _ = &mut stop => {
+                total = seen;
+                break;
+            }
+        }
+    }
+    say!("{}", output::probe_summary(&ms, total));
+    if ms.is_empty() && total > 0 {
+        return Err(CliError {
+            code: 2,
+            message: "every sample failed".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

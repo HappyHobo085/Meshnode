@@ -495,3 +495,187 @@ async fn online_host_failing_at_connect_then_next_serves() {
     assert_eq!(mesh.served(2), 1, "C served it");
     mesh.shutdown().await;
 }
+
+// ------------------------------------------------------------ _ping, pause, activity
+
+use mesh_gateway::Activity;
+use mesh_proto::PING_SERVICE;
+
+#[test]
+fn ping_name_is_not_a_valid_service_name() {
+    assert_eq!(PING_SERVICE, "_ping");
+    assert!(!mesh_proto::valid_service_name(PING_SERVICE));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ping_service_answers_204() {
+    // No services attached on node 0.
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Unattached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let resp = raw_forward(&mesh, 1, 0, &fwd_req(PING_SERVICE)).await;
+    assert_eq!(resp.status, 204);
+    assert!(resp.body.is_empty());
+    // Also detached.
+    mesh.m[1].slot.as_ref().unwrap().detach();
+    let resp = raw_forward(&mesh, 0, 1, &fwd_req(PING_SERVICE)).await;
+    assert_eq!(resp.status, 204);
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ping_gated_for_non_members() {
+    let mesh = mesh(vec![(Role::Host, Serve::Attached)]).await;
+    let dx = tempfile::tempdir().unwrap();
+    let mut cx = mesh_core::NodeConfig::new(dx.path(), "x");
+    cx.relay = mesh_core::RelayChoice::Disabled;
+    cx.discovery = false;
+    cx.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+    let key = ed25519_dalek::SigningKey::from_bytes(&[77; 32]);
+    let ep = mesh_core::transport::build_endpoint(&cx, &key)
+        .await
+        .unwrap();
+    let conn = ep
+        .connect(mesh.m[0].node.endpoint_addr_for_test(), ALPN_HTTPFWD)
+        .await
+        .unwrap();
+    // The gate closes the connection; no request is ever answered.
+    let closed = timeout(T, conn.closed()).await.unwrap();
+    match closed {
+        iroh::endpoint::ConnectionError::ApplicationClosed(c) => {
+            assert_eq!(c.error_code, mesh_core::transport::NOT_MEMBER)
+        }
+        other => panic!("unexpected close: {other:?}"),
+    }
+    ep.close().await;
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_answers_503_then_resumes() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    // Served on node 0, so that the request after the resume is answered 200.
+    deploy_counter(&mesh, Placement::Nodes(vec![mesh.id(0)])).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
+    let slot = mesh.m[0].slot.as_ref().unwrap();
+    slot.set_paused(true);
+    let resp = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.body, b"Service not yet replicated");
+    assert_eq!(
+        raw_forward(&mesh, 1, 0, &fwd_req(PING_SERVICE))
+            .await
+            .status,
+        204
+    );
+    slot.set_paused(false);
+    let resp = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
+    assert_eq!(
+        resp.status,
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    mesh.shutdown().await;
+}
+
+/// Opens a stream to node 0, sends `bytes` raw, and finishes the stream.
+async fn raw_bytes(mesh: &Mesh, bytes: &[u8]) {
+    let conn = mesh.m[1]
+        .node
+        .handle()
+        .connect(mesh.id(0), ALPN_HTTPFWD)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(bytes).await.unwrap();
+    send.finish().unwrap();
+    // The server answers or resets; either way the stream ends.
+    let _ = timeout(T, recv.read_to_end(HTTPFWD_MAX_FRAME)).await;
+}
+
+/// The 30 s read/write timeouts are not exercised in real time here: a timed-out stream
+/// leaves through the same `ActivityGuard` drop as the error and reset paths below, which
+/// are, so `End` follows `Start` there too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activity_start_end_balanced_on_success_error_and_timeout() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ev = events.clone();
+    mesh.m[0]
+        .slot
+        .as_ref()
+        .unwrap()
+        .set_activity(Arc::new(move |a| ev.lock().unwrap().push(a)));
+    let counts = || {
+        let e = events.lock().unwrap();
+        let n = |k| e.iter().filter(|a| **a == k).count();
+        (n(Activity::Start), n(Activity::End))
+    };
+
+    // Success: Start then End.
+    assert_eq!(
+        raw_forward(&mesh, 1, 0, &fwd_req(PING_SERVICE))
+            .await
+            .status,
+        204
+    );
+    wait_for("one balanced stream", || async { counts() == (1, 1) }).await;
+    assert_eq!(events.lock().unwrap()[0], Activity::Start);
+
+    // Paused 503 is also a stream served.
+    mesh.m[0].slot.as_ref().unwrap().set_paused(true);
+    raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
+    wait_for("two balanced streams", || async { counts() == (2, 2) }).await;
+    mesh.m[0].slot.as_ref().unwrap().set_paused(false);
+
+    // Error: a request that is not convertible resets the stream.
+    let mut bad = fwd_req(COUNTER);
+    bad.method = "BAD METHOD".into();
+    {
+        let conn = mesh.m[1]
+            .node
+            .handle()
+            .connect(mesh.id(0), ALPN_HTTPFWD)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &bad).await.unwrap();
+        send.finish().unwrap();
+        assert!(
+            read_frame::<_, ForwardResponse>(&mut recv, HTTPFWD_MAX_FRAME)
+                .await
+                .is_err()
+        );
+    }
+    wait_for("three balanced streams", || async { counts() == (3, 3) }).await;
+
+    // Error: a malformed request frame (oversized length prefix).
+    raw_bytes(&mesh, &[0xff; 8]).await;
+    wait_for("four balanced streams", || async { counts() == (4, 4) }).await;
+
+    // Reset by the peer before a request arrives (the read path).
+    {
+        let conn = mesh.m[1]
+            .node
+            .handle()
+            .connect(mesh.id(0), ALPN_HTTPFWD)
+            .await
+            .unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0, 0, 0, 9]).await.unwrap();
+        send.reset(7u32.into()).unwrap();
+    }
+    wait_for("five balanced streams", || async { counts() == (5, 5) }).await;
+    mesh.shutdown().await;
+}

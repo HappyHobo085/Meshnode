@@ -14,7 +14,7 @@ use mesh_core::membership::MESH_NS;
 use mesh_core::{Connection, NodeHandle};
 use mesh_proto::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
-    MAX_HEADERS, MAX_PATH, NodeId, Role, ServiceManifest, decode_raw,
+    MAX_HEADERS, MAX_PATH, NodeId, PING_SERVICE, Role, ServiceManifest, decode_raw,
 };
 use mesh_services::{LocalState, Services, manifest_key, placed_hosts};
 use tokio::sync::Semaphore;
@@ -248,6 +248,81 @@ impl Inner {
         }
         conn.close(DROPPED, b"httpfwd error");
     }
+}
+
+/// Why a `_ping` failed.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PingError {
+    /// No answer within the limit (milliseconds).
+    #[error("timed out after {0} ms")]
+    Timeout(u64),
+    #[error("connect failed: {0}")]
+    Connect(String),
+    /// The peer answered something other than `204`.
+    #[error("unexpected status {0}")]
+    Status(u16),
+    /// The request or response frame, or the stream, failed.
+    #[error("{0}")]
+    Frame(String),
+}
+
+/// Where the time of a successful [`ping`] went.
+#[derive(Clone, Copy, Debug)]
+pub struct PingTiming {
+    /// Dialling the peer.
+    pub connect: Duration,
+    /// Request out, response back, on the new connection.
+    pub exchange: Duration,
+    /// Both.
+    pub total: Duration,
+}
+
+/// Closes its connection when dropped, whichever way the ping ends (or is cancelled).
+struct CloseOnDrop(Connection);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close(DROPPED, b"ping done");
+    }
+}
+
+/// Sends one `_ping` `httpfwd` request straight to `peer` on a fresh connection (the cold
+/// path), within `limit` in all, and reports the connect and exchange times. The peer
+/// answers `204` without consulting its services, whatever its state. Uses the
+/// forwarder's frame helpers but not its connection cache or its host selection.
+pub async fn ping(
+    node: &NodeHandle,
+    peer: NodeId,
+    limit: Duration,
+) -> Result<PingTiming, PingError> {
+    let req = Request::get("/")
+        .body(Bytes::new())
+        .map_err(|e| PingError::Frame(e.to_string()))?;
+    let frame = encode_request(PING_SERVICE, req).map_err(|e| PingError::Frame(e.to_string()))?;
+    let start = Instant::now();
+    let deadline = start + limit;
+    let timed_out = || PingError::Timeout(limit.as_millis() as u64);
+    // The dial gets a little more than the deadline, so that the deadline reports it.
+    let dial = limit + Duration::from_secs(1);
+    let conn = timeout_at(deadline, node.connect_within(peer, ALPN_HTTPFWD, dial))
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(|e| PingError::Connect(e.to_string()))?;
+    let conn = CloseOnDrop(conn);
+    let connected = Instant::now();
+    let fr = timeout_at(deadline, exchange(&conn.0, &frame))
+        .await
+        .map_err(|_| timed_out())?
+        .map_err(|e| PingError::Frame(e.to_string()))?;
+    let done = Instant::now();
+    if fr.status != 204 {
+        return Err(PingError::Status(fr.status));
+    }
+    Ok(PingTiming {
+        connect: connected - start,
+        exchange: done - connected,
+        total: done - start,
+    })
 }
 
 /// Sends one request frame on a new stream and reads the response frame (at most

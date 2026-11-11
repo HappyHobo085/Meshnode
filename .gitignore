@@ -17,3 +17,4 @@ apps/ui/dist/
 apps/ui/node_modules/
 # A library: the app workspaces' lock files pin its dependencies.
 crates/mesh-ui-tauri/Cargo.lock
+services/*/target/

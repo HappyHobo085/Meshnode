@@ -2,7 +2,7 @@
 //! service's limits (sub-spec 3 §3.3).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -32,7 +32,14 @@ pub(crate) struct Shared {
     pub(crate) instantiations: Arc<AtomicU64>,
     /// Keeps the epoch ticking while a guest runs.
     pub(crate) ticker: TickerHandle,
+    /// The `wasi:clocks/wall-clock` time every guest sees, in ms since the UNIX epoch, or
+    /// [`REAL_WALL_CLOCK`] for the host's real clock. Only a test hook changes it
+    /// (`Runtime::set_wall_clock_ms`).
+    pub(crate) fixed_wall_ms: Arc<AtomicI64>,
 }
+
+/// [`Shared::fixed_wall_ms`] when guests see the real wall clock.
+pub(crate) const REAL_WALL_CLOCK: i64 = i64::MIN;
 
 /// The body of the `503` for a request the memory budget cannot take.
 const MEMORY_EXHAUSTED: &str = "Memory budget exhausted";
@@ -139,6 +146,7 @@ async fn run(
         node_id,
         kv_status.clone(),
         limits.memory_mb,
+        Some(shared.fixed_wall_ms.load(Ordering::Relaxed)).filter(|&ms| ms != REAL_WALL_CLOCK),
     );
     let mut store = Store::new(pre.engine(), state);
     store.limiter(State::limiter);

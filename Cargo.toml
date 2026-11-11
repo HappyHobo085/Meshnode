@@ -4,6 +4,8 @@ members = ["crates/*", "apps/meshd"]
 exclude = [
     "spikes",
     "crates/mesh-runtime/tests/fixtures",
+    # WASM services, each its own workspace built for wasm32-wasip2 (scripts/build-services.sh).
+    "services",
     "patches",
     # Vendored third-party-style trees (see vendor/VENDORED.md); not part of this workspace.
     "vendor",

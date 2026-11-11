@@ -69,11 +69,15 @@ impl State {
         node_id: NodeId,
         kv_status: KvStatus,
         memory_mb: u32,
+        fixed_wall_ms: Option<i64>,
     ) -> Self {
-        let wasi = WasiCtx::builder()
-            .stdout(GuestOutput::new(service, Stream::Stdout))
-            .stderr(GuestOutput::new(service, Stream::Stderr))
-            .build();
+        let mut wasi = WasiCtx::builder();
+        wasi.stdout(GuestOutput::new(service, Stream::Stdout))
+            .stderr(GuestOutput::new(service, Stream::Stderr));
+        if let Some(ms) = fixed_wall_ms {
+            wasi.wall_clock(FixedWallClock(ms));
+        }
+        let wasi = wasi.build();
         State {
             wasi,
             http: WasiHttpCtx::new(),
@@ -89,6 +93,20 @@ impl State {
     /// For [`wasmtime::Store::limiter`].
     pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
         &mut self.limiter
+    }
+}
+
+/// A wall clock stopped at `.0` ms since the UNIX epoch (a test hook; see
+/// `Runtime::set_wall_clock_ms`). A negative time reads as the epoch.
+struct FixedWallClock(i64);
+
+impl wasmtime_wasi::HostWallClock for FixedWallClock {
+    fn resolution(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(1)
+    }
+
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::try_from(self.0).unwrap_or(0))
     }
 }
 

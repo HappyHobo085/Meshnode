@@ -1,0 +1,348 @@
+//! `GET /v1/records` and `POST /v1/records`, as the native handlers answer them, over the
+//! record layout of [`crate::keys`].
+use std::collections::VecDeque;
+
+use aegis_sync_core::canon::{canonicalize_body, reject_client_poisoning_stamps};
+use aegis_sync_core::env::Entropy;
+use aegis_sync_core::order::{order_bytes, tie_ord};
+use aegis_sync_core::wire::{
+    MAX_CT_LEN, MAX_FIELD_LEN, MAX_RECORDS_PER_ACCOUNT, MAX_RECORDS_PER_REQUEST,
+    MAX_RESPONSE_BYTES, MAX_RESPONSE_RECORDS, WireRecord, hlc_key, hlc_well_formed, wire_bytes,
+};
+use serde::Deserialize;
+use serde_json::json;
+use wstd::http::{Body, HeaderValue, Response};
+
+use crate::http::{Resp, json, query_pairs, status};
+use crate::keys;
+use crate::meshnode::kv::store as kv;
+use crate::{auth, store};
+
+// ----------------------------------------------------------------------------- GET
+
+struct RecordsQuery {
+    ns: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The native `Query<RecordsQuery>`: `ns` required, `limit` a `usize`, a repeated field is an
+/// error. Unknown fields are ignored. Every failure is a `400`, before authentication.
+fn parse_query(q: &str) -> Result<RecordsQuery, u16> {
+    let (mut ns, mut cursor, mut limit) = (None, None, None);
+    for (k, v) in query_pairs(q) {
+        let slot = match k.as_str() {
+            "ns" => &mut ns,
+            "cursor" => &mut cursor,
+            "limit" => &mut limit,
+            _ => continue,
+        };
+        if slot.replace(v).is_some() {
+            return Err(400);
+        }
+    }
+    let limit = match limit {
+        Some(l) => Some(l.parse::<usize>().map_err(|_| 400u16)?),
+        None => None,
+    };
+    Ok(RecordsQuery {
+        ns: ns.ok_or(400u16)?,
+        cursor,
+        limit,
+    })
+}
+
+/// One page of `(account, ns)` in uuid order after `cursor`, with the tie `ord` applied.
+///
+/// The page is the core's `page::page_sorted` page (same limit clamp, the same stop before
+/// the record that would cross `MAX_RESPONSE_BYTES`, the first record always served, `next`
+/// the last uuid served), but computed record by record while the response body streams, so
+/// guest memory holds one record and one output chunk, not the page: a full 32 MiB page held
+/// as records, then cloned, then serialized would not fit the service's 64 MB. The harness
+/// checks every page it walks against `page_sorted` itself.
+///
+/// The runtime caps a RESPONSE body at the service's `max_body_bytes` as well, so serving a
+/// full `MAX_RESPONSE_BYTES` page needs that limit above 32 MiB (the request body stays bounded
+/// at `MAX_BODY_BYTES` by `http::read_body`).
+pub fn get(query: &str, authz: Option<&str>) -> Resp {
+    let q = match parse_query(query) {
+        Ok(q) => q,
+        Err(code) => return status(code),
+    };
+    let caller = match auth::authenticate(authz, auth::member) {
+        Ok(c) => c,
+        Err(code) => return status(code),
+    };
+    if q.ns.is_empty() {
+        return status(400);
+    }
+    if q.ns.len() > MAX_FIELD_LEN || q.cursor.as_ref().is_some_and(|c| c.len() > MAX_FIELD_LEN) {
+        return status(413);
+    }
+    let prefix = keys::rec_prefix(&caller.account, &q.ns);
+    let pager = Pager {
+        after: q.cursor.map(|c| format!("{prefix}{c}")),
+        prefix,
+        account: caller.account,
+        ns: q.ns,
+        limit: q
+            .limit
+            .unwrap_or(MAX_RESPONSE_RECORDS)
+            .clamp(1, MAX_RESPONSE_RECORDS),
+        queued: VecDeque::new(),
+        exhausted: false,
+        served: 0,
+        bytes: 0,
+        last: None,
+        end_after: None,
+        state: PagerState::Head,
+    };
+    let mut resp = Response::new(Body::from_stream(futures_lite::stream::iter(pager)));
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    resp
+}
+
+/// Bytes the pager gathers before handing a chunk to the response stream.
+const CHUNK: usize = 64 * 1024;
+
+enum PagerState {
+    Head,
+    Records,
+    Done,
+}
+
+enum Step {
+    Emit(WireRecord),
+    End(Option<String>),
+}
+
+/// The streaming page: an iterator of body chunks `{"records":[` … `],"next":…}`.
+struct Pager {
+    account: String,
+    ns: String,
+    prefix: String,
+    /// The `start-after` key of the next `list-keys` call.
+    after: Option<String>,
+    limit: usize,
+    /// Keys listed but not read yet.
+    queued: VecDeque<String>,
+    /// `list-keys` has nothing more after `after`.
+    exhausted: bool,
+    served: usize,
+    bytes: u64,
+    last: Option<String>,
+    /// The page ends right after the record just emitted, with this `next`.
+    end_after: Option<Option<String>>,
+    state: PagerState,
+}
+
+impl Pager {
+    /// The namespace's next record in uuid order, as served (tie `ord` included). Lists keys
+    /// only as far as needed: at most one record past a page that fills by count.
+    fn next_record(&mut self) -> Option<WireRecord> {
+        loop {
+            if let Some(key) = self.queued.pop_front() {
+                // A key listed but deleted before this read is simply gone.
+                let Some(mut rec) = store::record(&key) else {
+                    continue;
+                };
+                rec.uuid = key[self.prefix.len()..].to_string();
+                rec.ord = None;
+                if store::tied_below(&self.account, &self.ns, &rec) {
+                    rec.ord = Some(tie_ord(&rec));
+                }
+                return Some(rec);
+            }
+            if self.exhausted {
+                return None;
+            }
+            let want = (self.limit - self.served.min(self.limit) + 1).min(store::PAGE as usize);
+            let batch = kv::list_keys(&self.prefix, self.after.as_deref(), want as u32);
+            self.exhausted = batch.len() < want;
+            if let Some(k) = batch.last() {
+                self.after = Some(k.clone());
+            }
+            self.queued.extend(batch);
+        }
+    }
+
+    /// One iteration of `page_sorted`'s loop.
+    fn step(&mut self) -> Step {
+        if let Some(next) = self.end_after.take() {
+            return Step::End(next);
+        }
+        let Some(r) = self.next_record() else {
+            return Step::End(None);
+        };
+        if self.served >= self.limit {
+            // The page is full but the namespace is not exhausted.
+            return Step::End(self.last.clone());
+        }
+        self.bytes += wire_bytes(&r) as u64;
+        if self.served == 0 && self.bytes > MAX_RESPONSE_BYTES {
+            // The first record is always served, even over budget, so the cursor moves.
+            self.served = 1;
+            self.end_after = Some(Some(r.uuid.clone()));
+            return Step::Emit(r);
+        }
+        if self.bytes > MAX_RESPONSE_BYTES {
+            return Step::End(self.last.clone());
+        }
+        self.served += 1;
+        self.last = Some(r.uuid.clone());
+        Step::Emit(r)
+    }
+}
+
+impl Iterator for Pager {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        match self.state {
+            PagerState::Head => {
+                self.state = PagerState::Records;
+                Some(b"{\"records\":[".to_vec())
+            }
+            PagerState::Records => {
+                let mut chunk = Vec::new();
+                while chunk.len() < CHUNK {
+                    match self.step() {
+                        Step::Emit(r) => {
+                            if self.served > 1 {
+                                chunk.push(b',');
+                            }
+                            serde_json::to_writer(&mut chunk, &r).expect("a record serializes");
+                        }
+                        Step::End(next) => {
+                            chunk.extend_from_slice(b"],\"next\":");
+                            serde_json::to_writer(&mut chunk, &next).expect("a string serializes");
+                            chunk.push(b'}');
+                            self.state = PagerState::Done;
+                            break;
+                        }
+                    }
+                }
+                Some(chunk)
+            }
+            PagerState::Done => None,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------- POST
+
+#[derive(Deserialize)]
+struct PostRecords {
+    ns: String,
+    records: Vec<WireRecord>,
+}
+
+/// `wasi:random`, for the separator `canon::unique_uuid` draws when a synthesized id is taken.
+struct WasiEntropy;
+
+impl Entropy for WasiEntropy {
+    fn fill(&mut self, buf: &mut [u8]) {
+        let bytes = wasip2::random::random::get_random_bytes(buf.len() as u64);
+        buf.copy_from_slice(&bytes);
+    }
+}
+
+pub fn post(body: &[u8], authz: Option<&str>) -> Resp {
+    match post_inner(body, authz) {
+        Ok(()) => json(&json!({ "ok": true })),
+        Err(code) => status(code),
+    }
+}
+
+fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
+    // The native `Json<PostRecords>` extractor runs before authentication.
+    let body: PostRecords = serde_json::from_slice(body).map_err(|_| 400u16)?;
+    let caller = auth::authenticate(authz, auth::member)?;
+    let acct = caller.account.as_str();
+    let ns = body.ns.as_str();
+    if ns.is_empty() {
+        return Err(400);
+    }
+    if body.records.len() > MAX_RECORDS_PER_REQUEST || ns.len() > MAX_FIELD_LEN {
+        return Err(413);
+    }
+    let mut records = body.records;
+    for r in &mut records {
+        if r.uuid.len() > MAX_FIELD_LEN || r.nonce.len() > MAX_FIELD_LEN || r.ct.len() > MAX_CT_LEN
+        {
+            return Err(413);
+        }
+        if !hlc_well_formed(&r.hlc) {
+            return Err(400);
+        }
+        // `ord` is the server's own ordering stamp, never the client's to set.
+        r.ord = None;
+    }
+    let records = reject_client_poisoning_stamps(records, auth::now_ms());
+    // `canonicalize_body` needs the stored uuids only to keep a synthesized id (for a record
+    // pushed with an empty uuid) off an existing one. The ord it may compute from them is
+    // dropped below (the mesh serves `tie_ord` at read time), so each stands in as a default
+    // record, and the namespace is listed only when an id must be synthesized.
+    let existing: Vec<(String, WireRecord)> = if records.iter().any(|r| r.uuid.is_empty()) {
+        store::uuids(acct, ns)
+            .into_iter()
+            .map(|u| (u, WireRecord::default()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let incoming = canonicalize_body(
+        records,
+        ns,
+        existing.iter().map(|(u, r)| (u.as_str(), r)),
+        &mut WasiEntropy,
+    );
+    drop(existing);
+
+    // The replicated store's own bounds, checked for the whole request before anything is
+    // written: a key or set name over 512 bytes, an order over 64 bytes (an `hlc.node` over
+    // 48 bytes), a NUL in a key. The native server has no such bounds; these are the mesh's.
+    for (uuid, rec) in &incoming {
+        if uuid.contains('\0') {
+            return Err(400);
+        }
+        if keys::rec_key(acct, ns, uuid).len() > keys::MAX_KEY
+            || keys::hlcidx_set(acct, ns, &rec.hlc).len() > keys::MAX_KEY
+            || order_bytes(&rec.hlc).len() > keys::MAX_ORDER
+        {
+            return Err(413);
+        }
+    }
+
+    // HLC last-writer-wins against this node's view: keep the incoming record only if its
+    // `hlc` strictly dominates the stored one (`hlc` against `hlc`, never `ord`). The store's
+    // `set-ordered` applies the same order across replicas; checking here as well skips
+    // writing (and replicating) a stale or repeated push, as the native server keeps the
+    // stored record on an equal `hlc`.
+    let mut writes = Vec::new();
+    let mut new_keys = 0usize;
+    for (uuid, mut rec) in incoming {
+        match store::stored_hlc(&keys::rec_key(acct, ns, &uuid)) {
+            Some(old) if hlc_key(&rec.hlc) <= hlc_key(&old) => continue,
+            Some(_) => {}
+            None => new_keys += 1,
+        }
+        rec.uuid = uuid;
+        rec.ord = None;
+        writes.push(rec);
+    }
+    // Per-account cap over this node's view: refuse to GROW the account past it (updates to
+    // existing records always pass). The mesh total may exceed it by what other nodes admit
+    // concurrently.
+    if new_keys > 0 {
+        let current = store::count_keys(&keys::account_prefix(acct), MAX_RECORDS_PER_ACCOUNT + 1);
+        if current + new_keys > MAX_RECORDS_PER_ACCOUNT {
+            return Err(507);
+        }
+    }
+    for rec in &writes {
+        store::put_record(acct, ns, rec);
+    }
+    Ok(())
+}

@@ -6,8 +6,10 @@ it("default_device_name_per_platform", () => {
     "Mozilla/5.0 (Linux; Android 14; SM-S911B Build/UP1A.231005.007; wv) AppleWebKit/537.36";
   expect(defaultDeviceName("android", s23)).toBe("SM-S911B");
   expect(defaultDeviceName("android", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit")).toBe(
-    "My phone",
+    "Android phone",
   );
+  // No model at all in the user agent.
+  expect(defaultDeviceName("android", "Mozilla/5.0 (Linux; Android 14; wv)")).toBe("Android phone");
   expect(defaultDeviceName("desktop-windows", "")).toBe("Windows PC");
   expect(defaultDeviceName("desktop-macos", "")).toBe("Mac");
   expect(defaultDeviceName("desktop-linux", "")).toBe("Linux PC");

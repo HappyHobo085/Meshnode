@@ -9,7 +9,8 @@ export const chosenName = writable<string | null>(null);
 /**
  * A starting name for this device. The webview can't read the host name, so on desktop it is
  * the kind of computer; on Android it is the phone model when the user agent still carries one
- * (reduced user agents send "K" instead).
+ * (reduced user agents send "K" instead), else "Android phone". Android exposes no other
+ * source to the page; a `Build.MODEL` command would need a new Android command (deferred).
  */
 export function defaultDeviceName(
   platform: Platform | null,
@@ -18,7 +19,8 @@ export function defaultDeviceName(
   switch (platform) {
     case "android": {
       const model = /Android [\d.]+; ([^;)]+?)(?: Build\/[^;)]*)?[;)]/.exec(ua)?.[1]?.trim();
-      return model && model !== "K" ? model : "My phone";
+      // "K" is a reduced user agent's placeholder; "wv" marks a WebView, not a model.
+      return model && model !== "K" && model !== "wv" ? model : "Android phone";
     }
     case "desktop-windows":
       return "Windows PC";

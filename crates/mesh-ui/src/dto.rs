@@ -345,3 +345,40 @@ pub struct ConfigEntry {
 pub struct ConfigSetDto {
     pub restart_required: bool,
 }
+
+/// One latency probe sample: either timings or an error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeSampleDto {
+    pub seq: u32,
+    #[ts(type = "number | null")]
+    pub ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub connect_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Parses `seq=<n> ms=<total> connect=<connect_ms>` or `seq=<n> error=<reason>`.
+pub fn parse_probe_line(line: &str) -> Option<ProbeSampleDto> {
+    let rest = line.strip_prefix("seq=")?;
+    let (seq, rest) = rest.split_once(' ')?;
+    let seq: u32 = seq.parse().ok()?;
+    if let Some(reason) = rest.strip_prefix("error=") {
+        return Some(ProbeSampleDto {
+            seq,
+            ms: None,
+            connect_ms: None,
+            error: Some(reason.to_owned()),
+        });
+    }
+    let rest = rest.strip_prefix("ms=")?;
+    let (ms, rest) = rest.split_once(' ')?;
+    let connect = rest.strip_prefix("connect=")?;
+    Some(ProbeSampleDto {
+        seq,
+        ms: Some(ms.parse().ok()?),
+        connect_ms: Some(connect.trim().parse().ok()?),
+        error: None,
+    })
+}

@@ -2,10 +2,12 @@
 
 use mesh_admin::{AdminRequest, AdminResponse};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use ts_rs::TS;
 
 use crate::dto::*;
 use crate::error::{UiError, UiErrorCode};
+use crate::streams::Streams;
 use crate::transport::TransportFn;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -21,6 +23,7 @@ pub enum Platform {
 pub struct Ui {
     transport: TransportFn,
     platform: Platform,
+    streams: Streams,
 }
 
 fn unexpected(what: &str, got: AdminResponse) -> UiError {
@@ -32,6 +35,7 @@ impl Ui {
         Ui {
             transport,
             platform,
+            streams: Streams::new(),
         }
     }
 
@@ -230,5 +234,61 @@ impl Ui {
         )
         .await?;
         self.status().await
+    }
+
+    /// Follows the daemon log: the last `lines` lines, then new ones, until `tx` closes.
+    pub async fn logs_follow(&self, lines: u32, tx: mpsc::Sender<String>) -> Result<(), UiError> {
+        let _slot = self.streams.begin()?;
+        let transport = (self.transport)();
+        transport
+            .stream(
+                AdminRequest::LogsTail {
+                    lines,
+                    follow: true,
+                },
+                tx,
+            )
+            .await
+    }
+
+    /// Pings a member `count` times; each sample goes to `tx` as it arrives.
+    pub async fn probe(
+        &self,
+        node_prefix: String,
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        tx: mpsc::Sender<ProbeSampleDto>,
+    ) -> Result<(), UiError> {
+        let _slot = self.streams.begin()?;
+        let transport = (self.transport)();
+        let req = AdminRequest::Probe {
+            node: node_prefix,
+            count,
+            interval_ms,
+            timeout_ms,
+        };
+        let (line_tx, mut line_rx) = mpsc::channel::<String>(16);
+        let forward = async {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    line = line_rx.recv() => match line {
+                        None => break,
+                        Some(line) => {
+                            if let Some(sample) = parse_probe_line(&line)
+                                && tx.send(sample).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    },
+                }
+            }
+            // Closing the line channel stops the transport.
+            drop(line_rx);
+        };
+        let (result, ()) = tokio::join!(transport.stream(req, line_tx), forward);
+        result
     }
 }

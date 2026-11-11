@@ -9,6 +9,7 @@ license.workspace = true
 mesh-admin = { path = "../mesh-admin" }
 mesh-proto = { path = "../mesh-proto" }
 async-trait.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex.workspace = true
 serde.workspace = true
 thiserror.workspace = true

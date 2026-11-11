@@ -2901,6 +2901,7 @@ name = "mesh-ui"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "hex",
  "mesh-admin",
  "mesh-host",

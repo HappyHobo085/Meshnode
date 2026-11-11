@@ -560,6 +560,9 @@ async fn paused_answers_503_then_resumes() {
         (Role::Host, Serve::Attached),
     ])
     .await;
+    // Served on node 0, so that the request after the resume is answered 200.
+    deploy_counter(&mesh, Placement::Nodes(vec![mesh.id(0)])).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
     let slot = mesh.m[0].slot.as_ref().unwrap();
     slot.set_paused(true);
     let resp = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
@@ -573,7 +576,12 @@ async fn paused_answers_503_then_resumes() {
     );
     slot.set_paused(false);
     let resp = raw_forward(&mesh, 1, 0, &fwd_req(COUNTER)).await;
-    assert_ne!(resp.body, b"Service not yet replicated");
+    assert_eq!(
+        resp.status,
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&resp.body)
+    );
     mesh.shutdown().await;
 }
 
@@ -592,6 +600,9 @@ async fn raw_bytes(mesh: &Mesh, bytes: &[u8]) {
     let _ = timeout(T, recv.read_to_end(HTTPFWD_MAX_FRAME)).await;
 }
 
+/// The 30 s read/write timeouts are not exercised in real time here: a timed-out stream
+/// leaves through the same `ActivityGuard` drop as the error and reset paths below, which
+/// are, so `End` follows `Start` there too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activity_start_end_balanced_on_success_error_and_timeout() {
     let mesh = mesh(vec![

@@ -73,6 +73,8 @@ struct StartOptions {
     host: HostOptions,
     #[cfg(feature = "test-hooks")]
     deployer: Option<mesh_services::DeployerTimings>,
+    #[cfg(feature = "test-hooks")]
+    wall: Option<mesh_core::DynClock>,
 }
 
 /// Test-only start settings for [`Daemon::start_with`].
@@ -83,6 +85,8 @@ pub struct TestOptions {
     pub bind_addr: Option<SocketAddr>,
     pub deployer: mesh_services::DeployerTimings,
     pub host: HostOptions,
+    /// The node's wall clock (`None`: the system clock).
+    pub wall: Option<mesh_core::DynClock>,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -98,6 +102,7 @@ impl TestOptions {
                 retry_max: Duration::from_secs(1),
             },
             host: HostOptions::default(),
+            wall: None,
         }
     }
 }
@@ -218,6 +223,7 @@ impl Daemon {
             bind_addr: test.bind_addr,
             host: test.host,
             deployer: Some(test.deployer),
+            wall: test.wall,
         };
         Self::start_inner(data_dir, cfg, opts).await
     }
@@ -575,6 +581,15 @@ impl Inner {
         nc.bind_addr = self.opts.bind_addr;
         nc.timings = self.opts.timings.clone();
         nc.catch_up_on_incoming_after = self.catch_up_after(&power_state);
+        if self.power.has_sink() {
+            // The incoming-traffic catch-up holds the "catchup" wake lock, like a wake.
+            let power = self.power.clone();
+            nc.on_catch_up = Some(Arc::new(move || Box::new(power.catch_up_lock())));
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(wall) = &self.opts.wall {
+            nc.wall = Arc::new(wall.clone());
+        }
         nc.extra_protocols
             .push((ALPN_HTTPFWD.to_vec(), Arc::new(handler)));
         let node = match how {

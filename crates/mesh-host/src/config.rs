@@ -45,6 +45,9 @@ pub enum ConfigError {
     },
 }
 
+/// The longest `[android] periodic_wake_s`: 10 min, well inside the 15-min alarm.
+const MAX_PERIODIC_WAKE_S: u32 = 600;
+
 fn invalid(key: &str, message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid {
         key: key.into(),
@@ -203,6 +206,13 @@ impl HostConfig {
         for key in KEYS {
             let value = self.get(key).unwrap_or_default();
             self.clone().set(key, &value)?;
+        }
+        // Not a `config set` key. A longer hold would outlast the 15-min alarm's re-arm.
+        if self.android.periodic_wake_s > MAX_PERIODIC_WAKE_S {
+            return Err(invalid(
+                "android.periodic_wake_s",
+                format!("expected 0 to {MAX_PERIODIC_WAKE_S} (seconds)"),
+            ));
         }
         Ok(())
     }
@@ -488,5 +498,17 @@ windows_user_sid = "S-1-5-21-1-2-3-1001"
             cfg.set("admin", ""),
             Err(ConfigError::UnknownKey(_))
         ));
+    }
+
+    #[test]
+    fn periodic_wake_s_is_bounded() {
+        let mut cfg = HostConfig::default();
+        cfg.android.periodic_wake_s = 600;
+        cfg.validate().unwrap();
+        cfg.android.periodic_wake_s = 601;
+        match cfg.validate() {
+            Err(ConfigError::Invalid { key, .. }) => assert_eq!(key, "android.periodic_wake_s"),
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -27,11 +27,11 @@ use mesh_hlc::WallClock;
 use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::config::Timings;
+use crate::config::{CatchUpHook, Timings};
 use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
@@ -92,6 +92,13 @@ impl SignOut {
         self.proved.notified().await;
     }
 }
+
+/// A peer and its completed-round count when a catch-up started.
+pub(crate) type RoundMark = (NodeId, Arc<PeerMetrics>, u64);
+
+/// The longest a catch-up's host hook guard is held (spec §5.3: Balanced holds the
+/// catch-up wake lock for at most 60 s).
+const CATCH_UP_LIMIT: Duration = Duration::from_secs(60);
 
 /// The incoming-traffic catch-up (Android): peer traffic after at least `after` of
 /// silence on the wall clock starts a round with every connected peer. The wall clock,
@@ -156,7 +163,7 @@ impl IncomingHook {
             && let Some(sh) = self.peers.upgrade()
         {
             debug!("peer traffic after a long silence; catching up");
-            PeerManager(sh).start_round_all();
+            PeerManager(sh).catch_up();
         }
     }
 }
@@ -178,6 +185,8 @@ pub(crate) struct PeerEnv {
     /// A session found the store stale (spec §7); the re-bootstrap hook.
     pub stale: mpsc::Sender<NodeId>,
     pub catch_up: Arc<CatchUp>,
+    /// The host's hook for the catch-up's duration (see [`crate::NodeConfig::on_catch_up`]).
+    pub on_catch_up: Option<CatchUpHook>,
 }
 
 #[derive(Clone)]
@@ -459,6 +468,92 @@ impl PeerManager {
         }
     }
 
+    /// Every connected peer with its completed-round count now: what
+    /// [`PeerManager::wait_rounds`] waits on.
+    pub(crate) fn round_marks(&self) -> Vec<RoundMark> {
+        self.connected_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let m = self.metrics(&id)?;
+                let at = m.rounds_completed.load(Ordering::SeqCst);
+                Some((id, m, at))
+            })
+            .collect()
+    }
+
+    /// Waits until every peer in `pending` has completed a round past its mark or
+    /// disconnected, until `deadline` or shutdown. `rx` was subscribed before the marks
+    /// were taken (the round counters decide; events only wake the loop, so a lag loses
+    /// nothing). Returns the rounds completed and the peers still pending. Holds the
+    /// manager weakly: a node that goes away ends the wait.
+    pub(crate) async fn wait_rounds(
+        &self,
+        pending: Vec<RoundMark>,
+        deadline: Instant,
+        rx: broadcast::Receiver<NodeEvent>,
+    ) -> (usize, usize) {
+        Self::wait_rounds_weak(Arc::downgrade(&self.0), pending, deadline, rx).await
+    }
+
+    async fn wait_rounds_weak(
+        peers: Weak<Shared>,
+        mut pending: Vec<RoundMark>,
+        deadline: Instant,
+        mut rx: broadcast::Receiver<NodeEvent>,
+    ) -> (usize, usize) {
+        let mut rounds = 0;
+        let mut stop = false;
+        loop {
+            let Some((live, cancel)) = peers
+                .upgrade()
+                .map(|sh| (PeerManager(sh.clone()).connected_ids(), sh.cancel.clone()))
+            else {
+                break;
+            };
+            pending.retain(|(id, m, at)| {
+                if m.rounds_completed.load(Ordering::SeqCst) > *at {
+                    rounds += 1;
+                    false
+                } else {
+                    // A peer that disconnected (or stopped being a target) is done.
+                    live.contains(id)
+                }
+            });
+            if pending.is_empty() || stop {
+                break;
+            }
+            // Past the deadline (or on shutdown) one last look, then give up.
+            stop = tokio::select! {
+                _ = cancel.cancelled() => true,
+                r = timeout_at(deadline, rx.recv()) => match r {
+                    Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => false,
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => true,
+                },
+            };
+        }
+        (rounds, pending.len())
+    }
+
+    /// The incoming-traffic catch-up: a round with every connected peer. With a host hook
+    /// its guard is held, on a task, until those rounds end (see
+    /// [`crate::NodeConfig::on_catch_up`]).
+    fn catch_up(&self) {
+        let Some(hook) = self.0.env.on_catch_up.clone() else {
+            self.start_round_all();
+            return;
+        };
+        let rx = self.0.env.events.subscribe();
+        let pending = self.round_marks();
+        let guard = hook();
+        self.start_round_all();
+        let peers = Arc::downgrade(&self.0);
+        let deadline = Instant::now() + CATCH_UP_LIMIT;
+        self.lock().tasks.spawn(async move {
+            let _guard = guard;
+            Self::wait_rounds_weak(peers, pending, deadline, rx).await;
+        });
+    }
+
     /// Turns the incoming-traffic catch-up on (`Some(silence)`) or off.
     pub fn set_catch_up(&self, after: Option<Duration>) {
         self.0.env.catch_up.set(after);
@@ -545,7 +640,7 @@ impl PeerManager {
         // returned above and do not reset the silence).
         if self.0.env.catch_up.traffic() {
             debug!("incoming connection after a long silence; catching up");
-            self.start_round_all();
+            self.catch_up();
         }
     }
 

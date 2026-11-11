@@ -4,12 +4,14 @@
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mesh_admin::{
     AdminRequest, AdminResponse, DaemonState, DeployOpts, InProcessAdmin, LocalStateView,
     StatusInfo,
 };
+use mesh_core::DynClock;
+use mesh_hlc::ManualClock;
 use mesh_host::config::{CONFIG_FILE, GatewaySection};
 use mesh_host::{
     AndroidConfig, Daemon, HostConfig, HostOptions, Periodic, PowerPolicy, PowerState, TestOptions,
@@ -124,17 +126,21 @@ async fn start(cfg: HostConfig, host: HostOptions) -> D {
     start_in(tempfile::tempdir().unwrap(), cfg, host).await
 }
 
-async fn start_in(dir: TempDir, mut cfg: HostConfig, host: HostOptions) -> D {
+async fn start_in(dir: TempDir, cfg: HostConfig, host: HostOptions) -> D {
+    let opts = TestOptions {
+        host,
+        ..TestOptions::fast()
+    };
+    start_test(dir, cfg, opts).await
+}
+
+async fn start_test(dir: TempDir, mut cfg: HostConfig, opts: TestOptions) -> D {
     // `free_port` races with parallel tests: when the gateway cannot bind, try a fresh port.
     let mut attempt = 1;
     let daemon = loop {
-        let opts = TestOptions {
-            host: host.clone(),
-            ..TestOptions::fast()
-        };
         let r = timeout(
             T,
-            Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), opts),
+            Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), opts.clone()),
         )
         .await
         .expect("daemon start timed out");
@@ -167,13 +173,23 @@ where
 
 /// A desktop daemon `a` (initialised) and a phone daemon `b` (joined), both online.
 async fn pair() -> (D, D, Arc<Rec>) {
+    pair_with(None).await
+}
+
+/// [`pair`] with `b`'s node on wall clock `wall_b`.
+async fn pair_with(wall_b: Option<DynClock>) -> (D, D, Arc<Rec>) {
     let a = start(test_config(), HostOptions::default()).await;
     assert_eq!(
         a.req(AdminRequest::Init { name: "a".into() }).await,
         AdminResponse::Ok
     );
     let (host, rec) = phone();
-    let b = start(test_config(), host).await;
+    let opts = TestOptions {
+        host,
+        wall: wall_b,
+        ..TestOptions::fast()
+    };
+    let b = start_test(tempfile::tempdir().unwrap(), test_config(), opts).await;
     let ticket = match a
         .req(AdminRequest::Invite {
             role: Role::Host,
@@ -277,6 +293,28 @@ async fn wake_triggers_catch_up() {
     assert_eq!(s.peers_online, 1);
     assert_eq!(s.gateway_ports, [b.gateway().port()]);
     b.daemon.network_changed();
+    a.stop().await;
+    b.stop().await;
+}
+
+/// Spec §5.3: Balanced holds the catch-up lock during the incoming-traffic catch-up too.
+#[tokio::test]
+async fn incoming_after_silence_takes_catchup_lock() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let clock = ManualClock::new(now);
+    let (a, b, rec) = pair_with(Some(DynClock(Arc::new(clock.clone())))).await;
+    // Joined and online on the frozen clock: no silence yet, so no catch-up lock.
+    assert!(rec.of("catchup").is_empty(), "{:?}", rec.all());
+    // `a`'s periodic rounds reach `b` after more than a minute of (wall) silence.
+    clock.advance(61_000);
+    wait_for("the catch-up lock released", || async {
+        rec.of("catchup").len() >= 2
+    })
+    .await;
+    assert_eq!(rec.of("catchup"), ["+catchup:60000", "-catchup"]);
     a.stop().await;
     b.stop().await;
 }

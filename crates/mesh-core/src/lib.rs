@@ -23,7 +23,7 @@ pub mod transport;
 mod winfs;
 
 pub use blobs::{BlobHash, BlobKind, Blobs};
-pub use config::{DynClock, NodeConfig, RelayChoice, Timings};
+pub use config::{CatchUpHook, DynClock, NodeConfig, RelayChoice, Timings};
 pub use db::{CoreStore, StoreHandle, StoreReader};
 pub use error::NodeError;
 pub use events::NodeEvent;

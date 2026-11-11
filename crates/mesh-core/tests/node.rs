@@ -651,7 +651,9 @@ mod extra {
 
 mod catch_up {
     use super::*;
-    use mesh_core::Timings;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use mesh_core::{CatchUpHook, Timings};
     use mesh_hlc::ManualClock;
     use tokio::sync::broadcast;
 
@@ -665,6 +667,16 @@ mod catch_up {
         db: &Path,
         after: Option<Duration>,
     ) -> (Node, Node, ManualClock) {
+        quiet_pair_with(da, db, after, None).await
+    }
+
+    /// [`quiet_pair`] with `b`'s catch-up hook.
+    async fn quiet_pair_with(
+        da: &Path,
+        db: &Path,
+        after: Option<Duration>,
+        hook_b: Option<CatchUpHook>,
+    ) -> (Node, Node, ManualClock) {
         let hour = Duration::from_secs(3600);
         let timings = Timings {
             sync_interval: hour,
@@ -677,6 +689,7 @@ mod catch_up {
         let (mut cb, clock_b) = test_cfg(db, "b");
         cb.timings = timings;
         cb.catch_up_on_incoming_after = after;
+        cb.on_catch_up = hook_b;
 
         let a = Node::create_mesh(ca).await.unwrap();
         let b_id = id_of_dir(db);
@@ -732,6 +745,48 @@ mod catch_up {
             round_within(&mut eb, Duration::from_secs(10)).await,
             "no catch-up round after 61 s of silence"
         );
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    /// Records the start of a catch-up and the drop of the guard its hook returned.
+    struct Phase(Arc<StdMutex<Vec<&'static str>>>);
+
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("end");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_catch_up_holds_the_hook_guard_until_rounds_complete() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let l = log.clone();
+        let hook: CatchUpHook = Arc::new(move || {
+            l.lock().unwrap().push("start");
+            Box::new(Phase(l.clone()))
+        });
+        let (a, b, clock_b) = quiet_pair_with(
+            da.path(),
+            db.path(),
+            Some(Duration::from_secs(60)),
+            Some(hook),
+        )
+        .await;
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        let mut eb = b.subscribe();
+        clock_b.advance(MINUTE + 1_000);
+        a.store().set("app", "k", b"v".to_vec()).await.unwrap();
+        assert!(
+            round_within(&mut eb, Duration::from_secs(10)).await,
+            "no catch-up round after 61 s of silence"
+        );
+        wait_until("the catch-up guard dropped", T, || async {
+            log.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(*log.lock().unwrap(), ["start", "end"]);
         timeout(T, b.shutdown()).await.unwrap();
         timeout(T, a.shutdown()).await.unwrap();
     }

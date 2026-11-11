@@ -86,6 +86,10 @@ pub struct FfiStatus {
     pub power_policy: Option<FfiPowerPolicy>,
 }
 
+/// Why [`wake`] is called. Informational: it is logged, and `Alarm` also takes the
+/// `"alarm"` wake lock; the catch-up is the same for every reason. `Boot` and `Incoming`
+/// are reserved: the app sends only `Alarm` and `Network` (a start after boot dials anyway,
+/// and mesh-core catches up on incoming traffic by itself).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiWakeReason {
     Alarm,
@@ -572,8 +576,9 @@ pub async fn start(data_dir: String) -> Result<FfiStatus, FfiError> {
     .unwrap_or_else(panicked("start"))
 }
 
-/// Shuts the daemon down (within 20 s) and releases the data directory. No-op if
-/// stopped.
+/// Shuts the daemon down and releases the data directory. No-op if stopped. It first
+/// waits for in-flight [`wake`] calls to end (each returns within about 10 s), then runs
+/// the daemon's shutdown (within 20 s): about 30 s in the worst case.
 #[uniffi::export]
 pub async fn stop() {
     let r = on_host(|h| {

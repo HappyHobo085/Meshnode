@@ -2583,6 +2583,7 @@ dependencies = [
  "mesh-admin",
  "mesh-core",
  "mesh-gateway",
+ "mesh-hlc",
  "mesh-host",
  "mesh-proto",
  "mesh-runtime",

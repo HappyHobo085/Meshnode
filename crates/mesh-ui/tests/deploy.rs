@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::Mutex;
 
-use mesh_admin::MAX_UPLOAD_FILE;
+use async_trait::async_trait;
+use mesh_admin::{AdminRequest, AdminResponse, DeployOpts, MAX_UPLOAD_FILE};
 use mesh_host::config::GatewaySection;
 use mesh_host::{Daemon, HostConfig, TestOptions};
 use mesh_ui::{
     AdminTransport, DeployOptsDto, DirSource, FileSource, InProcessTransport, LimitsDto,
-    PipeTransport, PlacementDto, Platform, ServiceKindDto, Ui, UiErrorCode,
+    LocalStateDto, PipeTransport, PlacementDto, Platform, ServiceKindDto, Ui, UiError, UiErrorCode,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -190,4 +192,108 @@ async fn deploy_static_over_pipe() {
     let ui = ui_with(Arc::new(PipeTransport::new(d.endpoint().clone())));
     ui.init("test".into()).await.unwrap();
     deploy_and_check(ui).await;
+}
+
+/// Wraps a transport so the daemon's service list lags behind a deploy, as it does while the
+/// deployer's scan hasn't run yet: for the first `lag` listings every service shows its
+/// previous version (a brand-new one is missing).
+struct Lagging {
+    inner: Arc<dyn AdminTransport>,
+    lag: Mutex<usize>,
+}
+
+impl Lagging {
+    fn new(inner: Arc<dyn AdminTransport>, lag: usize) -> Arc<Self> {
+        Arc::new(Lagging {
+            inner,
+            lag: Mutex::new(lag),
+        })
+    }
+}
+
+#[async_trait]
+impl AdminTransport for Lagging {
+    async fn request(&self, req: AdminRequest) -> Result<AdminResponse, UiError> {
+        let is_list = matches!(req, AdminRequest::Services);
+        let resp = self.inner.request(req).await?;
+        let lagging = is_list && {
+            let mut lag = self.lag.lock().unwrap();
+            let on = *lag > 0;
+            *lag = lag.saturating_sub(1);
+            on
+        };
+        match resp {
+            AdminResponse::Services(list) if lagging => Ok(AdminResponse::Services(
+                list.into_iter()
+                    .filter_map(|mut s| {
+                        s.version -= 1;
+                        (s.version > 0).then_some(s)
+                    })
+                    .collect(),
+            )),
+            other => Ok(other),
+        }
+    }
+
+    async fn stream(&self, req: AdminRequest, tx: mpsc::Sender<String>) -> Result<(), UiError> {
+        self.inner.stream(req, tx).await
+    }
+
+    async fn deploy_static(
+        &self,
+        name: String,
+        opts: DeployOpts,
+        src: Box<dyn FileSource>,
+        progress: mpsc::Sender<u64>,
+    ) -> Result<AdminResponse, UiError> {
+        self.inner.deploy_static(name, opts, src, progress).await
+    }
+}
+
+async fn deploy_site(ui: &Ui, name: &str) -> Result<mesh_ui::ServiceDto, UiError> {
+    let (dir, _) = site();
+    let (tx, _rx) = mpsc::channel(256);
+    ui.deploy_static(
+        name.into(),
+        opts(),
+        Box::new(DirSource::new(dir.path().to_path_buf())),
+        tx,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deploy_waits_for_the_service_to_be_listed() {
+    let (d, _dir) = daemon().await;
+    let inner: Arc<dyn AdminTransport> = Arc::new(InProcessTransport(d.in_process_admin()));
+    let ui = ui_with(Lagging::new(inner, 5));
+    ui.init("test".into()).await.unwrap();
+    let svc = deploy_site(&ui, "mysite").await.unwrap();
+    assert_eq!((svc.name.as_str(), svc.version), ("mysite", 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redeploy_returns_the_new_version_not_the_stale_one() {
+    let (d, _dir) = daemon().await;
+    let inner: Arc<dyn AdminTransport> = Arc::new(InProcessTransport(d.in_process_admin()));
+    let plain = ui_with(inner.clone());
+    plain.init("test".into()).await.unwrap();
+    assert_eq!(deploy_site(&plain, "mysite").await.unwrap().version, 1);
+    let ui = ui_with(Lagging::new(inner, 5));
+    let svc = deploy_site(&ui, "mysite").await.unwrap();
+    assert_eq!(svc.version, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deploy_never_listed_answers_from_the_manifest() {
+    let (d, _dir) = daemon().await;
+    let inner: Arc<dyn AdminTransport> = Arc::new(InProcessTransport(d.in_process_admin()));
+    let ui = ui_with(Lagging::new(inner, usize::MAX));
+    ui.init("test".into()).await.unwrap();
+    let svc = deploy_site(&ui, "mysite").await.unwrap();
+    assert_eq!((svc.name.as_str(), svc.version), ("mysite", 1));
+    assert_eq!(svc.kind, ServiceKindDto::Static);
+    assert_eq!(svc.local, LocalStateDto::Fetching);
+    assert_eq!(svc.data_bytes, 0);
+    assert!(svc.placed_hosts.is_empty());
 }

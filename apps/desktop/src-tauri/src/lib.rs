@@ -196,7 +196,7 @@ fn locate_meshd(desktop: State<'_, Desktop>) -> Option<String> {
 }
 
 /// Locate meshd…: the user chooses `meshd` in the system dialog, opened here (the page
-/// never names the path). Only a file named `meshd` / `meshd.exe` is accepted; its
+/// never names the path). Only a file named `meshd` (`meshd.exe` on Windows) is accepted; its
 /// canonical path is remembered and returned.
 #[tauri::command]
 async fn locate_meshd_dialog(

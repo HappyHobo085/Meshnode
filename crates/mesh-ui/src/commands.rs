@@ -27,6 +27,27 @@ pub struct Ui {
     streams: Streams,
 }
 
+const DEPLOY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const DEPLOY_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A just-deployed service the daemon hasn't listed yet.
+fn manifest_dto(m: mesh_proto::ServiceManifest) -> ServiceDto {
+    ServiceDto {
+        name: m.name,
+        kind: match m.kind {
+            mesh_proto::ServiceKind::Wasm { .. } => ServiceKindDto::Wasm,
+            mesh_proto::ServiceKind::Static { .. } => ServiceKindDto::Static,
+        },
+        version: m.version,
+        placement: m.placement.into(),
+        placed_hosts: Vec::new(),
+        local: LocalStateDto::Fetching,
+        limits: m.limits.into(),
+        outbound: m.outbound,
+        data_bytes: 0,
+    }
+}
+
 fn unexpected(what: &str, got: AdminResponse) -> UiError {
     UiError::internal(format!("unexpected reply to {what}: {got:?}"))
 }
@@ -153,7 +174,7 @@ impl Ui {
         opts: DeployOptsDto,
     ) -> Result<ServiceDto, UiError> {
         let opts = opts.into_opts()?;
-        match self
+        let manifest = match self
             .call(AdminRequest::DeployWasm {
                 name: name.clone(),
                 wasm,
@@ -161,10 +182,11 @@ impl Ui {
             })
             .await?
         {
-            AdminResponse::Manifest(_) | AdminResponse::Ok => {}
+            AdminResponse::Manifest(m) => Some(m),
+            AdminResponse::Ok => None,
             other => return Err(unexpected("deploy_wasm", other)),
-        }
-        self.service_named(&name).await
+        };
+        self.deployed_service(&name, manifest).await
     }
 
     /// Deploys the file at `path` as a wasm service (at most 64 MiB).
@@ -197,23 +219,49 @@ impl Ui {
     ) -> Result<ServiceDto, UiError> {
         let opts = opts.into_opts()?;
         let transport = (self.transport)();
-        match transport
+        let manifest = match transport
             .deploy_static(name.clone(), opts, src, progress)
             .await?
         {
             AdminResponse::Error { code, message } => return Err((code, message).into()),
-            AdminResponse::Manifest(_) | AdminResponse::Ok => {}
+            AdminResponse::Manifest(m) => Some(m),
+            AdminResponse::Ok => None,
             other => return Err(unexpected("deploy_static", other)),
-        }
-        self.service_named(&name).await
+        };
+        self.deployed_service(&name, manifest).await
     }
 
-    pub(crate) async fn service_named(&self, name: &str) -> Result<ServiceDto, UiError> {
-        self.services()
-            .await?
-            .into_iter()
-            .find(|s| s.name == name)
-            .ok_or_else(|| UiError::new(UiErrorCode::NotFound, format!("service {name} not found")))
+    /// The service just deployed. The daemon lists services "as of the deployer's last scan",
+    /// which runs after the deploy returns, so this waits (every 100 ms, up to 3 s) for an
+    /// entry at least as new as `manifest`. On timeout it answers from the manifest (not yet
+    /// fetched) rather than reporting a failure for a deploy that succeeded.
+    async fn deployed_service(
+        &self,
+        name: &str,
+        manifest: Option<mesh_proto::ServiceManifest>,
+    ) -> Result<ServiceDto, UiError> {
+        let want = manifest.as_ref().map_or(0, |m| m.version);
+        let deadline = tokio::time::Instant::now() + DEPLOY_SETTLE;
+        loop {
+            let found = self
+                .services()
+                .await?
+                .into_iter()
+                .find(|s| s.name == name && s.version >= want);
+            if let Some(s) = found {
+                return Ok(s);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return match manifest {
+                    Some(m) => Ok(manifest_dto(m)),
+                    None => Err(UiError::new(
+                        UiErrorCode::NotFound,
+                        format!("service {name} not found"),
+                    )),
+                };
+            }
+            tokio::time::sleep(DEPLOY_POLL).await;
+        }
     }
 
     pub async fn undeploy(&self, name: String) -> Result<(), UiError> {

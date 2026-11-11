@@ -32,21 +32,22 @@ impl Os {
     }
 }
 
-/// Whether `name` is the daemon's file name: `meshd` or `meshd.exe`, ignoring case on
-/// Windows.
+/// Whether `name` is the daemon's file name: `meshd.exe` (ignoring case) on Windows,
+/// `meshd` elsewhere. On Windows an extensionless `meshd` is refused: `Command::new` would
+/// run an unchecked `meshd.exe` next to it.
 pub fn is_meshd_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
     if cfg!(windows) {
-        name.eq_ignore_ascii_case("meshd") || name.eq_ignore_ascii_case("meshd.exe")
+        name.eq_ignore_ascii_case("meshd.exe")
     } else {
-        name == "meshd" || name == "meshd.exe"
+        name == "meshd"
     }
 }
 
 /// A `meshd` the app may run: `path` must be absolute and name an existing file called
-/// `meshd` / `meshd.exe` (see [`is_meshd_name`]); the result is its canonical path, whose
+/// `meshd` (`meshd.exe` on Windows) (see [`is_meshd_name`]); the result is its canonical path, whose
 /// file name is checked again (a link named `meshd` to another program is refused).
 pub fn accept_meshd(path: &Path) -> Result<PathBuf, UiError> {
     let refuse = |why: &str| UiError {
@@ -397,8 +398,21 @@ pub fn run_elevated(program: &Path, args: &[OsString]) -> Result<(), UiError> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn meshd_name_is_platform_exact() {
+        let ok = |n: &str| super::is_meshd_name(OsStr::new(n));
+        if cfg!(windows) {
+            assert!(ok("meshd.exe") && ok("MESHD.EXE"));
+            assert!(!ok("meshd") && !ok("MESHD"));
+        } else {
+            assert!(ok("meshd"));
+            assert!(!ok("meshd.exe") && !ok("MESHD") && !ok("Meshd"));
+        }
+        assert!(!ok("meshd.exe.bak") && !ok("xmeshd") && !ok(""));
+    }
 
     use super::*;
 

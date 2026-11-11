@@ -89,8 +89,11 @@ The in-process admin transport (`InProcessAdmin`, with the same request dispatch
 | `crates/mesh-client` | Embeddable client: become a client-role member, send HTTP to services over iroh | proto, `iroh` |
 | `crates/mesh-ffi` | UniFFI bindings exposing the host's start/stop/status, wake, power and admin calls to Kotlin, plus the raw JNI `init_android` export *(back-ported from sub-spec 5)* | host, admin *(back-ported from sub-spec 5)* |
 | `apps/meshd` | Desktop daemon + CLI (a thin layer over `mesh-host`); Windows-service / launchd / systemd integration; `meshd probe` *(back-ported from sub-spec 5)* | host, admin *(back-ported from sub-spec 5)* |
-| `apps/ui` | Tauri 2 management UI (desktop + Android) | admin |
-| `apps/android` | The Android Tauri 2 project + Kotlin foreground service, receivers, workers, onboarding. `apps/android/src-tauri` is its own Cargo workspace (so desktop CI needs no webview system packages), builds the single `cdylib` `libmeshnode_app.so` that links `mesh-ffi`, and carries its own `Cargo.lock` *(back-ported from sub-spec 5)* | `mesh-ffi`, `apps/ui` (placeholder page until sub-spec 6) |
+| `crates/mesh-ui` | The shared UI command layer: typed commands over an `AdminTransport` trait (desktop admin pipe or socket; Android in-process), UI-shaped DTOs and errors with hints, the invite QR as SVG, bounded streams (logs, probe), deploy file sources; ts-rs generates the TypeScript types *(back-ported from sub-spec 6)* | admin |
+| `crates/mesh-ui-tauri` | The `#[tauri::command]` wrappers and `Channel` plumbing over `mesh-ui`, shared by both shells. Its own Cargo workspace, outside the root one, so root CI needs no webview packages *(back-ported from sub-spec 6)* | `mesh-ui`, `tauri` |
+| `apps/ui` | The Svelte 5 + Vite + TypeScript frontend (one codebase for desktop and Android), built to `apps/ui/dist` and loaded by both shells under a strict CSP; the generated ts-rs types are checked in *(back-ported from sub-spec 6)* | `mesh-ui` types (generated) |
+| `apps/desktop` | The desktop Tauri 2 app. `apps/desktop/src-tauri` is its own Cargo workspace and `Cargo.lock`; finds or starts the daemon, dialogs, `open_url`, elevated service install *(back-ported from sub-spec 6)* | `mesh-ui-tauri`, `apps/ui` |
+| `apps/android` | The Android Tauri 2 project + Kotlin foreground service, receivers, workers, onboarding. `apps/android/src-tauri` is its own Cargo workspace (so desktop CI needs no webview system packages), builds the single `cdylib` `libmeshnode_app.so` that links `mesh-ffi`, and carries its own `Cargo.lock` *(back-ported from sub-spec 5)* | `mesh-ffi`, `mesh-ui-tauri`, `apps/ui` *(sub-spec 6 replaced the placeholder page)* |
 | `services/aegis-sync` | The Aegis sync-server as a Meshnode WASM component (§11) | `aegis-sync-core` (from the Aegis repo) |
 | `packaging/` | systemd unit, launchd plist, WiX fragments, deb/rpm metadata | — |
 
@@ -270,6 +273,15 @@ One set of typed requests, used by the CLI and the UI:
 - **Logs:** a live tail.
 - On desktop the UI is a normal app that connects to the running daemon and offers to install or start the service if none is running.
 
+**Decisions** *(back-ported from sub-spec 6)*:
+- **Polling, no events.** The UI polls `status`, `members` and `services` every 2 s while the page is visible, pauses when hidden, never overlaps requests and refreshes after each mutation. There is no daemon event push; Add device detects the joined member through the poll.
+- **No-daemon actions (desktop).** The app probes the installed service's data directory, then the per-user daemon. With neither answering it offers **Run without installing** (`meshd run` as the user, detached, outliving the app), **Install as system service** (elevated: UAC on Windows, `pkexec` on Linux, `osascript` on macOS; a declined prompt is "Installation cancelled") and **Locate meshd…**. If both daemons answer, the service wins and the UI notes the second node.
+- **Per-user daemon directory.** `%LOCALAPPDATA%\Meshnode`, `$XDG_DATA_HOME/meshnode` (else `~/.local/share/meshnode`) or `~/Library/Application Support/Meshnode`; its log is `meshd.log` there.
+- **Hostname default.** First run offers the machine's host name (cleaned, at most 64 characters) as the device name, else "Windows PC" / "Mac" / "Linux PC"; on Android the phone model when the WebView user agent carries it, else "Android phone".
+- **Removed device.** A device whose state is `removed` shows a dedicated screen instead of Home: it was removed by another device, can never rejoin with the same identity, and can only reset its identity (then create or join a mesh). Removing a device asks the user to type its name.
+- **Streams.** Logs and the latency probe run as streams carrying `StreamEvent` (item, end, error) over a Tauri `Channel`; at most 4 concurrent streams per window; a lost stream shows "Disconnected — Resume".
+- **Android.** While the node is stopped, the UI shows **Node stopped** with Start and admin calls return `NotRunning`. The camera permission is requested before scanning; a denial leaves the paste field.
+
 ---
 
 ## 10. Platform shells
@@ -379,7 +391,7 @@ Each row is its own sub-spec → plan → implementation cycle, in this order. E
 | 3 | Runtime + services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-3.md`)* | wasmtime host, `meshnode:kv`, manifests, deployer, placement, static sites |
 | 4 | Gateway + admin API + `meshd` CLI + desktop OS services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-4.md`)* | two desktop nodes serving a site, installed as system services |
 | 5 | Android shell *(implemented, manual check pending; see `docs/manual-checks/sub-spec-5.md`)* | `mesh-ffi`, the foreground service, boot/watchdog, power policy |
-| 6 | Tauri UI (desktop + Android) | the full management UI, QR invite/join |
+| 6 | Tauri UI (desktop + Android) *(implemented, manual check pending; see `docs/manual-checks/sub-spec-6.md`)* | the full management UI, QR invite/join |
 | 7 | Aegis sync port | `aegis-sync-core` extraction in Aegis, `services/aegis-sync`, Aegis client changes |
 | 8 | `mesh-client` + packaging + E2E | installers (MSI, deb/rpm, dmg, APK), the full §1 success-criteria run |
 

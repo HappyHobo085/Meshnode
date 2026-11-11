@@ -211,6 +211,27 @@ async fn status_when_stopped() {
         .unwrap();
 }
 
+/// The Android shell's transport: an `InProcessAdmin` only while the daemon is live, used
+/// on the host's runtime.
+#[tokio::test]
+async fn in_process_admin_none_when_stopped_some_when_running() {
+    let _g = serial().await;
+    assert!(mesh_ffi::in_process_admin().is_none());
+    let dir = TempDir::new().unwrap();
+    mesh_ffi::start(dir_str(&dir)).await.unwrap();
+    let admin = mesh_ffi::in_process_admin().expect("live while running");
+    let resp = mesh_ffi::host_runtime()
+        .spawn(async move { admin.request(AdminRequest::Status).await })
+        .await
+        .unwrap();
+    match resp {
+        AdminResponse::Status(info) => assert_eq!(info.state, DaemonState::Uninitialised),
+        other => panic!("{other:?}"),
+    }
+    mesh_ffi::stop().await;
+    assert!(mesh_ffi::in_process_admin().is_none());
+}
+
 struct Lines {
     lines: Mutex<Vec<String>>,
     end: Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>,

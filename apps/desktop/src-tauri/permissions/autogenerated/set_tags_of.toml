@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-tags-of"
+description = "Enables the set_tags_of command without any pre-configured scope."
+commands.allow = ["set_tags_of"]
+
+[[permission]]
+identifier = "deny-set-tags-of"
+description = "Denies the set_tags_of command without any pre-configured scope."
+commands.deny = ["set_tags_of"]

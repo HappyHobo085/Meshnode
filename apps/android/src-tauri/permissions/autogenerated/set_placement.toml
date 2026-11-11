@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-placement"
+description = "Enables the set_placement command without any pre-configured scope."
+commands.allow = ["set_placement"]
+
+[[permission]]
+identifier = "deny-set-placement"
+description = "Denies the set_placement command without any pre-configured scope."
+commands.deny = ["set_placement"]

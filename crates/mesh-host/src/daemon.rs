@@ -813,7 +813,7 @@ impl AdminBackend for Backend {
     async fn handle(&self, req: AdminRequest, io: &mut RequestIo<'_>) -> AdminResponse {
         match self.0.upgrade() {
             Some(inner) => Daemon { inner }.handle(req, io).await,
-            None => AdminResponse::error(ErrorCode::NotRunning, "meshd is stopping"),
+            None => AdminResponse::error(ErrorCode::NotRunning, mesh_admin::DAEMON_STOPPING),
         }
     }
 }

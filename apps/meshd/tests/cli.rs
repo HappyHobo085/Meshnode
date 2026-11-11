@@ -419,3 +419,34 @@ fn probe_all_failed_exits_2() {
     assert_eq!(out.matches("error=").count(), 2, "{out}");
     assert!(out.contains("failed=2/2"), "{out}");
 }
+
+/// `service status --json` is one JSON line with the state and the installed data directory.
+/// Read-only: it never installs or changes the service.
+#[test]
+fn service_status_json_shape() {
+    let dir = TempDir::new().unwrap();
+    let o = meshd(dir.path(), &["service", "status", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert_eq!(out.trim_end().lines().count(), 1, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let obj = v.as_object().expect("an object");
+    assert_eq!(obj.len(), 2, "{out}");
+    let status = obj["status"].as_str().expect("status is a string");
+    assert!(
+        [
+            "running",
+            "stopped",
+            "starting",
+            "stopping",
+            "not-installed"
+        ]
+        .contains(&status),
+        "{status}"
+    );
+    let data_dir = &obj["dataDir"];
+    assert!(data_dir.is_null() || data_dir.is_string(), "{out}");
+    if status == "not-installed" {
+        assert!(data_dir.is_null(), "{out}");
+    }
+}

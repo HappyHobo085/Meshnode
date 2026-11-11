@@ -177,10 +177,124 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the cancel_stream command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-stream",
+          "markdownDescription": "Enables the cancel_stream command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the config_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-config-get",
+          "markdownDescription": "Enables the config_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the config_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-config-set",
+          "markdownDescription": "Enables the config_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the deploy_static_tree command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-deploy-static-tree",
+          "markdownDescription": "Enables the deploy_static_tree command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the deploy_wasm_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-deploy-wasm-file",
+          "markdownDescription": "Enables the deploy_wasm_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the init command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-init",
+          "markdownDescription": "Enables the init command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the invite command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-invite",
+          "markdownDescription": "Enables the invite command without any pre-configured scope."
+        },
+        {
           "description": "Enables the join command without any pre-configured scope.",
           "type": "string",
           "const": "allow-join",
           "markdownDescription": "Enables the join command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the logs_follow command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-logs-follow",
+          "markdownDescription": "Enables the logs_follow command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the members command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-members",
+          "markdownDescription": "Enables the members command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the node_running command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-node-running",
+          "markdownDescription": "Enables the node_running command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_tree command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-tree",
+          "markdownDescription": "Enables the pick_tree command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_wasm command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-wasm",
+          "markdownDescription": "Enables the pick_wasm command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the platform command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-platform",
+          "markdownDescription": "Enables the platform command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the power_policy_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-power-policy-get",
+          "markdownDescription": "Enables the power_policy_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the power_policy_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-power-policy-set",
+          "markdownDescription": "Enables the power_policy_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-probe",
+          "markdownDescription": "Enables the probe command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the purge command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-purge",
+          "markdownDescription": "Enables the purge command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove",
+          "markdownDescription": "Enables the remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reset_identity command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-identity",
+          "markdownDescription": "Enables the reset_identity command without any pre-configured scope."
         },
         {
           "description": "Enables the service_start command without any pre-configured scope.",
@@ -195,16 +309,172 @@
           "markdownDescription": "Enables the service_stop command without any pre-configured scope."
         },
         {
+          "description": "Enables the services command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-services",
+          "markdownDescription": "Enables the services command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-info",
+          "markdownDescription": "Enables the set_info command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_limits command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-limits",
+          "markdownDescription": "Enables the set_limits command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_outbound command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-outbound",
+          "markdownDescription": "Enables the set_outbound command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_placement command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-placement",
+          "markdownDescription": "Enables the set_placement command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_tags_of command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-tags-of",
+          "markdownDescription": "Enables the set_tags_of command without any pre-configured scope."
+        },
+        {
           "description": "Enables the status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-status",
           "markdownDescription": "Enables the status command without any pre-configured scope."
         },
         {
+          "description": "Enables the undeploy command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-undeploy",
+          "markdownDescription": "Enables the undeploy command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_stream command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-stream",
+          "markdownDescription": "Denies the cancel_stream command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the config_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-config-get",
+          "markdownDescription": "Denies the config_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the config_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-config-set",
+          "markdownDescription": "Denies the config_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the deploy_static_tree command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-deploy-static-tree",
+          "markdownDescription": "Denies the deploy_static_tree command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the deploy_wasm_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-deploy-wasm-file",
+          "markdownDescription": "Denies the deploy_wasm_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the init command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-init",
+          "markdownDescription": "Denies the init command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the invite command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-invite",
+          "markdownDescription": "Denies the invite command without any pre-configured scope."
+        },
+        {
           "description": "Denies the join command without any pre-configured scope.",
           "type": "string",
           "const": "deny-join",
           "markdownDescription": "Denies the join command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the logs_follow command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-logs-follow",
+          "markdownDescription": "Denies the logs_follow command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the members command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-members",
+          "markdownDescription": "Denies the members command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the node_running command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-node-running",
+          "markdownDescription": "Denies the node_running command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_tree command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-tree",
+          "markdownDescription": "Denies the pick_tree command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_wasm command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-wasm",
+          "markdownDescription": "Denies the pick_wasm command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the platform command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-platform",
+          "markdownDescription": "Denies the platform command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the power_policy_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-power-policy-get",
+          "markdownDescription": "Denies the power_policy_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the power_policy_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-power-policy-set",
+          "markdownDescription": "Denies the power_policy_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-probe",
+          "markdownDescription": "Denies the probe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the purge command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-purge",
+          "markdownDescription": "Denies the purge command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove",
+          "markdownDescription": "Denies the remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reset_identity command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-identity",
+          "markdownDescription": "Denies the reset_identity command without any pre-configured scope."
         },
         {
           "description": "Denies the service_start command without any pre-configured scope.",
@@ -219,10 +489,130 @@
           "markdownDescription": "Denies the service_stop command without any pre-configured scope."
         },
         {
+          "description": "Denies the services command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-services",
+          "markdownDescription": "Denies the services command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-info",
+          "markdownDescription": "Denies the set_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_limits command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-limits",
+          "markdownDescription": "Denies the set_limits command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_outbound command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-outbound",
+          "markdownDescription": "Denies the set_outbound command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_placement command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-placement",
+          "markdownDescription": "Denies the set_placement command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_tags_of command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-tags-of",
+          "markdownDescription": "Denies the set_tags_of command without any pre-configured scope."
+        },
+        {
           "description": "Denies the status command without any pre-configured scope.",
           "type": "string",
           "const": "deny-status",
           "markdownDescription": "Denies the status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the undeploy command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-undeploy",
+          "markdownDescription": "Denies the undeploy command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures which\nbarcode scanning features are by default exposed.\n\n#### Granted Permissions\n\nIt allows all barcode related features.\n\n\n#### This default permission set includes:\n\n- `allow-cancel`\n- `allow-check-permissions`\n- `allow-open-app-settings`\n- `allow-request-permissions`\n- `allow-scan`\n- `allow-vibrate`",
+          "type": "string",
+          "const": "barcode-scanner:default",
+          "markdownDescription": "This permission set configures which\nbarcode scanning features are by default exposed.\n\n#### Granted Permissions\n\nIt allows all barcode related features.\n\n\n#### This default permission set includes:\n\n- `allow-cancel`\n- `allow-check-permissions`\n- `allow-open-app-settings`\n- `allow-request-permissions`\n- `allow-scan`\n- `allow-vibrate`"
+        },
+        {
+          "description": "Enables the cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-cancel",
+          "markdownDescription": "Enables the cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-check-permissions",
+          "markdownDescription": "Enables the check_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_app_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-open-app-settings",
+          "markdownDescription": "Enables the open_app_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-request-permissions",
+          "markdownDescription": "Enables the request_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the scan command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-scan",
+          "markdownDescription": "Enables the scan command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the vibrate command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:allow-vibrate",
+          "markdownDescription": "Enables the vibrate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-cancel",
+          "markdownDescription": "Denies the cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-check-permissions",
+          "markdownDescription": "Denies the check_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_app_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-open-app-settings",
+          "markdownDescription": "Denies the open_app_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-request-permissions",
+          "markdownDescription": "Denies the request_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the scan command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-scan",
+          "markdownDescription": "Denies the scan command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the vibrate command without any pre-configured scope.",
+          "type": "string",
+          "const": "barcode-scanner:deny-vibrate",
+          "markdownDescription": "Denies the vibrate command without any pre-configured scope."
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",

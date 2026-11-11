@@ -3498,14 +3498,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-ui"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "hex",
+ "mesh-admin",
+ "mesh-proto",
+ "qrcode",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "ts-rs",
+]
+
+[[package]]
+name = "mesh-ui-tauri"
+version = "0.1.0"
+dependencies = [
+ "mesh-ui",
+ "serde",
+ "tauri",
+ "tokio",
+]
+
+[[package]]
 name = "meshnode-android"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "mesh-admin",
  "mesh-ffi",
- "postcard",
+ "mesh-ui",
+ "mesh-ui-tauri",
+ "serde",
  "tauri",
  "tauri-build",
+ "tauri-plugin-barcode-scanner",
+ "tokio",
 ]
 
 [[package]]
@@ -4798,6 +4829,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"
@@ -6226,6 +6263,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67fb21a77e8f94e8beb3325e583102488659365af0a3948b7ea244c5b779c291"
+dependencies = [
+ "anyhow",
+ "glob",
+ "plist",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tauri-utils",
+ "walkdir",
+]
+
+[[package]]
+name = "tauri-plugin-barcode-scanner"
+version = "2.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b57ad7e6ed3e8927205dade785400d9829b8208f59cfe24324fcb324f61482b2"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6811,6 +6878,28 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "ts-rs"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756050066659291d47a554a9f558125db17428b073c5ffce1daf5dcb0f7231d8"
+dependencies = [
+ "thiserror 2.0.21",
+ "ts-rs-macros",
+]
+
+[[package]]
+name = "ts-rs-macros"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d90eea51bc7988ef9e674bf80a85ba6804739e535e9cab48e4bb34a8b652aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "termcolor",
+]
 
 [[package]]
 name = "typeid"

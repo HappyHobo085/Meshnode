@@ -1,0 +1,90 @@
+import { writable } from "svelte/store";
+import type { IconName } from "./design/Icon.svelte";
+import { api, type Platform } from "./api";
+import type { JoinRefusalDto } from "./generated/JoinRefusalDto";
+
+/** The name typed on First run, carried over to Join so it isn't asked twice. */
+export const chosenName = writable<string | null>(null);
+
+/**
+ * A starting name for this device. The webview can't read the host name, so on desktop it is
+ * the kind of computer; on Android it is the phone model when the user agent still carries one
+ * (reduced user agents send "K" instead), else "Android phone". Android exposes no other
+ * source to the page; a `Build.MODEL` command would need a new Android command (deferred).
+ */
+export function defaultDeviceName(
+  platform: Platform | null,
+  ua: string = globalThis.navigator?.userAgent ?? "",
+): string {
+  switch (platform) {
+    case "android": {
+      const model = /Android [\d.]+; ([^;)]+?)(?: Build\/[^;)]*)?[;)]/.exec(ua)?.[1]?.trim();
+      // "K" is a reduced user agent's placeholder; "wv" marks a WebView, not a model.
+      return model && model !== "K" && model !== "wv" ? model : "Android phone";
+    }
+    case "desktop-windows":
+      return "Windows PC";
+    case "desktop-macos":
+      return "Mac";
+    case "desktop-linux":
+      return "Linux PC";
+    default:
+      return "";
+  }
+}
+
+/**
+ * The name First run and Join offer: the host name on desktop (spec §6.2), the phone model
+ * on Android, and the platform's word when neither can be read.
+ */
+export async function suggestedName(platform: Platform | null): Promise<string> {
+  if (platform !== null && platform !== "android") {
+    try {
+      const host = (await api.desktop.defaultDeviceName()).trim();
+      if (host) return host;
+    } catch {
+      // An older desktop shell without the command: fall through to the platform word.
+    }
+  }
+  return defaultDeviceName(platform);
+}
+
+/** A member's platform (`std::env::consts::OS` from Rust) as an icon and a word. */
+export function platformOf(platform: string): { icon: IconName; label: string } {
+  const p = platform.toLowerCase();
+  if (p.includes("android") || p.includes("ios")) return { icon: "phone", label: "Phone" };
+  if (p.includes("windows")) return { icon: "desktop", label: "Windows" };
+  if (p.includes("mac")) return { icon: "laptop", label: "Mac" };
+  if (p.includes("linux")) return { icon: "server", label: "Linux" };
+  return { icon: "desktop", label: platform || "Unknown" };
+}
+
+/** Why an invite was refused, in the user's words. */
+export function refusalText(reason: JoinRefusalDto | null): string | null {
+  switch (reason) {
+    case "expired":
+      return "This invite has expired";
+    case "used":
+      return "This invite was already used";
+    case "unknown":
+      return "This invite isn't known to that mesh";
+    case "wrongMesh":
+      return "This invite is for a different mesh";
+    case "removed":
+      return "This device was removed from that mesh";
+    case "inviterUnavailable":
+      return "The device that made this invite can't be reached";
+    default:
+      return null;
+  }
+}
+
+/** Copies text to the clipboard; resolves `false` when the clipboard is unavailable. */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await globalThis.navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}

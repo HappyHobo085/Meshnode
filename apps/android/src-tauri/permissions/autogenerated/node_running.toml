@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-node-running"
+description = "Enables the node_running command without any pre-configured scope."
+commands.allow = ["node_running"]
+
+[[permission]]
+identifier = "deny-node-running"
+description = "Denies the node_running command without any pre-configured scope."
+commands.deny = ["node_running"]

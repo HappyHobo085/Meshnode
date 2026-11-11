@@ -1,7 +1,15 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/meshd"]
-exclude = ["spikes", "crates/mesh-runtime/tests/fixtures", "patches", "apps/android"]
+exclude = [
+    "spikes",
+    "crates/mesh-runtime/tests/fixtures",
+    "patches",
+    "apps/android",
+    "apps/desktop",
+    # The Tauri wrappers: built only by the app workspaces, so this one stays webview-free.
+    "crates/mesh-ui-tauri",
+]
 
 [workspace.package]
 edition = "2024"

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-outbound"
+description = "Enables the set_outbound command without any pre-configured scope."
+commands.allow = ["set_outbound"]
+
+[[permission]]
+identifier = "deny-set-outbound"
+description = "Denies the set_outbound command without any pre-configured scope."
+commands.deny = ["set_outbound"]

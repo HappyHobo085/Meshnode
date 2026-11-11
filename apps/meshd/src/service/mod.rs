@@ -266,6 +266,11 @@ pub fn stop() -> Result<(), ServiceError> {
     platform::stop()
 }
 
+/// What is installed, read back from the service's registration. Needs no privileges.
+pub fn installed() -> Result<Installed, ServiceError> {
+    platform::installed()
+}
+
 /// Whether the service is installed, and its state. Needs no privileges.
 pub fn status() -> Result<ServiceStatus, ServiceError> {
     platform::status()

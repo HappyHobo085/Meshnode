@@ -11,3 +11,9 @@ apps/android/src-tauri/gen/android/**/build/
 apps/android/src-tauri/gen/android/.gradle/
 apps/android/src-tauri/target/
 apps/android/src-tauri/gen/android/.kotlin/
+/crates/mesh-ui/bindings/
+apps/desktop/src-tauri/target/
+apps/ui/dist/
+apps/ui/node_modules/
+# A library: the app workspaces' lock files pin its dependencies.
+crates/mesh-ui-tauri/Cargo.lock

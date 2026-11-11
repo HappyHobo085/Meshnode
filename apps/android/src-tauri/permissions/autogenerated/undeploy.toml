@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-undeploy"
+description = "Enables the undeploy command without any pre-configured scope."
+commands.allow = ["undeploy"]
+
+[[permission]]
+identifier = "deny-undeploy"
+description = "Denies the undeploy command without any pre-configured scope."
+commands.deny = ["undeploy"]

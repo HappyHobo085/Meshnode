@@ -151,7 +151,12 @@ pub enum ServiceCmd {
     /// Stop the installed service.
     Stop,
     /// Show whether the service is installed and running.
-    Status,
+    Status {
+        /// One JSON line: {"status": "running|stopped|starting|stopping|not-installed",
+        /// "dataDir": the installed service's data directory, or null}.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

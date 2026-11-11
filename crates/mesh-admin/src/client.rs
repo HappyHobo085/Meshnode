@@ -74,16 +74,44 @@ impl AdminClient {
                 return Err(size_changed(path, len, meta.size));
             }
         }
+        let mut paths: std::collections::VecDeque<PathBuf> =
+            files.into_iter().map(|(_, p)| p).collect();
+        self.deploy_static_from(name, opts, metas, move |_| {
+            let path = paths.pop_front().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no file left to read")
+            })?;
+            std::fs::read(path)
+        })
+        .await
+    }
+
+    /// Deploys a static site whose file contents come from `read`, called once per entry of
+    /// `files`, in order. Paths and declared sizes are checked before anything is sent, and
+    /// each read must return exactly the declared size. After an `Error` response the
+    /// connection is not reused.
+    pub async fn deploy_static_from(
+        &mut self,
+        name: String,
+        opts: DeployOpts,
+        files: Vec<FileMeta>,
+        mut read: impl FnMut(&FileMeta) -> std::io::Result<Vec<u8>> + Send,
+    ) -> Result<AdminResponse, AdminError> {
+        validate_upload(&files).map_err(AdminError::InvalidUpload)?;
         self.start(&AdminRequest::DeployStatic {
             name,
             opts,
-            files: metas,
+            files: files.clone(),
         })
         .await?;
-        for (meta, path) in &files {
-            let bytes = tokio::fs::read(path).await?;
+        for meta in &files {
+            let bytes = read(meta)?;
             if bytes.len() as u64 != meta.size {
-                return Err(size_changed(path, bytes.len() as u64, meta.size));
+                return Err(AdminError::InvalidUpload(format!(
+                    "{} is {} bytes, not the declared {}",
+                    meta.path,
+                    bytes.len(),
+                    meta.size
+                )));
             }
             if let Err(e) = write_frame(&mut self.conn, &FileData { bytes }).await {
                 // The daemon refuses a bad upload by answering and closing; the answer

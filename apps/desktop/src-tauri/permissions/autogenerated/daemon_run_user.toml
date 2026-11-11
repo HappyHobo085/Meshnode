@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-daemon-run-user"
+description = "Enables the daemon_run_user command without any pre-configured scope."
+commands.allow = ["daemon_run_user"]
+
+[[permission]]
+identifier = "deny-daemon-run-user"
+description = "Denies the daemon_run_user command without any pre-configured scope."
+commands.deny = ["daemon_run_user"]

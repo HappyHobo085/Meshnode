@@ -45,6 +45,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      # tauri::generate_context!() needs frontendDist (apps/ui/dist), which is not checked in.
+      - name: Build the UI
+        working-directory: apps/ui
+        run: |
+          npm ci
+          npm run build
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -60,6 +71,79 @@ jobs:
       - run: rustup component add clippy
       - run: cargo ndk -t arm64-v8a clippy --manifest-path apps/android/src-tauri/Cargo.toml --lib -- -D warnings
 
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  ts-types:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/gen-ts-types.sh --check
+
+  desktop-ui:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+            crates/mesh-ui-tauri
+      - name: WebKitGTK and tray packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      # The Tauri build script embeds apps/ui/dist.
+      - run: npm ci
+        working-directory: apps/ui
+      - run: npm run build
+        working-directory: apps/ui
+      # crates/mesh-ui-tauri and apps/desktop/src-tauri are outside the root workspace.
+      - run: cargo fmt --manifest-path crates/mesh-ui-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/mesh-ui-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path crates/mesh-ui-tauri/Cargo.toml
+      - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+      # The "run without installing" test spawns a real `meshd run` (temp data dir, loopback
+      # only); without MESHD_BIN it fails under CI rather than skipping.
+      - run: cargo build -p meshd
+      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+        env:
+          MESHD_BIN: ${{ github.workspace }}/target/debug/meshd${{ runner.os == 'Windows' && '.exe' || '' }}
+
   android-apk:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -74,6 +158,17 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      # The APK embeds apps/ui/dist (frontendDist); build it first.
+      - name: Build the UI
+        working-directory: apps/ui
+        run: |
+          npm ci
+          npm run build
       - run: sdkmanager "ndk;${NDK_VERSION}" "build-tools;36.0.0" "platforms;android-36" "platforms;android-35"
       - run: echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
       - run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"

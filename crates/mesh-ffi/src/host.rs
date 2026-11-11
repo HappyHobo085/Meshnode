@@ -712,6 +712,29 @@ pub fn service_control() -> Option<Arc<dyn FfiServiceControl>> {
     HOST.get().and_then(|h| lock(&h.control).clone())
 }
 
+/// The running daemon's admin interface, for the Tauri commands (not exported): `Some` only
+/// while the daemon is live and no stop has begun (the check of [`admin_logs`]). Use it on
+/// [`host_runtime`]: the daemon's requests may spawn tasks that must live on the host's
+/// runtime.
+pub fn in_process_admin() -> Option<InProcessAdmin> {
+    catch_unwind(|| {
+        let h = host();
+        let current = *h.stops.borrow();
+        let live = lock(&h.live);
+        match live.as_ref() {
+            Some(d) if h.live_stops.load(Ordering::SeqCst) == current => Some(d.in_process_admin()),
+            _ => None,
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// The host's runtime, which runs the daemon (not exported).
+pub fn host_runtime() -> tokio::runtime::Handle {
+    host().rt.handle().clone()
+}
+
 /// One admin request: postcard `AdminRequest` in, postcard `AdminResponse` out (which may
 /// be `AdminResponse::Error`). `DeployStatic`, `LogsTail` and `Probe` go through
 /// [`admin_deploy_static`] and [`admin_logs`].

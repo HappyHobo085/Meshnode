@@ -222,12 +222,46 @@ fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> 
             service::stop().map_err(failed)?;
             say!("Stopped the meshnode service.");
         }
-        ServiceCmd::Status => {
+        ServiceCmd::Status { json: false } => {
             let status = service::status().map_err(failed)?;
             say!("meshnode service: {status}");
         }
+        ServiceCmd::Status { json: true } => {
+            let status = service::status().map_err(failed)?;
+            let data_dir = match status {
+                service::ServiceStatus::NotInstalled => None,
+                _ => match service::installed().map_err(failed)? {
+                    service::Installed::DataDir(dir) => Some(dir),
+                    service::Installed::No | service::Installed::UnknownDataDir => None,
+                },
+            };
+            say!("{}", service_status_json(status, data_dir.as_deref()));
+        }
     }
     Ok(())
+}
+
+/// The one line of `service status --json`.
+fn service_status_json(status: meshd::service::ServiceStatus, data_dir: Option<&Path>) -> String {
+    use meshd::service::ServiceStatus;
+    let status = match status {
+        ServiceStatus::NotInstalled => "not-installed",
+        ServiceStatus::Stopped => "stopped",
+        ServiceStatus::Starting => "starting",
+        ServiceStatus::Running => "running",
+        ServiceStatus::Stopping => "stopping",
+    };
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Line<'a> {
+        status: &'a str,
+        data_dir: Option<String>,
+    }
+    let line = Line {
+        status,
+        data_dir: data_dir.map(|d| d.to_string_lossy().into_owned()),
+    };
+    serde_json::to_string(&line).expect("serialisable")
 }
 
 // --- talking to the daemon ---------------------------------------------------------------

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-locate-meshd"
+description = "Enables the locate_meshd command without any pre-configured scope."
+commands.allow = ["locate_meshd"]
+
+[[permission]]
+identifier = "deny-locate-meshd"
+description = "Denies the locate_meshd command without any pre-configured scope."
+commands.deny = ["locate_meshd"]

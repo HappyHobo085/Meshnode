@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-locate-meshd-dialog"
+description = "Enables the locate_meshd_dialog command without any pre-configured scope."
+commands.allow = ["locate_meshd_dialog"]
+
+[[permission]]
+identifier = "deny-locate-meshd-dialog"
+description = "Denies the locate_meshd_dialog command without any pre-configured scope."
+commands.deny = ["locate_meshd_dialog"]

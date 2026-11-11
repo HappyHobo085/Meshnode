@@ -3,6 +3,10 @@
 # `--release` is given. Output: src-tauri/gen/android/app/build/outputs/apk/universal/<profile>/.
 #
 # Usage: apps/android/build-apk.sh [--release]
+#
+# The page is the shared UI (apps/ui): the CLI builds it first (tauri.conf.json's
+# beforeBuildCommand, run from apps/android, hence `--prefix ../ui`) and embeds apps/ui/dist
+# in the library. This script installs the UI's npm packages first when they are missing.
 # Needs JAVA_HOME (JDK 17), ANDROID_HOME, NDK_HOME (NDK 27.2) and the Tauri CLI
 # (`cargo install tauri-cli --version "^2" --locked`).
 #
@@ -30,6 +34,10 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
 echo "build-apk: $(cargo tauri --version)" >&2
+if [ ! -d "$here/../ui/node_modules" ]; then
+    echo "build-apk: installing apps/ui's npm packages" >&2
+    npm --prefix "$here/../ui" ci
+fi
 cd "$tauri_dir"
 if cargo tauri android build "${cli_flags[@]}" --target aarch64 --apk --ci 2>&1 | tee "$log"; then
     exit 0

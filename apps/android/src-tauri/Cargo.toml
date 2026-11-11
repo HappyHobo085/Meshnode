@@ -23,8 +23,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 mesh-ffi = { path = "../../../crates/mesh-ffi" }
 mesh-admin = { path = "../../../crates/mesh-admin" }
-postcard = { version = "1", features = ["alloc", "use-std"] }
+mesh-ui = { path = "../../../crates/mesh-ui" }
+mesh-ui-tauri = { path = "../../../crates/mesh-ui-tauri" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["sync", "macros"] }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"
 
 # The `.so` shipped in release APKs. Never `panic = "abort"`: mesh-ffi catches panics
 # at the FFI boundary (catch_unwind).

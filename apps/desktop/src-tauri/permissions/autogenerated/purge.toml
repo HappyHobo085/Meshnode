@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-purge"
+description = "Enables the purge command without any pre-configured scope."
+commands.allow = ["purge"]
+
+[[permission]]
+identifier = "deny-purge"
+description = "Denies the purge command without any pre-configured scope."
+commands.deny = ["purge"]

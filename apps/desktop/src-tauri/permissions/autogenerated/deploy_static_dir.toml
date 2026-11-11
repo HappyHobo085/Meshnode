@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-deploy-static-dir"
+description = "Enables the deploy_static_dir command without any pre-configured scope."
+commands.allow = ["deploy_static_dir"]
+
+[[permission]]
+identifier = "deny-deploy-static-dir"
+description = "Denies the deploy_static_dir command without any pre-configured scope."
+commands.deny = ["deploy_static_dir"]

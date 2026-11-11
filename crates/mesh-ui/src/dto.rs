@@ -382,3 +382,36 @@ pub fn parse_probe_line(line: &str) -> Option<ProbeSampleDto> {
         error: None,
     })
 }
+
+/// One message on a live view's channel (log follow, probe): an item, the end, or the
+/// error that ended it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StreamEvent<T> {
+    Item { value: T },
+    End,
+    Error { error: UiError },
+}
+
+/// Which daemon the desktop app talks to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionKindDto {
+    /// The installed system service.
+    System,
+    /// A daemon running as the user.
+    User,
+    None,
+}
+
+/// The desktop app's connection: which daemon, and whether a second, separate one runs
+/// too (both the service and a per-user daemon answer).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionDto {
+    pub kind: ConnectionKindDto,
+    pub other_running: bool,
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-meshd-path"
+description = "Enables the set_meshd_path command without any pre-configured scope."
+commands.allow = ["set_meshd_path"]
+
+[[permission]]
+identifier = "deny-set-meshd-path"
+description = "Denies the set_meshd_path command without any pre-configured scope."
+commands.deny = ["set_meshd_path"]

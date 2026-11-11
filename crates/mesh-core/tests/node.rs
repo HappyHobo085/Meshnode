@@ -653,7 +653,7 @@ mod catch_up {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
 
-    use mesh_core::{CatchUpHook, Timings};
+    use mesh_core::{CatchUpHook, NodeHandle, Timings};
     use mesh_hlc::ManualClock;
     use tokio::sync::broadcast;
 
@@ -749,32 +749,66 @@ mod catch_up {
         timeout(T, a.shutdown()).await.unwrap();
     }
 
-    /// Records the start of a catch-up and the drop of the guard its hook returned.
-    struct Phase(Arc<StdMutex<Vec<&'static str>>>);
+    /// Records the start of each catch-up, the drop of the guard its hook returned, and
+    /// how many rounds `b` had completed with `a` at that drop.
+    #[derive(Clone, Default)]
+    struct Probe {
+        log: Arc<StdMutex<Vec<&'static str>>>,
+        /// `b`, once it exists. Taken out before shutdown: the hook lives inside `b`.
+        b: Arc<StdMutex<Option<NodeHandle>>>,
+        rounds_at_end: Arc<StdMutex<Vec<u64>>>,
+    }
+
+    impl Probe {
+        fn hook(&self, a: NodeId) -> CatchUpHook {
+            let p = self.clone();
+            Arc::new(move || {
+                p.log.lock().unwrap().push("start");
+                Box::new(Phase(p.clone(), a))
+            })
+        }
+
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn rounds_with(&self, a: NodeId) -> u64 {
+            self.b
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .rounds_with_for_test(a)
+        }
+    }
+
+    struct Phase(Probe, NodeId);
 
     impl Drop for Phase {
         fn drop(&mut self) {
-            self.0.lock().unwrap().push("end");
+            if let Some(b) = self.0.b.lock().unwrap().as_ref() {
+                let n = b.rounds_with_for_test(self.1);
+                self.0.rounds_at_end.lock().unwrap().push(n);
+            }
+            self.0.log.lock().unwrap().push("end");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn incoming_catch_up_holds_the_hook_guard_until_rounds_complete() {
         let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let log = Arc::new(StdMutex::new(Vec::new()));
-        let l = log.clone();
-        let hook: CatchUpHook = Arc::new(move || {
-            l.lock().unwrap().push("start");
-            Box::new(Phase(l.clone()))
-        });
+        let a_id = id_of_dir(da.path());
+        let probe = Probe::default();
         let (a, b, clock_b) = quiet_pair_with(
             da.path(),
             db.path(),
             Some(Duration::from_secs(60)),
-            Some(hook),
+            Some(probe.hook(a_id)),
         )
         .await;
-        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert!(probe.log().is_empty(), "{:?}", probe.log());
+        *probe.b.lock().unwrap() = Some(b.handle());
+        let before = probe.rounds_with(a_id);
         let mut eb = b.subscribe();
         clock_b.advance(MINUTE + 1_000);
         a.store().set("app", "k", b"v".to_vec()).await.unwrap();
@@ -783,10 +817,61 @@ mod catch_up {
             "no catch-up round after 61 s of silence"
         );
         wait_until("the catch-up guard dropped", T, || async {
-            log.lock().unwrap().len() == 2
+            probe.log().len() == 2
         })
         .await;
-        assert_eq!(*log.lock().unwrap(), ["start", "end"]);
+        assert_eq!(probe.log(), ["start", "end"]);
+        // Held until the round, not dropped at once.
+        let at_end = probe.rounds_at_end.lock().unwrap().clone();
+        assert!(
+            at_end[0] > before,
+            "guard dropped before a round: {at_end:?} vs {before}"
+        );
+        probe.b.lock().unwrap().take();
+        timeout(T, b.shutdown()).await.unwrap();
+        timeout(T, a.shutdown()).await.unwrap();
+    }
+
+    /// The other trigger: after the link died, the peer redials the silent node. That peer
+    /// has no session yet when the connection is accepted; the guard must still be held
+    /// until its first round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_connection_after_silence_holds_the_guard_until_its_first_round() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a_id = id_of_dir(da.path());
+        let probe = Probe::default();
+        let (a, b, clock_b) = quiet_pair_with(
+            da.path(),
+            db.path(),
+            Some(Duration::from_secs(60)),
+            Some(probe.hook(a_id)),
+        )
+        .await;
+        let b_id = b.node_id();
+        // `a` drops the link and refuses `b`'s redials: nothing reaches `b`.
+        a.partition(&[b_id]);
+        wait_until("link down", T, || async {
+            !online(&a, b_id) && !online(&b, a_id)
+        })
+        .await;
+        *probe.b.lock().unwrap() = Some(b.handle());
+        let before = probe.rounds_with(a_id);
+        clock_b.advance(MINUTE + 1_000);
+        // `b`'s redial backoff reaches its 1 s cap, so `a` dials first after the heal.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(probe.log().is_empty(), "{:?}", probe.log());
+        a.heal();
+        wait_until("the catch-up guard dropped", T, || async {
+            probe.log().len() == 2
+        })
+        .await;
+        assert_eq!(probe.log(), ["start", "end"]);
+        let at_end = probe.rounds_at_end.lock().unwrap().clone();
+        assert!(
+            at_end[0] > before,
+            "guard dropped before the redialling peer's first round: {at_end:?} vs {before}"
+        );
+        probe.b.lock().unwrap().take();
         timeout(T, b.shutdown()).await.unwrap();
         timeout(T, a.shutdown()).await.unwrap();
     }

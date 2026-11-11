@@ -942,6 +942,17 @@ impl Drop for Node {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+impl NodeHandle {
+    /// Rounds this node completed with `peer` so far (0 without a slot for it).
+    pub fn rounds_with_for_test(&self, peer: NodeId) -> u64 {
+        self.inner
+            .peers
+            .metrics(&peer)
+            .map_or(0, |m| m.rounds_completed.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 impl Node {
     /// Starts a member without `join` (the founder adds its `members` record itself).
     pub async fn start_member_for_test(

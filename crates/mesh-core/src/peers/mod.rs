@@ -163,7 +163,7 @@ impl IncomingHook {
             && let Some(sh) = self.peers.upgrade()
         {
             debug!("peer traffic after a long silence; catching up");
-            PeerManager(sh).catch_up();
+            PeerManager(sh).catch_up(None);
         }
     }
 }
@@ -492,24 +492,36 @@ impl PeerManager {
         deadline: Instant,
         rx: broadcast::Receiver<NodeEvent>,
     ) -> (usize, usize) {
-        Self::wait_rounds_weak(Arc::downgrade(&self.0), pending, deadline, rx).await
+        Self::wait_rounds_weak(Arc::downgrade(&self.0), pending, None, deadline, rx).await
     }
 
+    /// [`PeerManager::wait_rounds`]. `accepted` is a connection just taken from a peer in
+    /// `pending` whose session may not run yet: while that connection is open (and the
+    /// peer's slot is still the marked one), the peer counts as connected.
     async fn wait_rounds_weak(
         peers: Weak<Shared>,
         mut pending: Vec<RoundMark>,
+        mut accepted: Option<(NodeId, Connection)>,
         deadline: Instant,
         mut rx: broadcast::Receiver<NodeEvent>,
     ) -> (usize, usize) {
         let mut rounds = 0;
         let mut stop = false;
         loop {
-            let Some((live, cancel)) = peers
-                .upgrade()
-                .map(|sh| (PeerManager(sh.clone()).connected_ids(), sh.cancel.clone()))
-            else {
+            let Some(sh) = peers.upgrade() else {
                 break;
             };
+            let pm = PeerManager(sh);
+            let live = pm.connected_ids();
+            let cancel = pm.0.cancel.clone();
+            // Once the accepted connection is closed (refused, replaced or ended), only a
+            // live session keeps its peer pending.
+            if accepted
+                .as_ref()
+                .is_some_and(|(_, c)| c.close_reason().is_some())
+            {
+                accepted = None;
+            }
             pending.retain(|(id, m, at)| {
                 if m.rounds_completed.load(Ordering::SeqCst) > *at {
                     rounds += 1;
@@ -517,14 +529,27 @@ impl PeerManager {
                 } else {
                     // A peer that disconnected (or stopped being a target) is done.
                     live.contains(id)
+                        || accepted.as_ref().is_some_and(|(a, _)| {
+                            a == id && pm.metrics(id).is_some_and(|x| Arc::ptr_eq(&x, m))
+                        })
                 }
             });
+            // Not held across the wait: the task must not keep the manager alive.
+            drop(pm);
             if pending.is_empty() || stop {
                 break;
             }
+            let conn = accepted.as_ref().map(|(_, c)| c.clone());
             // Past the deadline (or on shutdown) one last look, then give up.
             stop = tokio::select! {
                 _ = cancel.cancelled() => true,
+                // The accepted connection closing is no event: look again.
+                () = async {
+                    match &conn {
+                        Some(c) => drop(c.closed().await),
+                        None => std::future::pending().await,
+                    }
+                } => false,
                 r = timeout_at(deadline, rx.recv()) => match r {
                     Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => false,
                     Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => true,
@@ -536,21 +561,31 @@ impl PeerManager {
 
     /// The incoming-traffic catch-up: a round with every connected peer. With a host hook
     /// its guard is held, on a task, until those rounds end (see
-    /// [`crate::NodeConfig::on_catch_up`]).
-    fn catch_up(&self) {
+    /// [`crate::NodeConfig::on_catch_up`]). `accepted` is the incoming connection that
+    /// triggered it, if any. Its peer may have no session yet (it redialled after the old
+    /// link died), so it is marked as well and waited on until its first round, or until
+    /// that connection closed with no session left.
+    fn catch_up(&self, accepted: Option<(NodeId, Connection)>) {
         let Some(hook) = self.0.env.on_catch_up.clone() else {
             self.start_round_all();
             return;
         };
         let rx = self.0.env.events.subscribe();
-        let pending = self.round_marks();
+        let mut pending = self.round_marks();
+        if let Some((peer, _)) = &accepted
+            && !pending.iter().any(|(id, _, _)| id == peer)
+            && let Some(m) = self.metrics(peer)
+        {
+            let at = m.rounds_completed.load(Ordering::SeqCst);
+            pending.push((*peer, m, at));
+        }
         let guard = hook();
         self.start_round_all();
         let peers = Arc::downgrade(&self.0);
         let deadline = Instant::now() + CATCH_UP_LIMIT;
         self.lock().tasks.spawn(async move {
             let _guard = guard;
-            Self::wait_rounds_weak(peers, pending, deadline, rx).await;
+            Self::wait_rounds_weak(peers, pending, accepted, deadline, rx).await;
         });
     }
 
@@ -633,14 +668,14 @@ impl PeerManager {
             None => self.spawn_slot(&mut st, peer, None),
         };
         st.track(conn.clone());
-        slot.lock().incoming.push(conn);
+        slot.lock().incoming.push(conn.clone());
         slot.kick.notify_one();
         drop(st);
         // Recorded only for connections taken (a refused or partitioned peer's redials
         // returned above and do not reset the silence).
         if self.0.env.catch_up.traffic() {
             debug!("incoming connection after a long silence; catching up");
-            self.catch_up();
+            self.catch_up(Some((peer, conn)));
         }
     }
 

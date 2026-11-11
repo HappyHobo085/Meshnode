@@ -25,6 +25,9 @@
 # com/sun/jna classes and fields by name, and UniFFI's Structure subclasses list their
 # fields by name: nothing in these packages may be renamed or removed.
 -dontwarn java.awt.**
+# JNA reads UniFFI's @Structure.FieldOrder annotations at runtime; keep them here rather
+# than rely on AGP's default optimize file.
+-keepattributes RuntimeVisibleAnnotations
 -keep class com.sun.jna.** { *; }
 -keep class * implements com.sun.jna.** { *; }
 -keepclassmembers class * extends com.sun.jna.Structure { <fields>; }

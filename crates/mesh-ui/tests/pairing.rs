@@ -153,6 +153,15 @@ async fn join_trims_ticket_whitespace() {
         .await
         .unwrap();
     wait_paired(&[&a, &b]).await;
+    // A ticket wrapped by mail, chat or a terminal: whitespace inside it is dropped too.
+    let c = start().await;
+    let inv = a.ui.invite(RoleDto::Host, 900).await.unwrap();
+    let (head, tail) = inv.text.split_at(inv.text.len() / 3);
+    let (mid, tail) = tail.split_at(tail.len() / 2);
+    c.ui.join(format!("{head}\r\n{mid} \t{tail}"), "c".into())
+        .await
+        .unwrap();
+    wait_paired(&[&a, &b, &c]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

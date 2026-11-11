@@ -110,7 +110,9 @@ impl Ui {
     }
 
     pub async fn join(&self, ticket: String, name: String) -> Result<StatusDto, UiError> {
-        let ticket = ticket.trim().to_owned();
+        // The ticket alphabet has no whitespace: a ticket wrapped by mail, chat or a terminal
+        // is joined back together.
+        let ticket: String = ticket.split_whitespace().collect();
         if mesh_proto::InviteTicket::from_text(&ticket).is_err() {
             return Err(UiError {
                 code: UiErrorCode::InvalidArgument,

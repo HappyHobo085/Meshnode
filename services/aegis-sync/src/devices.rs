@@ -244,11 +244,20 @@ pub fn approve(body: &[u8], authz: Option<&str>) -> Resp {
             return Err(404);
         }
         // The approval carries its time: `owner` ranks approved joiners by WHEN they were
-        // admitted, so approving a device that asked earlier never moves the role.
+        // admitted, so approving a device that asked earlier never moves the role. The stamp
+        // is also kept strictly after every approval this account already has: nodes' clocks
+        // differ, and an owner approved on a node whose clock runs ahead would otherwise lose
+        // the role to a device it approves on a node whose clock runs behind. The caller is
+        // the owner, so its own approval (if it ever needed one) is among those.
         let now = auth::now_ms();
+        let after_existing = facts
+            .approved
+            .values()
+            .max()
+            .map_or(i64::MIN, |ms| ms.saturating_add(1));
         let fact = ApprovedFact {
             device_id: t.device_id.clone(),
-            approved_ms: now,
+            approved_ms: now.max(after_existing),
         };
         let member = serde_json::to_vec(&fact).expect("an ApprovedFact serializes");
         kv::set_add(&keys::approved_set(&caller.account), &member);

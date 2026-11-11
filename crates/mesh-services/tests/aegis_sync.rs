@@ -1007,6 +1007,59 @@ async fn owner_handoff_single_node() {
     set_clock(&s, &kv, NOW_MS);
 }
 
+/// Clock skew between nodes must not move the role either (re-review N1). D3 is approved on a
+/// node whose clock runs ahead, then becomes owner; it approves D2 on a node whose clock runs
+/// behind (the injected clock set BACK). D2's approval is stamped strictly after every
+/// existing approval, not at the slow clock, so D3 stays owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn later_approval_on_a_slow_clock_keeps_the_owner() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let a = vector::account_id("A");
+    let id = |d: &str| vector::device_id(d);
+    let reg = |d: &str| register("A", d, d, auth("A", d, &nonce()));
+    assert_eq!(s.call(&kv, reg("D1")).await.0, 200);
+    assert_eq!(s.call(&kv, reg("D2")).await.0, 200);
+    assert_eq!(s.call(&kv, reg("D3")).await.0, 200);
+    // The fast node: D3 approved at +60 s; then D1 signs out and D3 owns the account.
+    set_clock(&s, &kv, NOW_MS + 60_000);
+    let r = s
+        .call(&kv, act("/v1/devices/approve", "A", "D1", "D3"))
+        .await;
+    assert_eq!(r.0, 200);
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", "D1", "D1"))
+        .await;
+    assert_eq!(r.0, 200);
+    // The slow node: 50 s behind.
+    set_clock(&s, &kv, NOW_MS + 10_000);
+    let r = s
+        .call(&kv, act("/v1/devices/approve", "A", "D3", "D2"))
+        .await;
+    assert_eq!(r.0, 200);
+    let list = req("GET", "/v1/devices", auth("A", "D2", &nonce()), None);
+    let body = s.call(&kv, list).await.1.unwrap();
+    assert_eq!(body["ownerDeviceId"], json!(id("D3")), "{body}");
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", "D2", "D3"))
+        .await;
+    assert_eq!(
+        r.0, 403,
+        "the later-approved device cannot remove the owner"
+    );
+    // The stored stamp is just after D3's approval, not the slow clock's reading.
+    let approvals: Vec<ApprovedFact> = kv
+        .set_members(&keys::approved_set(&a), None, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::from_slice(m).unwrap())
+        .collect();
+    let d2 = approvals.iter().find(|f| f.device_id == id("D2")).unwrap();
+    assert_eq!(d2.approved_ms, NOW_MS + 60_001);
+    set_clock(&s, &kv, NOW_MS);
+}
+
 /// `lastSeenMs` is a register per node; the newest across nodes is served, and a
 /// re-registration refreshes this node's.
 #[tokio::test(flavor = "multi_thread")]

@@ -1,0 +1,136 @@
+/*
+ * Meshnode design tokens: "a calm network of your own devices".
+ *
+ * Dark is soft graphite, light is warm paper. Every colour is one `light-dark()` pair, so
+ * the theme follows `prefers-color-scheme` through `color-scheme`, and `[data-theme]` on
+ * <html> overrides it (set from Settings). The app chrome stays quiet and nearly
+ * colourless; colour belongs to the devices: each one's `--h` (its accent hue, from Rust)
+ * drives `--accent` on its monogram and card edge, identical on every screen.
+ *
+ * Contrast (WCAG AA, 4.5:1 for text): ink, ink-2 and ink-3 are checked against both
+ * `--bg` and `--surface` in both themes; status colours pass as text on `--surface`.
+ */
+
+:root {
+  color-scheme: light dark;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root {
+  /* Surfaces: graphite (dark) / paper (light). */
+  --bg: light-dark(#f2f0ea, #16181b);
+  --surface: light-dark(#fbfaf6, #1e2125);
+  --surface-2: light-dark(#ece9e1, #262a2f);
+  --surface-3: light-dark(#e2ded4, #2f343a);
+  --scrim: light-dark(rgb(40 36 30 / 0.32), rgb(5 6 8 / 0.6));
+  --line: light-dark(#dcd7cc, #31363c);
+  --line-strong: light-dark(#c4beb1, #444a52);
+
+  /* Ink. ink-3 is the quietest text still at AA (≥ 4.5:1 on bg and surface). */
+  --ink: light-dark(#211f1b, #ebe8e2);
+  --ink-2: light-dark(#4e4a43, #b9bbbe);
+  --ink-3: light-dark(#6a655c, #8f949b);
+
+  /* The app's own signal colour: links, primary actions, focus. A cool sea-glass teal that
+     sits apart from any device hue at 70 % saturation. */
+  --signal: light-dark(#1b6b63, #67c9b9);
+  --signal-ink: light-dark(#ffffff, #0c2723);
+  --signal-soft: light-dark(rgb(27 107 99 / 0.1), rgb(103 201 185 / 0.12));
+
+  /* Status (always paired with text, never colour alone). */
+  --ok: light-dark(#23733f, #72d08f);
+  --ok-soft: light-dark(rgb(35 115 63 / 0.12), rgb(114 208 143 / 0.14));
+  --warn: light-dark(#875600, #e7b75c);
+  --warn-soft: light-dark(rgb(135 86 0 / 0.12), rgb(231 183 92 / 0.14));
+  --danger: light-dark(#b0342a, #f08378);
+  --danger-ink: light-dark(#ffffff, #2b0d0a);
+  --danger-soft: light-dark(rgb(176 52 42 / 0.1), rgb(240 131 120 / 0.13));
+
+  /* Device accent: set `--h` (0–359) on any element; spec: hsl(var(--h) 70% 55%). */
+  --h: 172;
+  --accent: hsl(var(--h) 70% 55%);
+  --accent-soft: light-dark(hsl(var(--h) 70% 55% / 0.16), hsl(var(--h) 70% 55% / 0.2));
+  --accent-ink: light-dark(hsl(var(--h) 75% 24%), hsl(var(--h) 80% 80%));
+
+  /* Type: Inter for UI, JetBrains Mono for ids, tickets and logs.
+     Scale: minor third (×1.2) on a 15 px base. */
+  --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --fs-xs: 0.75rem; /* 12 */
+  --fs-sm: 0.8125rem; /* 13 */
+  --fs-md: 0.9375rem; /* 15 base */
+  --fs-lg: 1.125rem; /* 18 */
+  --fs-xl: 1.375rem; /* 22 */
+  --fs-2xl: 1.625rem; /* 26 */
+  --fs-3xl: 2rem; /* 32 */
+  --lh-tight: 1.2;
+  --lh-snug: 1.35;
+  --lh-body: 1.5;
+  --fw-regular: 400;
+  --fw-medium: 520;
+  --fw-semibold: 620;
+  --fw-bold: 700;
+
+  /* Spacing: 4-pt scale. */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+  --s-16: 64px;
+
+  /* Radii: small controls are tighter than containers; pills for chips and toggles. */
+  --r-xs: 4px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --r-pill: 999px;
+
+  /* Elevation: graphite lifts with deep soft shadows and a faint top highlight; paper with a
+     warm-tinted shadow. `light-dark()` only takes colours, so the shadows use colour tokens. */
+  --shadow-weak: light-dark(rgb(60 50 30 / 0.06), rgb(0 0 0 / 0.35));
+  --shadow: light-dark(rgb(60 50 30 / 0.14), rgb(0 0 0 / 0.5));
+  --shadow-deep: light-dark(rgb(60 50 30 / 0.24), rgb(0 0 0 / 0.65));
+  --highlight: light-dark(rgb(255 255 255 / 0.7), rgb(255 255 255 / 0.04));
+  --e-1: 0 1px 0 var(--shadow-weak), inset 0 1px 0 var(--highlight);
+  --e-2:
+    0 1px 2px var(--shadow-weak), 0 8px 20px -8px var(--shadow), inset 0 1px 0 var(--highlight);
+  --e-3: 0 2px 6px var(--shadow-weak), 0 28px 56px -16px var(--shadow-deep);
+
+  /* Motion: short and soft; nothing longer than 200 ms. */
+  --dur-1: 120ms;
+  --dur-2: 160ms;
+  --dur-3: 200ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Layout. */
+  --content-max: 1100px;
+  --sidebar-w: 232px;
+  --rail-w: 72px;
+  --tabbar-h: 64px;
+  --touch: 44px;
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--signal);
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+    --dur-3: 0ms;
+  }
+}

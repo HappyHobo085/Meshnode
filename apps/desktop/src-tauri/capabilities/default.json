@@ -31,7 +31,7 @@
     "allow-deploy-static-dir",
     "allow-connection",
     "allow-locate-meshd",
-    "allow-set-meshd-path",
+    "allow-locate-meshd-dialog",
     "allow-daemon-run-user",
     "allow-daemon-install",
     "allow-pick-folder",

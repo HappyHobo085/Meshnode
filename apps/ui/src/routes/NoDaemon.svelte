@@ -106,9 +106,7 @@
   async function locateMeshd() {
     problem = null;
     try {
-      const path = await api.desktop.pickFile(platform === "desktop-windows" ? "exe" : "");
-      if (path === null) return;
-      await api.desktop.setMeshdPath(path);
+      if ((await api.desktop.locateMeshdDialog()) === null) return;
       await locate();
     } catch (e) {
       const err = toUiError(e);

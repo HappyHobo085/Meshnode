@@ -3,7 +3,7 @@
 //! [`install_command`] is pure and tested; [`run_elevated`] (UAC, pkexec, osascript) is
 //! only ever run by the user's own click in the app, never by tests.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,27 +32,98 @@ impl Os {
     }
 }
 
-/// The `meshd` to run: the remembered choice (Locate meshd…) if it still exists, else
-/// `meshd` next to this app's executable, else the first one on `PATH`.
+/// Whether `name` is the daemon's file name: `meshd` or `meshd.exe`, ignoring case on
+/// Windows.
+pub fn is_meshd_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case("meshd") || name.eq_ignore_ascii_case("meshd.exe")
+    } else {
+        name == "meshd" || name == "meshd.exe"
+    }
+}
+
+/// A `meshd` the app may run: `path` must be absolute and name an existing file called
+/// `meshd` / `meshd.exe` (see [`is_meshd_name`]); the result is its canonical path, whose
+/// file name is checked again (a link named `meshd` to another program is refused).
+pub fn accept_meshd(path: &Path) -> Result<PathBuf, UiError> {
+    let refuse = |why: &str| UiError {
+        code: UiErrorCode::InvalidArgument,
+        message: format!("{} {why}", path.display()),
+        hint: Some(format!(
+            "Choose the Meshnode daemon, the file named meshd{}.",
+            std::env::consts::EXE_SUFFIX
+        )),
+        reason: None,
+    };
+    if !path.is_absolute() {
+        return Err(refuse("is not a full path"));
+    }
+    if !path.file_name().is_some_and(is_meshd_name) {
+        return Err(refuse("isn't meshd"));
+    }
+    let real = std::fs::canonicalize(path).map_err(|_| refuse("was not found"))?;
+    if !real.is_file() {
+        return Err(refuse("is not a file"));
+    }
+    if !real.file_name().is_some_and(is_meshd_name) {
+        return Err(refuse("isn't meshd"));
+    }
+    Ok(without_verbatim_prefix(real))
+}
+
+/// `canonicalize` on Windows gives `\\?\C:\…` / `\\?\UNC\server\…`; the plain form is what
+/// the user expects to see and what `ShellExecuteExW` handles best.
+fn without_verbatim_prefix(p: PathBuf) -> PathBuf {
+    let Some(s) = p.to_str() else {
+        return p;
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    p
+}
+
+/// The `meshd` to run: the remembered choice (Locate meshd…) if it is still an acceptable
+/// `meshd`, else `meshd` next to this app's executable, else the first one on `PATH`.
 pub fn locate_meshd(remembered: Option<PathBuf>) -> Option<PathBuf> {
+    let me = std::env::current_exe().ok();
+    let path = std::env::var_os("PATH");
+    locate_meshd_in(
+        remembered,
+        me.as_deref().and_then(Path::parent),
+        path.as_deref(),
+    )
+}
+
+/// [`locate_meshd`] with its inputs given: every candidate goes through [`accept_meshd`],
+/// so relative `PATH` entries are skipped and the result is canonical.
+pub fn locate_meshd_in(
+    remembered: Option<PathBuf>,
+    exe_dir: Option<&Path>,
+    path_var: Option<&OsStr>,
+) -> Option<PathBuf> {
     if let Some(p) = remembered
-        && p.is_file()
+        && let Ok(p) = accept_meshd(&p)
     {
         return Some(p);
     }
     let exe = format!("meshd{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(me) = std::env::current_exe()
-        && let Some(dir) = me.parent()
+    if let Some(dir) = exe_dir
+        && let Ok(p) = accept_meshd(&dir.join(&exe))
     {
-        let p = dir.join(&exe);
-        if p.is_file() {
-            return Some(p);
-        }
+        return Some(p);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(&exe))
-        .find(|p| p.is_file())
+    std::env::split_paths(path_var?)
+        .filter(|d| d.is_absolute())
+        .find_map(|d| accept_meshd(&d.join(&exe)).ok())
 }
 
 /// The data directory of a daemon run as the user: `%LOCALAPPDATA%\Meshnode`,
@@ -401,6 +472,107 @@ mod tests {
         let (program, args) = run_user_command(Path::new("meshd"), Path::new("/d"));
         assert_eq!(program, PathBuf::from("meshd"));
         assert_eq!(args, os(&["--data", "/d", "run"]));
+    }
+
+    fn meshd_file(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"not really meshd").unwrap();
+        p
+    }
+
+    const EXE: &str = if cfg!(windows) { "meshd.exe" } else { "meshd" };
+
+    #[test]
+    fn accept_meshd_rejects_other_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "setup.exe",
+            "meshd.exe.bat",
+            "meshd2",
+            "notmeshd",
+            "meshd.sh",
+        ] {
+            let p = meshd_file(dir.path(), name);
+            let err = accept_meshd(&p).expect_err(name);
+            assert_eq!(err.code, UiErrorCode::InvalidArgument, "{name}");
+        }
+        // A folder named meshd is not the program either.
+        let folder = dir.path().join("sub");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(folder.join(EXE)).unwrap();
+        assert!(accept_meshd(&folder.join(EXE)).is_err());
+        // Nor is a file that does not exist.
+        assert!(accept_meshd(&dir.path().join("missing").join(EXE)).is_err());
+    }
+
+    #[test]
+    fn accept_meshd_rejects_relative_paths() {
+        let err = accept_meshd(Path::new(EXE)).unwrap_err();
+        assert_eq!(err.code, UiErrorCode::InvalidArgument);
+        let err = accept_meshd(&Path::new("bin").join(EXE)).unwrap_err();
+        assert_eq!(err.code, UiErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn accept_meshd_canonicalises() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = meshd_file(dir.path(), EXE);
+        std::fs::create_dir(dir.path().join("x")).unwrap();
+        let roundabout = dir.path().join("x").join("..").join(EXE);
+        let got = accept_meshd(&roundabout).unwrap();
+        assert!(got.is_absolute());
+        assert!(
+            !got.components()
+                .any(|c| c == std::path::Component::ParentDir)
+        );
+        assert_eq!(
+            std::fs::canonicalize(&got).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+        // No `\\?\` prefix: the path is shown to the user and passed to ShellExecute.
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"), "{got:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accept_meshd_ignores_case_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = meshd_file(dir.path(), "MeshD.EXE");
+        assert!(accept_meshd(&p).is_ok());
+    }
+
+    #[test]
+    fn locate_meshd_prefers_a_valid_remembered_path() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let remembered = meshd_file(a.path(), EXE);
+        meshd_file(b.path(), EXE);
+        let got = locate_meshd_in(Some(remembered.clone()), Some(b.path()), None).unwrap();
+        assert_eq!(got, accept_meshd(&remembered).unwrap());
+        // A remembered file of another name is ignored: the one next to the app is used.
+        let other = meshd_file(a.path(), "setup.exe");
+        let got = locate_meshd_in(Some(other), Some(b.path()), None).unwrap();
+        assert_eq!(got, accept_meshd(&b.path().join(EXE)).unwrap());
+    }
+
+    #[test]
+    fn locate_meshd_skips_relative_path_entries() {
+        // A relative PATH entry that does hold a meshd (relative to the test's cwd).
+        let rel = tempfile::Builder::new()
+            .prefix("relpath-test-")
+            .tempdir_in(".")
+            .unwrap();
+        meshd_file(rel.path(), EXE);
+        let rel_name = PathBuf::from(rel.path().file_name().unwrap());
+        assert!(rel_name.is_relative() && rel_name.join(EXE).is_file());
+        let path_var = std::env::join_paths([rel_name.clone()]).unwrap();
+        assert_eq!(locate_meshd_in(None, None, Some(&path_var)), None);
+        // The same directory given absolutely is found, as an absolute path.
+        let abs = std::env::current_dir().unwrap().join(&rel_name);
+        let path_var = std::env::join_paths([rel_name, abs.clone()]).unwrap();
+        let got = locate_meshd_in(None, None, Some(&path_var)).unwrap();
+        assert!(got.is_absolute());
+        assert_eq!(got, accept_meshd(&abs.join(EXE)).unwrap());
     }
 
     #[test]

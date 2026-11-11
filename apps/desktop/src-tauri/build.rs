@@ -7,7 +7,7 @@ const DESKTOP_COMMANDS: &[&str] = &[
     "deploy_static_dir",
     "connection",
     "locate_meshd",
-    "set_meshd_path",
+    "locate_meshd_dialog",
     "daemon_run_user",
     "daemon_install",
     "pick_folder",

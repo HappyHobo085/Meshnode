@@ -209,7 +209,11 @@ export const api = {
       }),
     connection: () => call<ConnectionDto>("connection"),
     locateMeshd: () => call<string | null>("locate_meshd"),
-    setMeshdPath: (path: string) => call<void>("set_meshd_path", { path }),
+    /**
+     * Locate meshd…: the system dialog, opened by Rust, which accepts only a file named
+     * `meshd` / `meshd.exe` and remembers it. Its path, or `null` when cancelled.
+     */
+    locateMeshdDialog: () => picked(call<string>("locate_meshd_dialog")),
     daemonRunUser: () => call<ConnectionDto>("daemon_run_user"),
     daemonInstall: () => call<ConnectionDto>("daemon_install"),
     /** A folder from the system dialog, or `null` when cancelled. */

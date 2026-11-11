@@ -423,6 +423,12 @@
           "markdownDescription": "Enables the locate_meshd command without any pre-configured scope."
         },
         {
+          "description": "Enables the locate_meshd_dialog command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-locate-meshd-dialog",
+          "markdownDescription": "Enables the locate_meshd_dialog command without any pre-configured scope."
+        },
+        {
           "description": "Enables the logs_follow command without any pre-configured scope.",
           "type": "string",
           "const": "allow-logs-follow",
@@ -499,12 +505,6 @@
           "type": "string",
           "const": "allow-set-limits",
           "markdownDescription": "Enables the set_limits command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the set_meshd_path command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-set-meshd-path",
-          "markdownDescription": "Enables the set_meshd_path command without any pre-configured scope."
         },
         {
           "description": "Enables the set_outbound command without any pre-configured scope.",
@@ -615,6 +615,12 @@
           "markdownDescription": "Denies the locate_meshd command without any pre-configured scope."
         },
         {
+          "description": "Denies the locate_meshd_dialog command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-locate-meshd-dialog",
+          "markdownDescription": "Denies the locate_meshd_dialog command without any pre-configured scope."
+        },
+        {
           "description": "Denies the logs_follow command without any pre-configured scope.",
           "type": "string",
           "const": "deny-logs-follow",
@@ -691,12 +697,6 @@
           "type": "string",
           "const": "deny-set-limits",
           "markdownDescription": "Denies the set_limits command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the set_meshd_path command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-set-meshd-path",
-          "markdownDescription": "Denies the set_meshd_path command without any pre-configured scope."
         },
         {
           "description": "Denies the set_outbound command without any pre-configured scope.",

@@ -172,7 +172,7 @@ service wins and the UI shows a one-time notice that a second, separate node is 
 ### 4.2 Starting a daemon
 
 - `locate_meshd()`: `meshd[.exe]` next to the app executable, else on `PATH`, else `None` (the UI then offers
-  **Locate meshd…**, a file dialog, remembered in the app's config dir).
+  **Locate meshd…**: `locate_meshd_dialog` opens the file dialog in Rust, accepts only a file named `meshd`/`meshd.exe`, canonicalises it and remembers it in the app's config dir; the page never names the path). Relative `PATH` entries are skipped.
 - **Run without installing:** spawn `meshd run --data <user dir>` detached (Windows: `DETACHED_PROCESS |
   CREATE_NO_WINDOW`; Unix: `setsid`), stdout/stderr to `<user dir>/meshd.log`. Poll the endpoint for up to 10 s
   (`DaemonStarting` meanwhile). The daemon outlives the UI.
@@ -184,7 +184,7 @@ service wins and the UI shows a one-time notice that a second, separate node is 
   against a temp data directory.
 
 ### 4.3 Desktop-only commands
-`connection`, `locate_meshd`, `set_meshd_path`, `daemon_run_user`, `daemon_install`, `pick_folder`, `pick_file`
+`connection`, `locate_meshd`, `locate_meshd_dialog`, `daemon_run_user`, `daemon_install`, `pick_folder`, `pick_file`
 (`tauri-plugin-dialog`), `open_url` (the gateway URL in the default browser, `tauri-plugin-opener`, only
 `http://*.localhost:*` and `http://127.0.0.1:*`).
 

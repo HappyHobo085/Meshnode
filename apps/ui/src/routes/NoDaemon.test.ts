@@ -14,8 +14,7 @@ const api = vi.hoisted(() => ({
     daemonRunUser: vi.fn(),
     daemonInstall: vi.fn(),
     locateMeshd: vi.fn(),
-    setMeshdPath: vi.fn(),
-    pickFile: vi.fn(),
+    locateMeshdDialog: vi.fn(),
   },
 }));
 vi.mock("../lib/api", async (importOriginal) => ({
@@ -44,7 +43,6 @@ beforeEach(() => {
   api.services.mockResolvedValue([]);
   api.desktop.connection.mockResolvedValue({ kind: "none", otherRunning: false });
   api.desktop.locateMeshd.mockResolvedValue("C:/Program Files/Meshnode/meshd.exe");
-  api.desktop.setMeshdPath.mockResolvedValue(undefined);
   status.set(null);
   banner.set({ kind: "unreachable", error: UNREACHABLE });
 });
@@ -110,16 +108,42 @@ it("no_daemon_run_that_never_answers_points_at_the_log", async () => {
 
 it("no_daemon_without_meshd_offers_locate", async () => {
   api.desktop.locateMeshd.mockResolvedValueOnce(null);
-  api.desktop.pickFile.mockResolvedValue("D:/tools/meshd.exe");
+  // The dialog is opened (and its choice checked and saved) in Rust: the page never names a path.
+  api.desktop.locateMeshdDialog.mockResolvedValue("D:\tools\meshd.exe");
   await mount();
   expect(screen.getByText(/meshd wasn't found/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Run without installing" })).toBeDisabled();
   await fireEvent.click(screen.getByRole("button", { name: "Locate meshd…" }));
   await tick();
   await tick();
-  expect(api.desktop.pickFile).toHaveBeenCalledWith("exe");
-  expect(api.desktop.setMeshdPath).toHaveBeenCalledWith("D:/tools/meshd.exe");
+  expect(api.desktop.locateMeshdDialog).toHaveBeenCalledWith();
   await tick();
   await tick();
   expect(screen.getByRole("button", { name: "Run without installing" })).toBeEnabled();
+});
+
+it("no_daemon_locate_refuses_other_files", async () => {
+  api.desktop.locateMeshd.mockResolvedValue(null);
+  api.desktop.locateMeshdDialog.mockRejectedValue({
+    code: "invalidArgument",
+    message: "D:\tools\setup.exe isn't meshd",
+    hint: "Choose the Meshnode daemon, the file named meshd.exe.",
+    reason: null,
+  });
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Locate meshd…" }));
+  for (let i = 0; i < 3; i++) await tick();
+  const alert = screen.getByRole("alert");
+  expect(alert).toHaveTextContent("Couldn't use that file");
+  expect(alert).toHaveTextContent("isn't meshd");
+  expect(screen.getByRole("button", { name: "Run without installing" })).toBeDisabled();
+});
+
+it("no_daemon_locate_cancel_is_quiet", async () => {
+  api.desktop.locateMeshd.mockResolvedValue(null);
+  api.desktop.locateMeshdDialog.mockResolvedValue(null);
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Locate meshd…" }));
+  for (let i = 0; i < 3; i++) await tick();
+  expect(screen.queryByRole("alert")).toBeNull();
 });

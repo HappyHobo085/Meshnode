@@ -98,15 +98,36 @@ where
     Fut: Future<Output = Result<(), UiError>> + Send + 'static,
 {
     let registry = app.state::<StreamRegistry>().inner().clone();
-    let (id, cancelled) = registry.register();
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    let (id, task) = stream_task(&registry, channel, move |tx| run(app, tx));
+    tauri::async_runtime::spawn(task);
+    id
+}
+
+/// The part of [`spawn_stream`] that needs no app: registers the stream and returns its id
+/// and the task to run.
+pub fn stream_task<T, F, Fut>(
+    registry: &StreamRegistry,
+    channel: Channel<StreamEvent<T>>,
+    run: F,
+) -> (u32, impl Future<Output = ()> + Send + 'static)
+where
+    T: Serialize + Clone + Send + Sync + 'static,
+    F: FnOnce(mpsc::Sender<T>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), UiError>> + Send + 'static,
+{
+    let registry = registry.clone();
+    let (id, cancelled) = registry.register();
+    let task = async move {
         let (tx, mut rx) = mpsc::channel::<T>(64);
-        let work = run(app, tx);
-        let forward = async {
+        let work = run(tx);
+        let items = channel.clone();
+        // Owns `rx`: when a send fails (the page is gone) this returns and drops the
+        // receiver, so `work` sees its sender closed and ends, freeing its stream slot and
+        // admin connection.
+        let forward = async move {
             while let Some(value) = rx.recv().await {
-                if channel.send(StreamEvent::Item { value }).is_err() {
-                    // Dropping the receiver stops `work`.
+                if items.send(StreamEvent::Item { value }).is_err() {
                     return false;
                 }
             }
@@ -124,8 +145,8 @@ where
             let _ = channel.send(end);
         }
         registry.finished(id);
-    });
-    id
+    };
+    (id, task)
 }
 
 #[cfg(test)]
@@ -189,6 +210,98 @@ mod tests {
         let (_c, rc) = reg.register();
         reg.cancel_all();
         assert!(rc.await.is_ok());
+        assert!(reg.is_empty());
+    }
+
+    /// A daemon whose log follow sends lines until its receiver is dropped.
+    struct EndlessLog;
+
+    #[async_trait::async_trait]
+    impl mesh_ui::AdminTransport for EndlessLog {
+        async fn request(
+            &self,
+            _req: mesh_admin::AdminRequest,
+        ) -> Result<mesh_admin::AdminResponse, UiError> {
+            Err(UiError::internal("not used"))
+        }
+
+        async fn stream(
+            &self,
+            _req: mesh_admin::AdminRequest,
+            tx: mpsc::Sender<String>,
+        ) -> Result<(), UiError> {
+            loop {
+                if tx.send("line".into()).await.is_err() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        async fn deploy_static(
+            &self,
+            _name: String,
+            _opts: mesh_admin::DeployOpts,
+            _src: Box<dyn mesh_ui::FileSource>,
+            _progress: mpsc::Sender<u64>,
+        ) -> Result<mesh_admin::AdminResponse, UiError> {
+            Err(UiError::internal("not used"))
+        }
+    }
+
+    fn follow(
+        ui: &Arc<mesh_ui::Ui>,
+        reg: &StreamRegistry,
+        channel: Channel<StreamEvent<String>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let ui = ui.clone();
+        let (_id, task) = stream_task(reg, channel, move |tx| async move {
+            ui.logs_follow(10, tx).await
+        });
+        tokio::spawn(task)
+    }
+
+    /// A failed send (the page is gone) ends the stream: its slot, its registry entry and
+    /// its connection are freed, so more than 4 such views never make later ones `Busy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_send_ends_the_stream() {
+        use std::time::Duration;
+        let transport: Arc<dyn mesh_ui::AdminTransport> = Arc::new(EndlessLog);
+        let ui = Arc::new(mesh_ui::Ui::new(
+            Arc::new(move || transport.clone()),
+            mesh_ui::Platform::DesktopWindows,
+        ));
+        let reg = StreamRegistry::new();
+        for _ in 0..mesh_ui::streams::MAX_STREAMS {
+            let gone = Channel::new(|_| Err(tauri::Error::FailedToReceiveMessage));
+            let task = follow(&ui, &reg, gone);
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the stream ends after a failed send")
+                .unwrap();
+        }
+        assert!(reg.is_empty(), "every ended stream is forgotten");
+
+        // A 5th view gets lines, not Busy.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<String>();
+        let live = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let _ = seen_tx.send(json);
+            }
+            Ok(())
+        });
+        let task = follow(&ui, &reg, live);
+        let first = tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+            .await
+            .expect("an event")
+            .expect("an event");
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["kind"], "item", "{first}");
+        reg.cancel_all();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancel ends it")
+            .unwrap();
         assert!(reg.is_empty());
     }
 

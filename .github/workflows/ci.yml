@@ -137,7 +137,12 @@ jobs:
       - run: cargo test --manifest-path crates/mesh-ui-tauri/Cargo.toml
       - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+      # The "run without installing" test spawns a real `meshd run` (temp data dir, loopback
+      # only); without MESHD_BIN it fails under CI rather than skipping.
+      - run: cargo build -p meshd
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+        env:
+          MESHD_BIN: ${{ github.workspace }}/target/debug/meshd${{ runner.os == 'Windows' && '.exe' || '' }}
 
   android-apk:
     runs-on: ubuntu-latest

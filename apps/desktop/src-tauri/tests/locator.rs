@@ -144,6 +144,24 @@ async fn locator_relocates_after_daemon_restart() {
     d.shutdown().await;
 }
 
+/// The `meshd` the spawn test runs: `$MESHD_BIN` when set (CI builds it and sets this; it
+/// must then exist), else one built in this target directory (`cargo build -p meshd`).
+/// Without one the test is skipped locally, but fails under CI (`$CI` set), so it can never
+/// pass silently there.
+fn meshd_for_spawn_test() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var_os("MESHD_BIN") {
+        let bin = PathBuf::from(bin);
+        assert!(bin.is_file(), "MESHD_BIN={} is not a file", bin.display());
+        return Some(bin);
+    }
+    let found = built_meshd();
+    assert!(
+        found.is_some() || std::env::var_os("CI").is_none(),
+        "run_user_spawns_daemon needs meshd under CI: build it (cargo build -p meshd) and set MESHD_BIN"
+    );
+    found
+}
+
 /// A `meshd` binary built in this target directory (`cargo build -p meshd`), if any.
 fn built_meshd() -> Option<PathBuf> {
     let exe = format!("meshd{}", std::env::consts::EXE_SUFFIX);
@@ -174,8 +192,10 @@ impl Drop for Kill {
 /// within 10 s; the test then kills it. The OS service is never involved.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_user_spawns_daemon() {
-    let Some(meshd) = built_meshd() else {
-        eprintln!("run_user_spawns_daemon: no built meshd found (cargo build -p meshd); skipped");
+    let Some(meshd) = meshd_for_spawn_test() else {
+        eprintln!(
+            "run_user_spawns_daemon: SKIPPED, no built meshd (cargo build -p meshd, or set MESHD_BIN)"
+        );
         return;
     };
     let data = TempDir::new().unwrap();

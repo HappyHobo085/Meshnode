@@ -283,3 +283,24 @@ it("settings_shows_the_second_node_notice_when_both_run", async () => {
   await mount();
   expect(screen.getByText(/second, separate node is running as you/)).toBeInTheDocument();
 });
+
+it("reset_identity_without_a_name_asks_for_the_word_reset", async () => {
+  // `status_info` fills the name only while the daemon can read the node or meshd.toml;
+  // the in-process status (Android) may leave it out.
+  status.set(running({ state: "removed", name: null }));
+  members.set([]);
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Reset identity…" }));
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getByRole("heading")).toHaveTextContent("Reset this device's identity?");
+  expect(dialog).toHaveTextContent("name isn't available right now, so type “reset”");
+  const input = within(dialog).getByLabelText("Type “reset” to confirm");
+  const action = within(dialog).getByRole("button", { name: "Reset identity" });
+  await fireEvent.input(input, { target: { value: "this device" } });
+  expect(action).toBeDisabled();
+  await fireEvent.input(input, { target: { value: "reset" } });
+  expect(action).toBeEnabled();
+  await fireEvent.click(action);
+  await tick();
+  expect(api.resetIdentity).toHaveBeenCalledTimes(1);
+});

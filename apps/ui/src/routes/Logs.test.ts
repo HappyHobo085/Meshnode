@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { flushSync, tick } from "svelte";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { OnEnd } from "../lib/api";
@@ -160,4 +160,67 @@ it("logs_too_many_live_views_shows_inline", async () => {
   await tick();
   expect(screen.getByRole("alert")).toHaveTextContent("Too many live views open");
   expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+});
+
+it("logs_resume_that_fails_keeps_the_old_lines", async () => {
+  await mount();
+  push(line("ERROR", "why it broke"));
+  end({ code: "daemonUnreachable", message: "gone", hint: null, reason: null });
+  flushSync();
+  api.logsFollow.mockRejectedValueOnce({
+    code: "daemonUnreachable",
+    message: "still gone",
+    hint: null,
+    reason: null,
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+  await tick();
+  await tick();
+  expect(api.logsFollow).toHaveBeenCalledTimes(2);
+  expect(screen.getByRole("status")).toHaveTextContent("Disconnected");
+  // The lines that explain the disconnect are still on screen.
+  expect(screen.getByText(/why it broke$/)).toBeInTheDocument();
+});
+
+it("logs_resume_replaces_the_old_lines_when_the_new_stream_speaks", async () => {
+  await mount();
+  push(line("INFO", "old line"));
+  end({ code: "daemonUnreachable", message: "gone", hint: null, reason: null });
+  flushSync();
+  await fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+  await tick();
+  await tick();
+  expect(screen.getByText(/old line$/)).toBeInTheDocument();
+  // The new stream replays the history: it replaces the old lines rather than doubling them.
+  push(line("INFO", "replayed history"));
+  flushSync();
+  expect(screen.queryByText(/old line$/)).toBeNull();
+  expect(screen.getByText(/replayed history$/)).toBeInTheDocument();
+  expect(screen.getByText(/^1 line$/)).toBeInTheDocument();
+});
+
+it("logs_resume_while_paused_follows_again", async () => {
+  await mount();
+  push(line("INFO", "a"));
+  flushSync();
+  await fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+  end({ code: "daemonUnreachable", message: "gone", hint: null, reason: null });
+  flushSync();
+  // The strip's Resume (the header button also reads Resume while paused).
+  const strip = screen.getByRole("status");
+  await fireEvent.click(within(strip).getByRole("button", { name: "Resume" }));
+  await tick();
+  await tick();
+  expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+  push(line("INFO", "after reconnect"));
+  flushSync();
+  expect(screen.getByText(/after reconnect$/)).toBeInTheDocument();
+});
+
+it("logs_new_lines_while_paused_are_capped_at_capacity", async () => {
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+  for (let i = 0; i < 12_000; i++) push(line("INFO", `p ${i}`));
+  flushSync();
+  expect(screen.getByText(/^10\D?000 new lines$/)).toBeInTheDocument();
 });

@@ -10,6 +10,7 @@ import deploy from "../../routes/Deploy.svelte?raw";
 import services from "../../routes/Services.svelte?raw";
 import sheet from "./Sheet.svelte?raw";
 import app from "../../App.svelte?raw";
+import removed from "../../routes/Removed.svelte?raw";
 import logs from "../../routes/Logs.svelte?raw";
 import settings from "../../routes/Settings.svelte?raw";
 import probeChart from "../../routes/ProbeChart.svelte?raw";
@@ -72,6 +73,7 @@ it.each([
   ["ProbeChart", ".target", probeChart],
   ["Chip", ".remove", chip],
   ["App", ".dismiss", app],
+  ["Removed", ".link", removed],
 ])("%s %s meets the touch target on coarse pointers", (_name, selector, source) => {
   const rule = new RegExp(
     selector.replace(".", "\\.") + String.raw`\s*\{[^}]*(min-)?height:\s*var\(--touch\)`,

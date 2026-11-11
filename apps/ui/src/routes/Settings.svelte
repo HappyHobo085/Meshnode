@@ -3,15 +3,14 @@
   import { api, toUiError, type ConnectionDto, type Platform, type UiError } from "../lib/api";
   import Button from "../lib/design/Button.svelte";
   import Chip from "../lib/design/Chip.svelte";
-  import Confirm from "../lib/design/Confirm.svelte";
   import Field from "../lib/design/Field.svelte";
   import Icon from "../lib/design/Icon.svelte";
-  import { navigate } from "../lib/router";
   import { NAME_RULE, validServiceName } from "../lib/service";
   import { members, refreshNow, status, toast } from "../lib/stores";
   import { theme, type Theme } from "../lib/theme";
   import PowerPolicy from "./PowerPolicy.svelte";
   import ProbeChart from "./ProbeChart.svelte";
+  import ResetIdentity from "./ResetIdentity.svelte";
 
   /** The daemon's limits on this device's info (mesh-proto `join.rs`). */
   const MAX_NAME_BYTES = 64;
@@ -238,16 +237,6 @@
 
   // ---- Danger zone ----------------------------------------------------------------------
   const removed = $derived($status?.state === "removed");
-  const selfName = $derived($status?.name ?? $members.find((m) => m.isSelf)?.name ?? "this device");
-  let confirmReset = $state(false);
-
-  async function resetIdentity() {
-    await api.resetIdentity();
-    confirmReset = false;
-    await refreshNow();
-    toast("Identity reset");
-    navigate({ name: "first-run" }, { replace: true });
-  }
 
   onMount(() => {
     void loadConfig();
@@ -556,23 +545,11 @@
             </p>
           {/if}
         </div>
-        <Button variant="danger" disabled={!removed} onclick={() => (confirmReset = true)}
-          >Reset identity…</Button
-        >
+        <ResetIdentity disabled={!removed} />
       </div>
     </div>
   </section>
 </div>
-
-<Confirm
-  open={confirmReset}
-  title="Reset {selfName}'s identity?"
-  consequence="This deletes this device's identity and its copy of the mesh's data. It gets a new identity and starts again from first run. A removed device can never rejoin with the same identity."
-  typeToConfirm={selfName}
-  actionLabel="Reset identity"
-  onConfirm={resetIdentity}
-  onCancel={() => (confirmReset = false)}
-/>
 
 <style>
   .settings {

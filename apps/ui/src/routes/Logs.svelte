@@ -53,6 +53,9 @@
       version++;
     }
   }
+  // Deliberate side effect: reading `seen` re-arms `changed`. Every view value below reads
+  // it, and the template reads them each flush; keep it that way when refactoring, or a
+  // burst could leave the view one bump behind.
   const seen = $derived.by(() => {
     bumpWaiting = false;
     return version;
@@ -174,25 +177,46 @@
       : `${total.toLocaleString()} ${total === 1 ? "line" : "lines"}`,
   );
 
+  /**
+   * Set while (re)connecting: the lines on screen stay until the new stream's first line
+   * arrives, so a Resume that fails again keeps the lines that explain the disconnect.
+   */
+  let replaceOnFirstLine = false;
+
   function onLine(text: string) {
+    if (replaceOnFirstLine) {
+      // The fresh stream replays the recent history, so the old lines go now.
+      replaceOnFirstLine = false;
+      buffer.clear();
+      lastLevel = "info";
+      pendingCount = 0;
+    }
     const level = levelOf(text) ?? lastLevel;
     lastLevel = level;
     buffer.push({ n: seq++, text, level });
-    if (paused) pendingCount++;
+    // Only the last LOG_CAPACITY lines are kept, so more can't be waiting.
+    if (paused) pendingCount = Math.min(pendingCount + 1, LOG_CAPACITY);
     changed();
   }
 
   function connect() {
     live?.close();
-    buffer.clear();
-    lastLevel = "info";
-    pendingCount = 0;
-    if (paused) frozen = [];
-    changed();
+    replaceOnFirstLine = true;
     live = openLive(
       (onEnd) => api.logsFollow(LOG_HISTORY, onLine, onEnd),
       (s) => (stream = s),
     );
+  }
+
+  /** "Disconnected — Resume": reconnect and follow again (a paused view would stay frozen). */
+  function resume() {
+    if (paused) {
+      paused = false;
+      pendingCount = 0;
+      follow = true;
+      changed();
+    }
+    connect();
   }
 
   onMount(() => {
@@ -296,7 +320,7 @@
     <div class="strip lost" role="status">
       <Icon name="alert" size={16} />
       <p><strong>Disconnected</strong> <span class="detail">{lostText}</span></p>
-      <Button size="sm" onclick={connect}><Icon name="refresh" size={16} />Resume</Button>
+      <Button size="sm" onclick={resume}><Icon name="refresh" size={16} />Resume</Button>
     </div>
   {:else if stream.kind === "busy" || stream.kind === "failed"}
     <div class="strip failed" role="alert">
@@ -309,7 +333,7 @@
           <span class="detail">{stream.error.hint}</span>
         {/if}
       </p>
-      <Button size="sm" onclick={connect}>Try again</Button>
+      <Button size="sm" onclick={resume}>Try again</Button>
     </div>
   {/if}
 

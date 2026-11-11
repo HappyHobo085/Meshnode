@@ -16,6 +16,7 @@
   import Logs from "./routes/Logs.svelte";
   import NoDaemon from "./routes/NoDaemon.svelte";
   import NodeStopped from "./routes/NodeStopped.svelte";
+  import Removed from "./routes/Removed.svelte";
   import Services from "./routes/Services.svelte";
   import Settings from "./routes/Settings.svelte";
 
@@ -144,7 +145,10 @@
       </div>
     {/if}
     <main id="content" tabindex="-1">
-      {#if $route.name === "home"}
+      {#if $route.name === "home" && $status?.state === "removed"}
+        <!-- A removed device has no mesh to show: Home explains and offers the reset. -->
+        <Removed />
+      {:else if $route.name === "home"}
         <Home />
       {:else if $route.name === "add"}
         <AddDevice />

@@ -5,6 +5,7 @@
   import Button from "../lib/design/Button.svelte";
   import Icon from "../lib/design/Icon.svelte";
   import { copyText } from "../lib/device";
+  import { gatewayOpenUrl } from "../lib/format";
   import { hrefOf, navigate } from "../lib/router";
   import { members, status, toast } from "../lib/stores";
   import DeviceCard from "./DeviceCard.svelte";
@@ -59,6 +60,20 @@
     return Date.now();
   });
 
+  /** The address that could not be opened in the browser, shown inline. */
+  let openFailed: string | null = $state(null);
+
+  async function openGateway() {
+    if (!gateway) return;
+    const url = gatewayOpenUrl(gateway);
+    openFailed = null;
+    try {
+      await api.desktop.openUrl(url);
+    } catch {
+      openFailed = url;
+    }
+  }
+
   async function copyGateway() {
     if (!gateway) return;
     copyFailed = !(await copyText(gateway));
@@ -105,16 +120,16 @@
             <Icon name="copy" size={16} />
           </button>
           {#if desktop}
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label="Open in browser"
-              onclick={() => api.desktop.openUrl(gateway)}
-            >
+            <Button variant="ghost" size="sm" aria-label="Open in browser" onclick={openGateway}>
               <Icon name="external" size={16} /><span class="open-word">Open</span>
             </Button>
           {/if}
         </div>
+        {#if openFailed}
+          <p class="gw-error" role="alert">
+            Couldn't open {openFailed}. Copy the address and open it in your browser.
+          </p>
+        {/if}
         {#if copyFailed}
           <p class="gw-error" role="alert">
             Couldn't copy. Select the address and copy it by hand.

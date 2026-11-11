@@ -122,3 +122,27 @@ it("home_slides_in_only_members_that_appear_later", async () => {
   expect(desk).not.toHaveClass("arrive");
   expect(pixel).toHaveClass("arrive");
 });
+
+it("home_open_gateway_on_a_wildcard_address_opens_loopback", async () => {
+  status.set(running({ gatewayUrl: "http://0.0.0.0:7780" }));
+  members.set([member({ id: "a", name: "Desk", isSelf: true })]);
+  render(Home);
+  await fireEvent.click(await screen.findByRole("button", { name: /open in browser/i }));
+  expect(api.desktop.openUrl).toHaveBeenCalledWith("http://127.0.0.1:7780");
+});
+
+it("home_open_gateway_failure_is_shown_inline", async () => {
+  api.desktop.openUrl.mockRejectedValue({
+    code: "invalidArgument",
+    message: "Only Meshnode's local addresses can be opened",
+    hint: null,
+    reason: null,
+  });
+  status.set(running({ gatewayUrl: "http://192.168.1.5:7780" }));
+  members.set([member({ id: "a", name: "Desk", isSelf: true })]);
+  render(Home);
+  await fireEvent.click(await screen.findByRole("button", { name: /open in browser/i }));
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("Couldn't open http://192.168.1.5:7780");
+  expect(alert).toHaveTextContent("Copy the address and open it in your browser.");
+});

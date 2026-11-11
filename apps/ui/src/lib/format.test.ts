@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bytes, clock, relativeTime, rtt } from "./format";
+import { bytes, clock, gatewayOpenUrl, relativeTime, rtt } from "./format";
 
 const now = 1_700_000_000_000;
 const s = 1000;
@@ -44,4 +44,17 @@ it("clock_cases", () => {
   expect(clock(1)).toBe("0:01");
   expect(clock(0)).toBe("0:00");
   expect(clock(-5_000)).toBe("0:00");
+});
+
+describe("gatewayOpenUrl", () => {
+  it("opens a wildcard listen address on this machine", () => {
+    expect(gatewayOpenUrl("http://0.0.0.0:7780")).toBe("http://127.0.0.1:7780");
+    expect(gatewayOpenUrl("http://[::]:7780")).toBe("http://127.0.0.1:7780");
+  });
+  it("leaves other addresses as they are", () => {
+    expect(gatewayOpenUrl("http://127.0.0.1:7780")).toBe("http://127.0.0.1:7780");
+    expect(gatewayOpenUrl("http://192.168.1.5:7780")).toBe("http://192.168.1.5:7780");
+    // Loopback over IPv6 is not 127.0.0.1: left for open_url to refuse (shown inline).
+    expect(gatewayOpenUrl("http://[::1]:7780")).toBe("http://[::1]:7780");
+  });
 });

@@ -43,3 +43,12 @@ export function clock(ms: number): string {
   const s = total % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
 }
+
+/**
+ * The address to open for the gateway at `url` (`http://<gateway.listen>`): a wildcard
+ * listen address (`0.0.0.0`, `[::]`) is reached on this machine as `127.0.0.1`, the form
+ * the desktop app's `open_url` accepts. Anything else is returned as it is.
+ */
+export function gatewayOpenUrl(url: string): string {
+  return url.replace(/^http:\/\/(?:0\.0\.0\.0|\[::\])(?=:\d+(?:[/?#]|$))/i, "http://127.0.0.1");
+}

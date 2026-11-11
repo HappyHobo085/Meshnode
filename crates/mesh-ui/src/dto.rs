@@ -64,6 +64,15 @@ impl From<Role> for RoleDto {
     }
 }
 
+impl From<RoleDto> for Role {
+    fn from(r: RoleDto) -> Self {
+        match r {
+            RoleDto::Host => Role::Host,
+            RoleDto::Client => Role::Client,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]

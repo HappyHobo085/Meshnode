@@ -14,8 +14,11 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 ts-rs = { version = "12", features = ["serde-compat"] }
+qrcode = { workspace = true, default-features = false }
 
 [dev-dependencies]
 mesh-host = { path = "../mesh-host", features = ["test-hooks"] }
+resvg = "0.49.0"
+rqrr = "0.11.0"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

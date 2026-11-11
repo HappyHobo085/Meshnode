@@ -4,9 +4,11 @@
 pub mod commands;
 pub mod dto;
 pub mod error;
+pub mod qr;
 pub mod transport;
 
 pub use commands::{Platform, Ui};
 pub use dto::*;
 pub use error::{JoinRefusalDto, UiError, UiErrorCode, hint_for};
+pub use qr::qr_svg;
 pub use transport::{AdminTransport, InProcessTransport, NoNode, TransportFn};

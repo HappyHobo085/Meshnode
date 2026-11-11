@@ -80,7 +80,40 @@ impl Ui {
         self.status().await
     }
 
+    pub async fn invite(&self, role: RoleDto, ttl_s: u32) -> Result<InviteDto, UiError> {
+        if !matches!(ttl_s, 300 | 900 | 3600) {
+            return Err(UiError::invalid(
+                "an invite lasts 5 minutes, 15 minutes or 1 hour",
+            ));
+        }
+        let req = AdminRequest::Invite {
+            role: role.into(),
+            ttl_secs: ttl_s,
+        };
+        match self.call(req).await? {
+            AdminResponse::Ticket { text } => {
+                let ticket = mesh_proto::InviteTicket::from_text(&text)
+                    .map_err(|e| UiError::internal(format!("daemon made a bad invite: {e}")))?;
+                Ok(InviteDto {
+                    qr_svg: crate::qr::qr_svg(&text),
+                    text,
+                    expires_at_ms: ticket.expires_ms,
+                })
+            }
+            other => Err(unexpected("invite", other)),
+        }
+    }
+
     pub async fn join(&self, ticket: String, name: String) -> Result<StatusDto, UiError> {
+        let ticket = ticket.trim().to_owned();
+        if mesh_proto::InviteTicket::from_text(&ticket).is_err() {
+            return Err(UiError {
+                code: UiErrorCode::InvalidArgument,
+                message: "That isn't a Meshnode invite".into(),
+                hint: Some("Scan or paste the invite shown on the other device.".into()),
+                reason: None,
+            });
+        }
         self.call_ok("join", AdminRequest::Join { ticket, name })
             .await?;
         self.status().await

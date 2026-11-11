@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use aegis_sync_core::auth::MAX_TTL_MS;
 use aegis_sync_core::devices::{AccountFacts, DeviceFacts};
 use aegis_sync_core::order::{order_bytes, tie_ord};
-use aegis_sync_core::page::page_sorted;
+use aegis_sync_core::page::{Page, page_sorted};
 use aegis_sync_core::vector::{self, Host, NOW_MS, Req, Tamper, Vector};
 use aegis_sync_core::wire::{
     MAX_CT_LEN, MAX_RECORDS_PER_ACCOUNT, MAX_RESPONSE_BYTES, MAX_RESPONSE_RECORDS, WireRecord,
@@ -38,12 +38,11 @@ const SERVICE_LIMITS: Limits = Limits {
     max_body_bytes: 8 * 1024 * 1024,
 };
 
-/// Room for a full `MAX_RESPONSE_BYTES` page: the runtime caps a RESPONSE body at
-/// `max_body_bytes` too, so the 8 MiB default cuts a 32 MiB page off with a 500.
-const WIDE_LIMITS: Limits = Limits {
-    max_body_bytes: 40 * 1024 * 1024,
-    ..SERVICE_LIMITS
-};
+/// The service's page byte budget (`records::MESH_MAX_RESPONSE_BYTES`): 6 MiB instead of the
+/// core's 32 MiB `MAX_RESPONSE_BYTES`, because the runtime caps response bodies at
+/// `max_body_bytes` (8 MiB) too. Every walked page is checked against [`page_mesh`] with this
+/// budget, so a different value in the service fails the paging tests.
+const MESH_MAX_RESPONSE_BYTES: u64 = 6 * 1024 * 1024;
 
 struct Svc {
     rt: Runtime,
@@ -66,6 +65,12 @@ fn fresh_kv() -> Arc<MemKv> {
 
 impl Svc {
     async fn send(&self, kv: &Arc<MemKv>, limits: Limits, req: &Req) -> (u16, Option<Value>) {
+        let (status, raw) = self.send_raw(kv, limits, req).await;
+        (status, serde_json::from_slice(&raw).ok())
+    }
+
+    /// The status and the raw response body.
+    async fn send_raw(&self, kv: &Arc<MemKv>, limits: Limits, req: &Req) -> (u16, Bytes) {
         let mut b = http::Request::builder()
             .method(req.method.as_str())
             .uri(format!("http://sync.mesh.localhost{}", req.path));
@@ -88,9 +93,7 @@ impl Svc {
             outbound: Vec::new(),
         };
         let resp = self.rt.handle(&self.svc, b.body(body).unwrap(), ctx).await;
-        let status = resp.status().as_u16();
-        let body = serde_json::from_slice(resp.body()).ok();
-        (status, body)
+        (resp.status().as_u16(), resp.into_body())
     }
 
     async fn call(&self, kv: &Arc<MemKv>, req: Req) -> (u16, Option<Value>) {
@@ -539,8 +542,63 @@ struct Walk<'a> {
     max_pages: usize,
 }
 
-/// Walks a namespace page by page, checking every page against the core's `page_sorted` over
-/// `model` (what the mesh should serve, see [`served`]); returns the uuids in walk order.
+/// `page::page_sorted` with the byte budget as a parameter: the same loop, line for line.
+/// [`page_mesh_is_page_sorted`] pins it to the core's function at the core's budget; the walks
+/// use it with [`MESH_MAX_RESPONSE_BYTES`], the service's budget.
+fn page_mesh(sorted: &[WireRecord], cursor: Option<&str>, limit: usize, budget: u64) -> Page {
+    let limit = limit.clamp(1, MAX_RESPONSE_RECORDS);
+    let mut records: Vec<WireRecord> = Vec::new();
+    let mut bytes = 0u64;
+    let mut next: Option<String> = None;
+    let after_cursor = sorted
+        .iter()
+        .skip_while(|r| cursor.is_some_and(|c| r.uuid.as_str() <= c));
+    for r in after_cursor {
+        if records.len() >= limit {
+            next = Some(records.last().map(|w| w.uuid.clone()).unwrap_or_default());
+            break;
+        }
+        bytes += wire_bytes(r) as u64;
+        if records.is_empty() && bytes > budget {
+            records.push(r.clone());
+            next = Some(r.uuid.clone());
+            break;
+        }
+        if bytes > budget {
+            next = Some(records.last().map(|w| w.uuid.clone()).unwrap_or_default());
+            break;
+        }
+        records.push(r.clone());
+    }
+    Page { records, next }
+}
+
+#[test]
+fn page_mesh_is_page_sorted() {
+    let small: Vec<WireRecord> = (0..12_000)
+        .map(|i| rec(&format!("s{i:05}"), i, 0, "n", "c"))
+        .collect();
+    let ct = "a".repeat(MAX_CT_LEN);
+    let fat: Vec<WireRecord> = (0..600)
+        .map(|i| rec(&format!("f{i:04}"), i, 0, "n", &ct))
+        .collect();
+    let mut huge = vec![rec("h0", 1, 0, "n", "c"), rec("h1", 1, 0, "n", "c")];
+    huge[0].ct = "a".repeat(MAX_RESPONSE_BYTES as usize + 1);
+    for set in [&small, &fat, &huge] {
+        for cursor in [None, Some("f0100"), Some("s05000x"), Some("zz")] {
+            for limit in [0, 1, 7, 4_999, MAX_RESPONSE_RECORDS, usize::MAX] {
+                let a = page_sorted(set.iter(), cursor, limit);
+                let b = page_mesh(set, cursor, limit, MAX_RESPONSE_BYTES);
+                assert_eq!(as_value(&a.records), as_value(&b.records));
+                assert_eq!(a.next, b.next);
+            }
+        }
+    }
+}
+
+/// Walks a namespace page by page, checking every page against [`page_mesh`] at the service's
+/// budget over `model` (what the mesh should serve, see [`served`]) and every raw response body
+/// against that budget; returns the uuids in walk order.
 async fn walk(
     s: &Svc,
     kv: &Arc<MemKv>,
@@ -565,8 +623,8 @@ async fn walk(
             path.push_str(&format!("&cursor={c}"));
         }
         let started = Instant::now();
-        let (status, body) = s
-            .send(
+        let (status, raw) = s
+            .send_raw(
                 kv,
                 limits,
                 &req("GET", &path, auth("A", "D1", &nonce()), None),
@@ -575,11 +633,17 @@ async fn walk(
         let took = started.elapsed();
         assert_eq!(status, 200, "GET {path}");
         assert!(took < Duration::from_secs(30), "GET {path} took {took:?}");
-        let body = body.unwrap();
-        let want = page_sorted(
-            model.iter(),
+        assert!(
+            raw.len() as u64 <= MESH_MAX_RESPONSE_BYTES,
+            "GET {path}: a {} byte body",
+            raw.len()
+        );
+        let body: Value = serde_json::from_slice(&raw).unwrap();
+        let want = page_mesh(
+            model,
             cursor.as_deref(),
             limit.unwrap_or(MAX_RESPONSE_RECORDS),
+            MESH_MAX_RESPONSE_BYTES,
         );
         assert_eq!(
             body["records"],
@@ -591,7 +655,7 @@ async fn walk(
         assert!(page.len() <= MAX_RESPONSE_RECORDS);
         let bytes: u64 = page.iter().map(|r| wire_bytes(r) as u64).sum();
         assert!(
-            page.len() == 1 || bytes <= MAX_RESPONSE_BYTES,
+            page.len() == 1 || bytes <= MESH_MAX_RESPONSE_BYTES,
             "{bytes} bytes"
         );
         seen.extend(page.into_iter().map(|r| r.uuid));
@@ -669,10 +733,12 @@ async fn paging_large_namespace() {
     assert_eq!(s.call(&kv, update).await.0, 200);
 }
 
-/// A page of full-size records reaches `MAX_RESPONSE_BYTES` before `MAX_RESPONSE_RECORDS`; the
-/// service serves it within 64 MB of guest memory.
+/// A namespace whose records add up to far more than the 6 MiB page budget (640 records of
+/// 64 KiB ciphertext, about 40 MiB) is served across several pages under the service's
+/// default limits (64 MB, 30 s, 8 MiB body): every record exactly once, every response body at
+/// most 6 MiB.
 #[tokio::test(flavor = "multi_thread")]
-async fn paging_byte_budget_within_memory_limit() {
+async fn paging_byte_budget_spans_pages() {
     let s = service().await;
     let kv = fresh_kv();
     let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
@@ -684,9 +750,51 @@ async fn paging_byte_budget_within_memory_limit() {
     for r in &records {
         seed_record(&kv, &a, "fat", r).await;
     }
+    let total: u64 = records.iter().map(|r| wire_bytes(r) as u64).sum();
+    assert!(total > 6 * MESH_MAX_RESPONSE_BYTES, "{total} bytes");
     let model = served(&records);
-    let first = page_sorted(model.iter(), None, MAX_RESPONSE_RECORDS);
-    assert!(first.next.is_some() && first.records.len() < records.len());
-    let uuids = walk(&s, &kv, WIDE_LIMITS, whole("fat"), &model).await;
+    let first = page_mesh(&model, None, MAX_RESPONSE_RECORDS, MESH_MAX_RESPONSE_BYTES);
+    assert!(first.next.is_some() && first.records.len() < 100);
+    let uuids = walk(&s, &kv, SERVICE_LIMITS, whole("fat"), &model).await;
     assert_eq!(uuids.len(), records.len());
+    let unique: BTreeSet<&String> = uuids.iter().collect();
+    assert_eq!(unique.len(), records.len(), "every record exactly once");
+}
+
+/// A NUL anywhere in `ns`, a uuid or a record nonce is a 400 before canonicalisation. A uuid
+/// spelled like `canonicalize_body`'s internal empty-id slot ("\0empty:N") would otherwise be
+/// treated as missing and given a synthesized id, which may be an existing record's.
+#[tokio::test(flavor = "multi_thread")]
+async fn nul_in_ns_uuid_or_nonce_is_refused() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let push = |ns: &str, records: Vec<WireRecord>| {
+        let body = json!({ "ns": ns, "records": records });
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+    };
+    let ok = rec("fine", 1, 0, "n", "x");
+    let sentinel = rec("\u{0}empty:1", 1, 0, "n", "x");
+    assert_eq!(
+        s.call(&kv, push("bm", vec![ok.clone(), sentinel])).await.0,
+        400
+    );
+    let nul_uuid = rec("a\u{0}b", 1, 0, "n", "x");
+    assert_eq!(
+        s.call(&kv, push("bm", vec![ok.clone(), nul_uuid])).await.0,
+        400
+    );
+    let mut nul_nonce = rec("u", 1, 0, "n", "x");
+    nul_nonce.nonce = "a\u{0}".into();
+    assert_eq!(
+        s.call(&kv, push("bm", vec![ok.clone(), nul_nonce])).await.0,
+        400
+    );
+    assert_eq!(s.call(&kv, push("b\u{0}m", vec![ok.clone()])).await.0, 400);
+    let stored = kv.list_keys("rec/", None, 10).await.unwrap();
+    assert!(stored.is_empty(), "nothing written: {stored:?}");
+    // The same record without the NUL is stored.
+    assert_eq!(s.call(&kv, push("bm", vec![ok])).await.0, 200);
+    assert_eq!(kv.list_keys("rec/", None, 10).await.unwrap().len(), 1);
 }

@@ -7,7 +7,7 @@ use aegis_sync_core::env::Entropy;
 use aegis_sync_core::order::{order_bytes, tie_ord};
 use aegis_sync_core::wire::{
     MAX_CT_LEN, MAX_FIELD_LEN, MAX_RECORDS_PER_ACCOUNT, MAX_RECORDS_PER_REQUEST,
-    MAX_RESPONSE_BYTES, MAX_RESPONSE_RECORDS, WireRecord, hlc_key, hlc_well_formed, wire_bytes,
+    MAX_RESPONSE_RECORDS, WireRecord, hlc_key, hlc_well_formed, wire_bytes,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -55,15 +55,13 @@ fn parse_query(q: &str) -> Result<RecordsQuery, u16> {
 /// One page of `(account, ns)` in uuid order after `cursor`, with the tie `ord` applied.
 ///
 /// The page is the core's `page::page_sorted` page (same limit clamp, the same stop before
-/// the record that would cross `MAX_RESPONSE_BYTES`, the first record always served, `next`
-/// the last uuid served), but computed record by record while the response body streams, so
-/// guest memory holds one record and one output chunk, not the page: a full 32 MiB page held
-/// as records, then cloned, then serialized would not fit the service's 64 MB. The harness
-/// checks every page it walks against `page_sorted` itself.
-///
-/// The runtime caps a RESPONSE body at the service's `max_body_bytes` as well, so serving a
-/// full `MAX_RESPONSE_BYTES` page needs that limit above 32 MiB (the request body stays bounded
-/// at `MAX_BODY_BYTES` by `http::read_body`).
+/// the record that would cross the byte budget, the first record always served, `next` the
+/// last uuid served) with the byte budget [`MESH_MAX_RESPONSE_BYTES`] instead of the core's
+/// `MAX_RESPONSE_BYTES`. It is computed record by record while the response body streams, so
+/// guest memory holds one record and one output chunk, not the page (held as records, then
+/// cloned, then serialized, a page would cost about three times its size). The harness checks
+/// every page it walks against the same loop with the mesh budget, and pins that loop to
+/// `page_sorted` at the core's budget.
 pub fn get(query: &str, authz: Option<&str>) -> Resp {
     let q = match parse_query(query) {
         Ok(q) => q,
@@ -102,6 +100,15 @@ pub fn get(query: &str, authz: Option<&str>) -> Resp {
         .insert("content-type", HeaderValue::from_static("application/json"));
     resp
 }
+
+/// The byte budget of one `GET /v1/records` page on the mesh: 6 MiB, not the core's 32 MiB
+/// `wire::MAX_RESPONSE_BYTES`. The runtime caps a service's RESPONSE body at its
+/// `max_body_bytes` (8 MiB by default, spec §5.3) just as it caps the request body, so a 32 MiB
+/// page would come back as a 500 and the client could never page past it. 6 MiB of
+/// `wire_bytes` leaves room under 8 MiB for JSON that `wire_bytes`' per-record slack does not
+/// cover (string escapes). The record limit stays `MAX_RESPONSE_RECORDS`. The vendored core
+/// stays byte-identical, so the constant lives here.
+pub const MESH_MAX_RESPONSE_BYTES: u64 = 6 * 1024 * 1024;
 
 /// Bytes the pager gathers before handing a chunk to the response stream.
 const CHUNK: usize = 64 * 1024;
@@ -180,13 +187,13 @@ impl Pager {
             return Step::End(self.last.clone());
         }
         self.bytes += wire_bytes(&r) as u64;
-        if self.served == 0 && self.bytes > MAX_RESPONSE_BYTES {
+        if self.served == 0 && self.bytes > MESH_MAX_RESPONSE_BYTES {
             // The first record is always served, even over budget, so the cursor moves.
             self.served = 1;
             self.end_after = Some(Some(r.uuid.clone()));
             return Step::Emit(r);
         }
-        if self.bytes > MAX_RESPONSE_BYTES {
+        if self.bytes > MESH_MAX_RESPONSE_BYTES {
             return Step::End(self.last.clone());
         }
         self.served += 1;
@@ -267,11 +274,21 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
     if body.records.len() > MAX_RECORDS_PER_REQUEST || ns.len() > MAX_FIELD_LEN {
         return Err(413);
     }
+    // NUL is refused before canonicalisation: `canonicalize_body` takes a uuid beginning with
+    // its internal "\0empty:" slot prefix for a MISSING id, so such a uuid would be given a
+    // synthesized id (possibly an existing one) instead of being stored as sent. The store
+    // also refuses NUL in a key. The native server has no such check; this is a mesh bound.
+    if ns.contains('\0') {
+        return Err(400);
+    }
     let mut records = body.records;
     for r in &mut records {
         if r.uuid.len() > MAX_FIELD_LEN || r.nonce.len() > MAX_FIELD_LEN || r.ct.len() > MAX_CT_LEN
         {
             return Err(413);
+        }
+        if r.uuid.contains('\0') || r.nonce.contains('\0') {
+            return Err(400);
         }
         if !hlc_well_formed(&r.hlc) {
             return Err(400);
@@ -302,11 +319,9 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
 
     // The replicated store's own bounds, checked for the whole request before anything is
     // written: a key or set name over 512 bytes, an order over 64 bytes (an `hlc.node` over
-    // 48 bytes), a NUL in a key. The native server has no such bounds; these are the mesh's.
+    // 48 bytes); NUL was refused above. The native server has no such bounds; these are the
+    // mesh's.
     for (uuid, rec) in &incoming {
-        if uuid.contains('\0') {
-            return Err(400);
-        }
         if keys::rec_key(acct, ns, uuid).len() > keys::MAX_KEY
             || keys::hlcidx_set(acct, ns, &rec.hlc).len() > keys::MAX_KEY
             || order_bytes(&rec.hlc).len() > keys::MAX_ORDER

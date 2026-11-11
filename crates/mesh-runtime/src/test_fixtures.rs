@@ -53,6 +53,8 @@ fn build_wasm(manifest: &Path, subdir: &str) -> PathBuf {
     let out = Command::new(cargo)
         .args([
             "build",
+            // The committed lock file, never a re-resolve: a test run must not rewrite it.
+            "--locked",
             "--release",
             "--target",
             "wasm32-wasip2",

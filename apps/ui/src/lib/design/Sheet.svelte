@@ -138,6 +138,12 @@
     color: var(--ink-2);
     cursor: pointer;
   }
+  @media (pointer: coarse) {
+    .close {
+      width: var(--touch);
+      height: var(--touch);
+    }
+  }
   .close:hover {
     background: var(--surface-2);
     color: var(--ink);

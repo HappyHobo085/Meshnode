@@ -50,6 +50,54 @@ jobs:
       - run: cargo ndk -t arm64-v8a build -p mesh-store
       - run: cargo ndk -t arm64-v8a build -p mesh-services
       - run: cargo ndk -t arm64-v8a build -p mesh-gateway -p mesh-admin
+      - run: cargo ndk -t arm64-v8a build -p mesh-host -p mesh-ffi
+      # The Tauri project's crate is its own workspace; lint it for the Android target.
+      - run: rustup component add clippy
+      - run: cargo ndk -t arm64-v8a clippy --manifest-path apps/android/src-tauri/Cargo.toml --lib -- -D warnings
+
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Versions recorded in apps/android/build-apk.sh; bump them together.
+      TAURI_CLI_VERSION: "2.12.4"
+      NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;${NDK_VERSION}" "build-tools;36.0.0" "platforms;android-36" "platforms;android-35"
+      - run: echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            apps/android/src-tauri
+      - run: rustup target add aarch64-linux-android
+      - run: cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
+      - run: cargo install cargo-ndk --locked
+      # The committed UniFFI Kotlin bindings must match mesh-ffi's interface.
+      - name: Bindings are up to date
+        run: |
+          apps/android/gen-bindings.sh
+          git diff --exit-code -- apps/android/src-tauri/gen/android/app/src/main/java/net/meshnode/ffi/mesh_ffi.kt
+      # Release (stripped, thin LTO) arm64 APK; unsigned (release signing is sub-spec 8).
+      - name: Build the release APK
+        run: apps/android/build-apk.sh --release
+      - name: JVM unit tests and lint
+        working-directory: apps/android/src-tauri/gen/android
+        run: ./gradlew testUniversalDebugUnitTest lintUniversalDebug
+      - name: APK size
+        run: ls -l apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshnode-release-apk
+          path: apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
 
   macos:
     runs-on: macos-latest

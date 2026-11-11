@@ -53,7 +53,7 @@ Defaults reproduce desktop behaviour exactly.
 
 | Function | Behaviour |
 |---|---|
-| `init_android(context)` | Stores a global ref; calls `ndk_context::initialize_android_context(vm, context)` once. Idempotent. Must run before `start` (spike requirement 1); `start` returns `NotInitialised` otherwise on Android. |
+| `init_android(context)` | A raw JNI export (UniFFI cannot pass a `Context`). Stores a global ref; calls `ndk_context::initialize_android_context(vm, context)`. Idempotent; the workspace's patched `ndk-context` (`patches/ndk-context`) keeps the first context, so it is safe next to Tauri's `tao` in either start order. There is no `releaseAndroidContext`. Must run before `start` (spike requirement 1); `start` returns `NotInitialised` otherwise on Android. |
 | `start(data_dir, opts) -> Status` | Idempotent: if running, returns the current status. Starts `Daemon` with `HostOptions` (Android column). |
 | `stop()` | Graceful shutdown within the 20 s limit; releases `meshd.lock`. No-op if stopped. |
 | `status() -> Status` | `{ state: Stopped/Uninitialised/Running/Removed, node_id, mesh_name, services_hosted, peers_online, gateway_ports, last_error }`. |
@@ -107,8 +107,10 @@ traffic triggers a background catch-up (spike requirement 6).
 
 The restart decision (`trigger × user_stopped × running → start / ignore`) is a pure Kotlin function.
 
+Android refuses a foreground-service start from the background except for boot, package-replaced and an exact alarm; the inexact alarm and the WorkManager watchdog are refused without the battery exemption. A refused start posts the notification "Meshnode stopped in the background — tap to restart" instead of failing silently.
+
 ### 5.3 Power policy
-Stored in `meshd.toml` `[android] power = "balanced" | "always_on" | "saver"` (default `balanced`) and
+Stored in `meshd.toml` (the single source of truth; Rust saves a change) `[android] power = "balanced" | "always_on" | "saver"` (default `balanced`) and
 `[android] periodic_wake_s = 0` (default off). Rust decides; Kotlin only holds/releases locks it is told to.
 
 | Policy | Wake lock | Serving |
@@ -135,11 +137,12 @@ per-manufacturer guidance (dontkillmyapp.com).
 ## 6. Build and the placeholder UI
 
 ### 6.1 Toolchain and build
-- `apps/android` created with `tauri android init`; NDK 27.2, pinned build-tools, minSdk 29, targetSdk 35,
+- `apps/android` created with `tauri android init`; NDK 27.2, compileSdk 36, build-tools 36.0.0 (required by tauri-android 2.11+ and AGP 9.3.1), minSdk 29, targetSdk 35,
   ABIs arm64-v8a (+ x86_64 for the emulator).
 - Android release profile for the `.so`: `strip = true`, `lto = "thin"`, `codegen-units = 1`,
   `opt-level = "s"`. The APK size is measured and recorded in the manual check (no target).
-- Debug signing; sideloaded. Release signing is sub-spec 8.
+- `cargo tauri android build` cannot create the `jniLibs` symlink on a FAT32 checkout, so `apps/android/build-apk.sh` wraps it and falls back to copying; Linux CI calls the CLI directly. The Tauri CLI is pinned (tauri-cli 2.12.4). `apps/android/gen-bindings.sh` regenerates the committed Kotlin bindings; CI regenerates them and fails on a diff. Gradle variants: `testUniversalDebugUnitTest`, `lintUniversalDebug`.
+- Debug signing for installs; the release APK is built unsigned for the size measurement. Release signing is sub-spec 8.
 
 ### 6.2 Placeholder page
 Static HTML + two Tauri commands backed by `mesh-ffi`: `status` (state, node id, mesh, peers, services) and
@@ -166,6 +169,8 @@ Static HTML + two Tauri commands backed by `mesh-ffi`: `status` (state, node id,
 - `mesh-gateway`: `ping_service_answers_204`, gated for non-members.
 - `meshd`: `probe_reports_samples` (two daemons).
 
+Probe output includes `connect=` (the fresh dial, reported separately from the exchange time) and the CLI takes `--timeout` (1 s to 2 min, default 30 s). Saver mode answers 503 on the phone, which the desktop sees as 502.
+
 ### 8.2 Kotlin (JVM unit tests, no device)
 Restart decision table; notification text formatting.
 
@@ -182,9 +187,10 @@ Restart decision table; notification text formatting.
 
 If p95 on a sleeping phone exceeds 60 s (success criterion 7), set the `periodic_wake_s` default from the data.
 
+The manual-check document also carries the checks that the reviews found no way to automate: boot, swipe with and without the exact-alarm grant, the watchdog without the battery exemption (a refused background restart posts a notification), Stop then Start in quick succession, the always-on lock released after Stop, the page under the CSP, onboarding grants, cold start to `startForeground`, and the service-first / app-first `ndk-context` order.
+
 ### 8.4 CI
-Android job: `cargo ndk` build of `mesh-host`, `mesh-ffi`; APK `assembleDebug` via the Tauri CLI for
-arm64-v8a. No emulator in CI.
+`android` job: `cargo ndk` builds of the Android-capable crates including `mesh-host` and `mesh-ffi`, and clippy (`-D warnings`) of `apps/android/src-tauri` for the Android target. `android-apk` job (ubuntu): JDK 17, Android SDK (NDK 27.2.12479018, build-tools 36.0.0, platforms 35 and 36), pinned tauri-cli, the bindings drift check, the **release** APK (stripped, unsigned) through `build-apk.sh --release`, then `testUniversalDebugUnitTest` and `lintUniversalDebug`. No emulator in CI.
 
 ## 9. Back-ports to the master spec
 §3 crate table (`mesh-host`; `mesh-ffi` depends on host + admin; `apps/meshd` depends on host), §3 diagram note

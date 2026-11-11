@@ -5,7 +5,7 @@
   import Icon from "../lib/design/Icon.svelte";
   import Monogram from "../lib/design/Monogram.svelte";
   import { rtt } from "../lib/format";
-  import { openLive, type Live, type LiveState } from "../lib/live";
+  import { onVisibilityChange, openLive, type Live, type LiveState } from "../lib/live";
   import { niceCeiling, PROBE, summarize } from "../lib/probe";
 
   interface Props {
@@ -60,9 +60,13 @@
       : "Latency chart",
   );
 
+  /** The measurement was stopped because the page was hidden. */
+  let pausedHidden = $state(false);
+
   function start() {
     const device = chosen;
     if (!device) return;
+    pausedHidden = false;
     live?.close();
     target = device;
     samples = [];
@@ -74,14 +78,28 @@
   }
 
   function stop() {
+    pausedHidden = false;
     live?.close();
     live = null;
     stream = { kind: "ended" };
   }
 
-  onMount(() => () => {
-    live?.close();
-    live = null;
+  onMount(() => {
+    // Hidden (window minimised, phone backgrounded): stop measuring, and say so. It is not
+    // restarted when shown again: a new run starts its samples over.
+    const stopWatching = onVisibilityChange({
+      hidden() {
+        if (!running) return;
+        stop();
+        pausedHidden = true;
+      },
+      visible() {},
+    });
+    return () => {
+      stopWatching();
+      live?.close();
+      live = null;
+    };
   });
 </script>
 
@@ -129,7 +147,16 @@
     </div>
   {/if}
 
-  {#if stream.kind === "disconnected"}
+  {#if pausedHidden}
+    <div class="strip lost" role="status">
+      <Icon name="pause" size={16} />
+      <p>
+        <strong>Paused</strong>
+        <span class="detail">The measurement stopped while Meshnode was in the background.</span>
+      </p>
+      <Button size="sm" onclick={start}><Icon name="refresh" size={16} />Resume</Button>
+    </div>
+  {:else if stream.kind === "disconnected"}
     <div class="strip lost" role="status">
       <Icon name="alert" size={16} />
       <p>

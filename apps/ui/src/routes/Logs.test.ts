@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { flushSync, tick } from "svelte";
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { OnEnd } from "../lib/api";
 
 const api = vi.hoisted(() => ({
@@ -29,6 +29,19 @@ beforeEach(() => {
       return { id: 7, cancel };
     },
   );
+});
+
+/** Hides or shows the page, as minimising the window or backgrounding the phone does. */
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+afterEach(() => {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => "visible",
+  });
 });
 
 const line = (level: string, msg: string) =>
@@ -67,6 +80,60 @@ it("logs_view_cancels_on_unmount", async () => {
   const { unmount } = await mount();
   unmount();
   expect(cancel).toHaveBeenCalledTimes(1);
+});
+
+it("logs_view_stops_while_hidden_and_reconnects_keeping_lines", async () => {
+  await mount();
+  push(line("INFO", "before hiding"));
+  flushSync();
+  setVisibility("hidden");
+  // The follow (and its admin connection) ends while nobody can see it.
+  expect(cancel).toHaveBeenCalledTimes(1);
+  flushSync();
+  expect(screen.getByText(/before hiding$/)).toBeInTheDocument();
+  setVisibility("visible");
+  await tick();
+  await tick();
+  // Shown again: a new follow, the old lines kept until its replayed history arrives.
+  expect(api.logsFollow).toHaveBeenCalledTimes(2);
+  expect(screen.getByText(/before hiding$/)).toBeInTheDocument();
+  expect(screen.getByText("Live")).toBeInTheDocument();
+  push(line("INFO", "replayed"));
+  flushSync();
+  expect(screen.getByText(/replayed$/)).toBeInTheDocument();
+  expect(screen.queryByText(/before hiding$/)).toBeNull();
+});
+
+it("logs_view_hidden_after_a_disconnect_does_not_reconnect", async () => {
+  await mount();
+  end({ code: "daemonUnreachable", message: "gone", hint: null, reason: null });
+  flushSync();
+  setVisibility("hidden");
+  setVisibility("visible");
+  await tick();
+  expect(api.logsFollow).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("status")).toHaveTextContent("Disconnected");
+});
+
+it("logs_view_stops_listening_for_visibility_on_unmount", async () => {
+  const { unmount } = await mount();
+  unmount();
+  setVisibility("hidden");
+  setVisibility("visible");
+  await tick();
+  expect(api.logsFollow).toHaveBeenCalledTimes(1);
+});
+
+it("logs_view_busy_stream_error_says_too_many_live_views", async () => {
+  // logs_follow returns its id at once; the daemon's Busy refusal arrives as the stream's
+  // error event, not as a rejected invoke.
+  await mount();
+  end({ code: "busy", message: "Too many live views open", hint: null, reason: null });
+  flushSync();
+  const alert = screen.getByRole("alert");
+  expect(alert).toHaveTextContent("Too many live views open");
+  expect(alert).toHaveTextContent("Close another log or latency view");
+  expect(screen.queryByRole("status")).toBeNull();
 });
 
 it("logs_view_cancels_a_stream_that_opens_after_unmount", async () => {

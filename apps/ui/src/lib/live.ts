@@ -7,7 +7,8 @@ import { toUiError, type OnEnd, type StreamHandle, type UiError } from "./api";
  * - `ended`: the stream finished normally;
  * - `disconnected`: the connection was lost (an error event, or the daemon unreachable);
  *   the view offers "Disconnected — Resume";
- * - `busy`: too many live views are open (the daemon allows 4);
+ * - `busy`: too many live views are open (the daemon allows 4), whether refused at the
+ *   start or by the stream's first event;
  * - `failed`: it could not start for another reason.
  */
 export type LiveState =
@@ -41,7 +42,10 @@ export function openLive(
   start((error) => {
     if (closed) return;
     finished = true;
-    onState(error ? { kind: "disconnected", error } : { kind: "ended" });
+    // The daemon refuses a fifth live view after the id is returned, so `busy` usually
+    // arrives here, as the stream's error, rather than as a rejected start.
+    if (error?.code === "busy") onState({ kind: "busy", error });
+    else onState(error ? { kind: "disconnected", error } : { kind: "ended" });
   }).then(
     (h) => {
       if (closed) {
@@ -68,4 +72,23 @@ export function openLive(
       if (handle && !finished) cancel(handle);
     },
   };
+}
+
+type VisibilityDoc = Pick<Document, "visibilityState" | "addEventListener" | "removeEventListener">;
+
+/**
+ * Calls `hidden` when the page is hidden (the window minimised, the phone app
+ * backgrounded) and `visible` when it is shown again. Returns the function that stops
+ * listening. Live views use it to end their stream while nobody can see it.
+ */
+export function onVisibilityChange(
+  handlers: { hidden: () => void; visible: () => void },
+  doc: VisibilityDoc = document,
+): () => void {
+  const listener = () => {
+    if (doc.visibilityState === "hidden") handlers.hidden();
+    else handlers.visible();
+  };
+  doc.addEventListener("visibilitychange", listener);
+  return () => doc.removeEventListener("visibilitychange", listener);
 }

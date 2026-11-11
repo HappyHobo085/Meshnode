@@ -4,7 +4,7 @@
   import Button from "../lib/design/Button.svelte";
   import Chip from "../lib/design/Chip.svelte";
   import Icon from "../lib/design/Icon.svelte";
-  import { openLive, type Live, type LiveState } from "../lib/live";
+  import { onVisibilityChange, openLive, type Live, type LiveState } from "../lib/live";
   import {
     LEVELS,
     LOG_CAPACITY,
@@ -219,9 +219,30 @@
     connect();
   }
 
+  /** Set while the page is hidden and its follow was ended for that reason. */
+  let suspended = false;
+
   onMount(() => {
     connect();
+    // Hidden (window minimised, phone backgrounded): end the follow and its admin
+    // connection; shown again: reconnect as Resume does, the lines kept until the replayed
+    // history arrives.
+    const stopWatching = onVisibilityChange({
+      hidden() {
+        if (stream.kind !== "connecting" && stream.kind !== "live") return;
+        live?.close();
+        live = null;
+        suspended = true;
+        stream = { kind: "idle" };
+      },
+      visible() {
+        if (!suspended) return;
+        suspended = false;
+        connect();
+      },
+    });
     return () => {
+      stopWatching();
       live?.close();
       live = null;
     };

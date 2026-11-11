@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { flushSync, tick } from "svelte";
 import { get } from "svelte/store";
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { OnEnd, ProbeSampleDto } from "../lib/api";
 import { member, running } from "./fixtures";
 
@@ -69,6 +69,18 @@ beforeEach(() => {
   members.set([DESK, PIXEL]);
   toasts.set([]);
   theme.set("system");
+});
+
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+afterEach(() => {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => "visible",
+  });
 });
 
 async function mount() {
@@ -221,6 +233,15 @@ it("probe_too_many_live_views_shows_inline", async () => {
   expect(screen.getByRole("alert")).toHaveTextContent("Too many live views open");
 });
 
+it("probe_busy_stream_error_shows_inline", async () => {
+  await mount();
+  await startProbe();
+  probeEnd({ code: "busy", message: "Too many live views open", hint: null, reason: null });
+  flushSync();
+  expect(screen.getByRole("alert")).toHaveTextContent("Too many live views open");
+  expect(screen.queryByText("Disconnected")).toBeNull();
+});
+
 it("probe_lost_connection_offers_resume", async () => {
   await mount();
   await startProbe();
@@ -231,6 +252,38 @@ it("probe_lost_connection_offers_resume", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Resume" }));
   await tick();
   expect(api.probe).toHaveBeenCalledTimes(2);
+});
+
+it("probe_stops_while_hidden_and_says_so", async () => {
+  await mount();
+  await startProbe();
+  sample({ seq: 1, ms: 12, connectMs: null, error: null });
+  setVisibility("hidden");
+  expect(cancel).toHaveBeenCalledTimes(1);
+  setVisibility("visible");
+  await tick();
+  flushSync();
+  // Not restarted on its own (a new run would start the 20 samples over): it says it paused.
+  expect(api.probe).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("status")).toHaveTextContent("Paused");
+  expect(screen.getByRole("status")).toHaveTextContent("in the background");
+  // The sample taken before hiding is still shown.
+  expect(screen.getByRole("img", { name: /Latency to Pixel: 1 answered/ })).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+  await tick();
+  expect(api.probe).toHaveBeenCalledTimes(2);
+});
+
+it("probe_hidden_when_not_running_changes_nothing", async () => {
+  await mount();
+  await startProbe();
+  probeEnd(null);
+  flushSync();
+  setVisibility("hidden");
+  setVisibility("visible");
+  flushSync();
+  expect(cancel).not.toHaveBeenCalled();
+  expect(screen.queryByText("Paused")).toBeNull();
 });
 
 it("power_policy_android_only", async () => {

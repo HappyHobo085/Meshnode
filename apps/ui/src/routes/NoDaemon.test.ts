@@ -109,7 +109,7 @@ it("no_daemon_run_that_never_answers_points_at_the_log", async () => {
 it("no_daemon_without_meshd_offers_locate", async () => {
   api.desktop.locateMeshd.mockResolvedValueOnce(null);
   // The dialog is opened (and its choice checked and saved) in Rust: the page never names a path.
-  api.desktop.locateMeshdDialog.mockResolvedValue("D:\tools\meshd.exe");
+  api.desktop.locateMeshdDialog.mockResolvedValue(String.raw`D:\tools\meshd.exe`);
   await mount();
   expect(screen.getByText(/meshd wasn't found/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Run without installing" })).toBeDisabled();
@@ -126,7 +126,7 @@ it("no_daemon_locate_refuses_other_files", async () => {
   api.desktop.locateMeshd.mockResolvedValue(null);
   api.desktop.locateMeshdDialog.mockRejectedValue({
     code: "invalidArgument",
-    message: "D:\tools\setup.exe isn't meshd",
+    message: String.raw`D:\tools\setup.exe isn't meshd`,
     hint: "Choose the Meshnode daemon, the file named meshd.exe.",
     reason: null,
   });

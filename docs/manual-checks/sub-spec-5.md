@@ -93,7 +93,7 @@ The default is off (`[android] periodic_wake_s = 0` in `meshd.toml`). If in step
 | Reconnects overnight | |
 | Battery (mAh, hours unplugged) | |
 | `periodic_wake_s` default decided | |
-| Release APK size (stripped, unsigned, `app-universal-release-unsigned.apk`, arm64) | 35,482,467 bytes (33.8 MiB; measured 2026-11-11 with `apps/android/build-apk.sh --release`; `libmeshnode_app.so` inside is 32.5 MB) |
+| Release APK size (stripped, unsigned, `app-universal-release-unsigned.apk`, arm64) | 35,678,515 bytes (34.0 MiB; measured 2026-11-11 with `apps/android/build-apk.sh --release`, with the R8 keep rules for JNA and the UniFFI bindings; `libmeshnode_app.so` inside is 32.6 MB) |
 | Debug APK size (unstripped, arm64) | 802 MiB (measured in Task 8) |
 
 ## Carried owner gates from sub-specs 2 to 4

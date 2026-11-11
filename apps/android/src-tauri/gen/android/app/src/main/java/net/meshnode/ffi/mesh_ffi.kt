@@ -1154,7 +1154,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mesh_ffi_checksum_func_status() != 45279.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_mesh_ffi_checksum_func_stop() != 35408.toShort()) {
+    if (lib.uniffi_mesh_ffi_checksum_func_stop() != 44067.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_ffi_checksum_func_wake() != 48024.toShort()) {
@@ -2745,6 +2745,12 @@ public object FfiConverterTypeFfiState: FfiConverterRustBuffer<FfiState> {
 
 
 
+/**
+ * Why [`wake`] is called. Informational: it is logged, and `Alarm` also takes the
+ * `"alarm"` wake lock; the catch-up is the same for every reason. `Boot` and `Incoming`
+ * are reserved: the app sends only `Alarm` and `Network` (a start after boot dials anyway,
+ * and mesh-core catches up on incoming traffic by itself).
+ */
 
 enum class FfiWakeReason {
     
@@ -3046,8 +3052,9 @@ public object FfiConverterSequenceTypeFfiFile: FfiConverterRustBuffer<List<FfiFi
     
 
         /**
-         * Shuts the daemon down (within 20 s) and releases the data directory. No-op if
-         * stopped.
+         * Shuts the daemon down and releases the data directory. No-op if stopped. It first
+         * waits for in-flight [`wake`] calls to end (each returns within about 10 s), then runs
+         * the daemon's shutdown (within 20 s): about 30 s in the worst case.
          */
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `stop`() {

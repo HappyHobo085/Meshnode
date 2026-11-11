@@ -4,8 +4,18 @@
 //!
 //! Rows: `ns \0 key` -> `expiry_ms` (u64 big-endian, 0 = none) `++ value`. An entry is
 //! live while `expiry_ms == 0 || now < expiry_ms`; expired entries are invisible on read
-//! and deleted by [`Store::local_sweep`]. `svc_local_count` holds the number of rows per
-//! namespace (live or not yet swept), so the key cap costs no scan until it is reached.
+//! and deleted by [`Store::local_sweep`].
+//!
+//! `svc_local_count`: `ns` -> `count ++ due` (two u64 big-endian). `count` is the number of
+//! rows of `ns` (live or not yet swept). `due` is 0 when no row of `ns` can expire, else a
+//! lower bound on the earliest expiry among its rows: nothing in `ns` has expired before
+//! `due`. So a new key at the cap is refused in O(1) unless `now >= due`, and only then is
+//! the namespace scanned (which frees a slot or makes `due` exact again).
+//!
+//! "Now" is read from the store's wall clock directly, never through the HLC mutex, so
+//! local reads do not wait behind replicated commits.
+
+use std::collections::BTreeMap;
 
 use crate::error::StoreError;
 use crate::tables::{SVC_LOCAL, SVC_LOCAL_COUNT};
@@ -77,26 +87,70 @@ fn live(expiry_ms: u64, now_ms: u64) -> bool {
     expiry_ms == 0 || now_ms < expiry_ms
 }
 
-fn count_of(c: &T<'_>, ns: &[u8]) -> Result<u64, StoreError> {
-    match c.get(ns)? {
-        Some(g) => keys::read_u64_value("svc_local_count", g.value()),
-        None => Ok(0),
+/// The earlier of two expiries, where 0 means "none".
+fn earliest(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
     }
 }
 
-fn set_count(c: &mut T<'_>, ns: &[u8], n: u64) -> Result<(), StoreError> {
-    if n == 0 {
+/// A `svc_local_count` row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NsMeta {
+    count: u64,
+    /// 0: no row can expire; else no row expires before this.
+    due: u64,
+}
+
+fn meta_of(
+    c: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    ns: &[u8],
+) -> Result<NsMeta, StoreError> {
+    let Some(g) = c.get(ns)? else {
+        return Ok(NsMeta::default());
+    };
+    let v = g.value();
+    if v.len() != 16 {
+        return Err(StoreError::corrupt(
+            "svc_local_count",
+            format!("row of {} bytes, expected 16", v.len()),
+        ));
+    }
+    Ok(NsMeta {
+        count: keys::read_u64_value("svc_local_count", &v[..8])?,
+        due: keys::read_u64_value("svc_local_count", &v[8..])?,
+    })
+}
+
+fn set_meta(c: &mut T<'_>, ns: &[u8], m: NsMeta) -> Result<(), StoreError> {
+    if m.count == 0 {
         c.remove(ns)?;
     } else {
-        c.insert(ns, keys::u64_value(n).as_slice())?;
+        let mut v = [0u8; 16];
+        v[..8].copy_from_slice(&keys::u64_value(m.count));
+        v[8..].copy_from_slice(&keys::u64_value(m.due));
+        c.insert(ns, v.as_slice())?;
     }
     Ok(())
 }
 
-/// Deletes the expired rows of `ns` (all rows when `ns` is `None`) and fixes the counts.
-/// Returns how many were deleted.
-fn sweep(t: &mut T<'_>, c: &mut T<'_>, ns: Option<&str>, now_ms: u64) -> Result<usize, StoreError> {
+/// What a [`sweep`] did.
+struct Swept {
+    removed: usize,
+    /// Rows read.
+    visited: u64,
+    /// Whether any row or count row changed (worth a commit).
+    changed: bool,
+}
+
+/// Deletes the expired rows of `ns` (of every namespace when `ns` is `None`), and sets
+/// each scanned namespace's count and an exact `due` (the earliest surviving expiry).
+fn sweep(t: &mut T<'_>, c: &mut T<'_>, ns: Option<&str>, now_ms: u64) -> Result<Swept, StoreError> {
     let mut doomed = Vec::new();
+    // Per namespace: (rows removed, earliest surviving expiry).
+    let mut seen: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+    let mut visited = 0;
     {
         let iter = match ns {
             Some(ns) => {
@@ -107,28 +161,60 @@ fn sweep(t: &mut T<'_>, c: &mut T<'_>, ns: Option<&str>, now_ms: u64) -> Result<
         };
         for item in iter {
             let (k, v) = item?;
+            visited += 1;
             let (expiry, _) = split_row(v.value())?;
-            if !live(expiry, now_ms) {
+            let entry = seen.entry(ns_of(k.value())?.to_vec()).or_default();
+            if live(expiry, now_ms) {
+                entry.1 = earliest(entry.1, expiry);
+            } else {
+                entry.0 += 1;
                 doomed.push(k.value().to_vec());
             }
         }
     }
-    let mut per_ns: std::collections::BTreeMap<Vec<u8>, u64> = Default::default();
     for k in &doomed {
         t.remove(k.as_slice())?;
-        *per_ns.entry(ns_of(k)?.to_vec()).or_default() += 1;
     }
-    for (ns, removed) in per_ns {
-        let n = count_of(c, &ns)?.saturating_sub(removed);
-        set_count(c, &ns, n)?;
+    let mut changed = !doomed.is_empty();
+    for (ns, (removed, due)) in seen {
+        let old = meta_of(c, &ns)?;
+        let new = NsMeta {
+            count: old.count.saturating_sub(removed),
+            due,
+        };
+        if new != old {
+            set_meta(c, &ns, new)?;
+            changed = true;
+        }
     }
-    Ok(doomed.len())
+    Ok(Swept {
+        removed: doomed.len(),
+        visited,
+        changed,
+    })
 }
 
 impl<W: WallClock> Store<W> {
-    /// The store's wall clock, the clock local expiries are measured with.
+    /// The store's wall clock, the clock local expiries are measured with (read without
+    /// the HLC mutex).
     fn local_now_ms(&self) -> u64 {
-        self.lock_clock().wall().now_ms()
+        self.wall.now_ms()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn note_scanned(&self, rows: u64) {
+        self.local_scanned
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    fn note_scanned(&self, _rows: u64) {}
+
+    /// Rows the local sweeps of this store have read so far (test-hooks only).
+    #[cfg(feature = "test-hooks")]
+    pub fn local_rows_scanned(&self) -> u64 {
+        self.local_scanned
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The live value of `ns/key`, if any.
@@ -150,7 +236,8 @@ impl<W: WallClock> Store<W> {
     /// Sets `ns/key` to `value`, expiring `ttl_ms` from now (0 = never); an overwrite
     /// replaces the expiry. The inner `Err` is a cap breach (key over [`LOCAL_MAX_KEY`]
     /// bytes, value over [`LOCAL_MAX_VALUE`] bytes, or a new key when `ns` already holds
-    /// [`LOCAL_MAX_KEYS`] live keys); nothing is written then.
+    /// [`LOCAL_MAX_KEYS`] live keys); the entry is not written then. A refusal costs no
+    /// scan unless some entry of `ns` may have expired.
     pub fn local_set(
         &self,
         ns: &str,
@@ -182,32 +269,46 @@ impl<W: WallClock> Store<W> {
         let k = row_key(ns, key);
 
         let tx = self.db.begin_write()?;
-        {
+        let refused = {
             let mut t = tx.open_table(SVC_LOCAL)?;
             let mut c = tx.open_table(SVC_LOCAL_COUNT)?;
-            if t.get(k.as_slice())?.is_none() {
-                let mut n = count_of(&c, ns.as_bytes())?;
-                if n >= LOCAL_MAX_KEYS {
-                    // Expired rows do not count: drop them before refusing.
-                    sweep(&mut t, &mut c, Some(ns), now)?;
-                    n = count_of(&c, ns.as_bytes())?;
-                }
-                if n >= LOCAL_MAX_KEYS {
-                    drop((t, c));
-                    tx.abort()?;
-                    return Ok(Err(format!(
-                        "namespace holds {LOCAL_MAX_KEYS} live keys, the most allowed"
-                    )));
-                }
-                set_count(&mut c, ns.as_bytes(), n + 1)?;
+            let mut m = meta_of(&c, ns.as_bytes())?;
+            let is_new = t.get(k.as_slice())?.is_none();
+            let mut swept = false;
+            if is_new && m.count >= LOCAL_MAX_KEYS && m.due != 0 && now >= m.due {
+                // Something may have expired: expired rows do not count, so drop them.
+                let s = sweep(&mut t, &mut c, Some(ns), now)?;
+                self.note_scanned(s.visited);
+                swept = s.changed;
+                m = meta_of(&c, ns.as_bytes())?;
             }
-            t.insert(k.as_slice(), row.as_slice())?;
+            if is_new && m.count >= LOCAL_MAX_KEYS {
+                Some(swept)
+            } else {
+                if is_new {
+                    m.count += 1;
+                }
+                m.due = earliest(m.due, expiry);
+                set_meta(&mut c, ns.as_bytes(), m)?;
+                t.insert(k.as_slice(), row.as_slice())?;
+                None
+            }
+        };
+        match refused {
+            None => tx.commit()?,
+            // Keep what a sweep did (an exact `due`), so the next refusal is O(1) again.
+            Some(true) => tx.commit()?,
+            Some(false) => tx.abort()?,
         }
-        tx.commit()?;
+        if refused.is_some() {
+            return Ok(Err(format!(
+                "namespace holds {LOCAL_MAX_KEYS} live keys, the most allowed"
+            )));
+        }
         Ok(Ok(()))
     }
 
-    /// Deletes `ns/key` (a no-op if absent).
+    /// Deletes `ns/key` (a no-op if absent). `due` stays a valid lower bound.
     pub fn local_delete(&self, ns: &str, key: &str) -> Result<(), StoreError> {
         check_ns(ns)?;
         if key.len() > LOCAL_MAX_KEY {
@@ -219,8 +320,9 @@ impl<W: WallClock> Store<W> {
             let removed = t.remove(row_key(ns, key).as_slice())?.is_some();
             if removed {
                 let mut c = tx.open_table(SVC_LOCAL_COUNT)?;
-                let n = count_of(&c, ns.as_bytes())?.saturating_sub(1);
-                set_count(&mut c, ns.as_bytes(), n)?;
+                let mut m = meta_of(&c, ns.as_bytes())?;
+                m.count = m.count.saturating_sub(1);
+                set_meta(&mut c, ns.as_bytes(), m)?;
             }
             removed
         };
@@ -235,36 +337,40 @@ impl<W: WallClock> Store<W> {
     /// Deletes every entry expired at `now_ms`, in all namespaces. Returns how many.
     pub fn local_sweep(&self, now_ms: u64) -> Result<usize, StoreError> {
         let tx = self.db.begin_write()?;
-        let removed = {
+        let s = {
             let mut t = tx.open_table(SVC_LOCAL)?;
             let mut c = tx.open_table(SVC_LOCAL_COUNT)?;
             sweep(&mut t, &mut c, None, now_ms)?
         };
-        if removed > 0 {
+        self.note_scanned(s.visited);
+        if s.changed {
             tx.commit()?;
         } else {
             tx.abort()?;
         }
-        Ok(removed)
+        Ok(s.removed)
     }
 
-    /// Deletes every entry of `ns`, live or not (for a purged data generation). Returns
-    /// how many.
+    /// Deletes every entry of `ns`, live or not (for a purged data generation), and its
+    /// count row. Returns how many entries.
     pub fn local_drop_namespace(&self, ns: &str) -> Result<usize, StoreError> {
         check_ns(ns)?;
         let (lo, hi) = ns_range(ns);
         let tx = self.db.begin_write()?;
-        let removed = {
+        let (removed, had_meta) = {
             let mut t = tx.open_table(SVC_LOCAL)?;
             let mut removed = 0;
             for item in t.extract_from_if(lo.as_slice()..hi.as_slice(), |_, _| true)? {
                 item?;
                 removed += 1;
             }
-            tx.open_table(SVC_LOCAL_COUNT)?.remove(ns.as_bytes())?;
-            removed
+            let had_meta = tx
+                .open_table(SVC_LOCAL_COUNT)?
+                .remove(ns.as_bytes())?
+                .is_some();
+            (removed, had_meta)
         };
-        if removed > 0 {
+        if removed > 0 || had_meta {
             tx.commit()?;
         } else {
             tx.abort()?;
@@ -308,10 +414,7 @@ impl<W: WallClock> Store<W> {
         check_ns(ns)?;
         let tx = self.db.begin_read()?;
         let c = tx.open_table(SVC_LOCAL_COUNT)?;
-        match c.get(ns.as_bytes())? {
-            Some(g) => keys::read_u64_value("svc_local_count", g.value()),
-            None => Ok(0),
-        }
+        Ok(meta_of(&c, ns.as_bytes())?.count)
     }
 
     /// Inserts `n` entries `<prefix><i>` (value `[1]`, absolute `expiry_ms`) in one
@@ -331,15 +434,15 @@ impl<W: WallClock> Store<W> {
             let mut c = tx.open_table(SVC_LOCAL_COUNT)?;
             let mut row = keys::u64_value(expiry_ms).to_vec();
             row.push(1);
-            let mut added = 0;
+            let mut m = meta_of(&c, ns.as_bytes())?;
             for i in 0..n {
                 let k = row_key(ns, &format!("{prefix}{i:06}"));
                 if t.insert(k.as_slice(), row.as_slice())?.is_none() {
-                    added += 1;
+                    m.count += 1;
                 }
             }
-            let total = count_of(&c, ns.as_bytes())? + added;
-            set_count(&mut c, ns.as_bytes(), total)?;
+            m.due = earliest(m.due, expiry_ms);
+            set_meta(&mut c, ns.as_bytes(), m)?;
         }
         tx.commit()?;
         Ok(())

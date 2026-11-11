@@ -199,7 +199,12 @@ async fn sweep_local(shared: &Shared) -> Result<(), ServicesError> {
                 g
             }
         };
-        if generation < cur {
+        // A purge replicated from another node may not have reached this node's running
+        // instance yet: never drop the namespace it still serves (a later pass will).
+        let in_use = shared
+            .active(name)
+            .is_some_and(|a| a.generation == generation);
+        if generation < cur && !in_use {
             purged += store.local_drop_namespace(&ns).await?;
         }
     }

@@ -72,8 +72,10 @@ mod mem {
         inner: Mutex<Inner>,
     }
 
-    /// The largest `local` value, as the node's store allows.
+    /// The largest `local` value and key, as the node's store allows. (The 100 000-key cap
+    /// is not modelled.)
     const LOCAL_MAX_VALUE: usize = 64 * 1024;
+    const LOCAL_MAX_KEY: usize = 512;
 
     #[derive(Default)]
     struct Inner {
@@ -254,6 +256,12 @@ mod mem {
             ttl_ms: u64,
         ) -> Result<Result<(), String>, KvError> {
             self.check()?;
+            if key.len() > LOCAL_MAX_KEY {
+                return Ok(Err(format!(
+                    "key of {} bytes exceeds {LOCAL_MAX_KEY}",
+                    key.len()
+                )));
+            }
             if value.len() > LOCAL_MAX_VALUE {
                 return Ok(Err(format!(
                     "value of {} bytes exceeds {LOCAL_MAX_VALUE}",

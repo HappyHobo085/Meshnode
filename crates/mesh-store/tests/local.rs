@@ -171,3 +171,67 @@ fn local_survives_reopen_and_reset() {
     assert!(s.set("svc", "r", b"y").is_err());
     s.local_set("svc", "m", b"2", 0).unwrap().unwrap();
 }
+
+#[test]
+fn local_cap_refusal_does_not_scan() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.local_fill_for_test("svc", "f", LOCAL_MAX_KEYS - 1, 0)
+        .unwrap();
+    // The namespace is full; its earliest expiry is T0 + 5 s.
+    s.local_set("svc", "t", b"v", 5_000).unwrap().unwrap();
+    let before = s.local_rows_scanned();
+    for i in 0..50 {
+        assert!(
+            s.local_set("svc", &format!("n{i}"), b"v", 0)
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(
+        s.local_rows_scanned(),
+        before,
+        "nothing can have expired yet: refusals read no rows"
+    );
+
+    // Once the earliest expiry passes, one scan frees its slot.
+    clock.advance(5_000);
+    s.local_set("svc", "n", b"v", 0).unwrap().unwrap();
+    let after = s.local_rows_scanned();
+    assert!(after > before);
+    // Full again with nothing that can expire: refusals stay O(1).
+    for i in 0..50 {
+        assert!(
+            s.local_set("svc", &format!("m{i}"), b"v", 0)
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(s.local_rows_scanned(), after);
+}
+
+#[test]
+fn local_cap_stale_due_costs_one_scan() {
+    let (dir, clock) = setup();
+    let s = store(dir.path(), 1, &clock);
+    s.local_fill_for_test("svc", "f", LOCAL_MAX_KEYS - 1, 0)
+        .unwrap();
+    // An expiring key that is deleted leaves a stale (early) sweep-due time behind.
+    s.local_set("svc", "gone", b"v", 1_000).unwrap().unwrap();
+    s.local_delete("svc", "gone").unwrap();
+    s.local_set("svc", "last", b"v", 0).unwrap().unwrap();
+    clock.advance(1_000);
+    let before = s.local_rows_scanned();
+    assert!(s.local_set("svc", "x", b"v", 0).unwrap().is_err());
+    let once = s.local_rows_scanned();
+    assert!(once > before, "the stale bound triggers one scan");
+    // That scan made the bound exact (and was kept despite the refusal): no more scans.
+    for i in 0..20 {
+        assert!(
+            s.local_set("svc", &format!("y{i}"), b"v", 0)
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(s.local_rows_scanned(), once);
+}

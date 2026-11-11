@@ -1,12 +1,13 @@
 //! The request/response commands, shared by the desktop and Android shells.
 
-use mesh_admin::{AdminRequest, AdminResponse};
+use mesh_admin::{AdminRequest, AdminResponse, MAX_UPLOAD_FILE};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use ts_rs::TS;
 
 use crate::dto::*;
 use crate::error::{UiError, UiErrorCode};
+use crate::source::FileSource;
 use crate::streams::Streams;
 use crate::transport::TransportFn;
 
@@ -160,6 +161,47 @@ impl Ui {
         {
             AdminResponse::Manifest(_) | AdminResponse::Ok => {}
             other => return Err(unexpected("deploy_wasm", other)),
+        }
+        self.service_named(&name).await
+    }
+
+    /// Deploys the file at `path` as a wasm service (at most 64 MiB).
+    pub async fn deploy_wasm_file(
+        &self,
+        name: String,
+        path: std::path::PathBuf,
+        opts: DeployOptsDto,
+    ) -> Result<ServiceDto, UiError> {
+        let io =
+            |e: std::io::Error| UiError::new(UiErrorCode::Io, format!("{}: {e}", path.display()));
+        let len = std::fs::metadata(&path).map_err(io)?.len();
+        if len > MAX_UPLOAD_FILE {
+            return Err(UiError::invalid(format!(
+                "{} is larger than 64 MiB",
+                path.display()
+            )));
+        }
+        let wasm = std::fs::read(&path).map_err(io)?;
+        self.deploy_wasm(name, wasm, opts).await
+    }
+
+    /// Deploys a static site from `src`, sending cumulative bytes read to `progress`.
+    pub async fn deploy_static(
+        &self,
+        name: String,
+        opts: DeployOptsDto,
+        src: Box<dyn FileSource>,
+        progress: mpsc::Sender<u64>,
+    ) -> Result<ServiceDto, UiError> {
+        let opts = opts.into_opts()?;
+        let transport = (self.transport)();
+        match transport
+            .deploy_static(name.clone(), opts, src, progress)
+            .await?
+        {
+            AdminResponse::Error { code, message } => return Err((code, message).into()),
+            AdminResponse::Manifest(_) | AdminResponse::Ok => {}
+            other => return Err(unexpected("deploy_static", other)),
         }
         self.service_named(&name).await
     }

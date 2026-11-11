@@ -1254,3 +1254,41 @@ async fn in_process_logs_tail_streams_then_ends() {
         "{all:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deploy_static_from_reader_matches_disk() {
+    let d = daemon().await;
+    let src = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let files = write_tree(
+        src.path(),
+        &[
+            ("index.html", b"<h1>hi</h1>".to_vec()),
+            ("assets/app.bin", big),
+        ],
+    );
+    let mut c = d.client().await;
+    let r = c
+        .deploy_static("disk".into(), DeployOpts::default(), files.clone())
+        .await
+        .unwrap();
+    assert_eq!(r, AdminResponse::Ok);
+    let metas: Vec<FileMeta> = files.iter().map(|(m, _)| m.clone()).collect();
+    let by_path: std::collections::HashMap<String, PathBuf> = files
+        .iter()
+        .map(|(m, p)| (m.path.clone(), p.clone()))
+        .collect();
+    let r = c
+        .deploy_static_from("reader".into(), DeployOpts::default(), metas, |m| {
+            std::fs::read(&by_path[&m.path])
+        })
+        .await
+        .unwrap();
+    assert_eq!(r, AdminResponse::Ok);
+    {
+        let uploads = d.fake.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].1, uploads[1].1, "same metas and bytes");
+    }
+    d.stop().await;
+}

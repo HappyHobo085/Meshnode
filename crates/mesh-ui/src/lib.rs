@@ -6,6 +6,7 @@ pub mod dto;
 pub mod error;
 pub mod pipe;
 pub mod qr;
+pub mod source;
 pub mod streams;
 pub mod transport;
 
@@ -14,5 +15,6 @@ pub use dto::*;
 pub use error::{JoinRefusalDto, UiError, UiErrorCode, hint_for};
 pub use pipe::PipeTransport;
 pub use qr::qr_svg;
+pub use source::{DirSource, FileSource};
 pub use streams::{StreamGuard, Streams};
 pub use transport::{AdminTransport, InProcessTransport, NoNode, TransportFn};

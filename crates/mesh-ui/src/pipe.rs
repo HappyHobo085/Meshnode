@@ -2,11 +2,12 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use mesh_admin::{AdminClient, AdminError, AdminRequest, AdminResponse, Endpoint};
+use mesh_admin::{AdminClient, AdminError, AdminRequest, AdminResponse, DeployOpts, Endpoint};
 use tokio::sync::mpsc;
 
 use crate::error::{UiError, UiErrorCode};
-use crate::transport::AdminTransport;
+use crate::source::FileSource;
+use crate::transport::{AdminTransport, report};
 
 pub struct PipeTransport {
     endpoint: Endpoint,
@@ -89,5 +90,34 @@ impl AdminTransport for PipeTransport {
         // Dropping an unfinished stream leaves the connection unusable: drop it too.
         drop(client);
         result
+    }
+
+    async fn deploy_static(
+        &self,
+        name: String,
+        opts: DeployOpts,
+        mut src: Box<dyn FileSource>,
+        progress: mpsc::Sender<u64>,
+    ) -> Result<AdminResponse, UiError> {
+        let metas = src.list()?;
+        let total: u64 = metas.iter().map(|m| m.size).sum();
+        let mut client = self.connect().await?;
+        let mut done = 0u64;
+        let resp = client
+            .deploy_static_from(name, opts, metas, |m| {
+                let bytes = src
+                    .read(&m.path)
+                    .map_err(|e| std::io::Error::other(e.message))?;
+                done += bytes.len() as u64;
+                report(&progress, done);
+                Ok(bytes)
+            })
+            .await
+            .map_err(map_error)?;
+        // The last value always arrives, even if the channel was full above.
+        if done == total {
+            let _ = progress.send(total).await;
+        }
+        Ok(resp)
     }
 }

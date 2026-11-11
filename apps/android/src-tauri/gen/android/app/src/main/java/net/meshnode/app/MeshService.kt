@@ -39,7 +39,6 @@ import net.meshnode.ffi.FfiServiceControl
 import net.meshnode.ffi.FfiState
 import net.meshnode.ffi.FfiStatus
 import net.meshnode.ffi.FfiWakeReason
-import net.meshnode.ffi.networkChanged
 import net.meshnode.ffi.setPowerState
 import net.meshnode.ffi.setServiceControl
 import net.meshnode.ffi.setWakeLockSink
@@ -190,8 +189,10 @@ class MeshService : Service() {
       unregisterReceiver(powerReceiver)
       powerReceiverRegistered = false
     }
-    // No wake lock outlives the service, and no node runs without it.
-    WakeLocks.get(this).releaseAll()
+    // No node runs without the service. stop() first, so Rust releases its locks itself
+    // (Power::close) and does not record them as held after Kotlin let them go; then
+    // releaseAll() as the backstop: no wake lock outlives the service.
+    val locks = WakeLocks.get(this)
     if (!stopRan) {
       stopRan = true
       scope.launch {
@@ -201,8 +202,12 @@ class MeshService : Service() {
           throw e
         } catch (t: Throwable) {
           Log.e(TAG, "stop on destroy failed", t)
+        } finally {
+          locks.releaseAll()
         }
       }
+    } else {
+      locks.releaseAll()
     }
     super.onDestroy()
   }
@@ -450,7 +455,7 @@ class MeshService : Service() {
         // Not cancelled by a later callback once started.
         scope.launch {
           try {
-            networkChanged()
+            // Node::wake rebinds iroh itself (network_change), so no networkChanged() here.
             wake(FfiWakeReason.NETWORK)
           } catch (e: CancellationException) {
             throw e

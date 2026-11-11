@@ -18,7 +18,7 @@ class AlarmReceiver : BroadcastReceiver() {
     Alarms.scheduleTick(app)
     val pending = goAsync()
     val lock = app.getSystemService(PowerManager::class.java)
-      .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "meshnode:alarm")
+      .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "meshnode:alarm-receiver")
       .apply {
         setReferenceCounted(false)
         acquire(WAKE_LOCK_MS)

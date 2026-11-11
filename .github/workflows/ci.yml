@@ -96,6 +96,13 @@ jobs:
       # Release (stripped, thin LTO) arm64 APK; unsigned (release signing is sub-spec 8).
       - name: Build the release APK
         run: apps/android/build-apk.sh --release
+      # JNA and the UniFFI bindings are looked up by name: R8 must not rename them
+      # (keep rules in app/proguard-rules.pro).
+      - name: R8 keeps JNA and the bindings
+        run: |
+          m=apps/android/src-tauri/gen/android/app/build/outputs/mapping/universalRelease/mapping.txt
+          grep -q '^net\.meshnode\.ffi\.UniffiLib -> net\.meshnode\.ffi\.UniffiLib:' "$m"
+          grep -q '^com\.sun\.jna\.Structure -> com\.sun\.jna\.Structure:' "$m"
       - name: JVM unit tests and lint
         working-directory: apps/android/src-tauri/gen/android
         run: ./gradlew testUniversalDebugUnitTest lintUniversalDebug

@@ -46,7 +46,7 @@ Defaults reproduce desktop behaviour exactly.
 | Field | Desktop default | Android | Meaning |
 |---|---|---|---|
 | `periodic` | `Timers` | `Driven` | `Driven`: periodic catch-up and address refresh also run on `Daemon::wake()` and on incoming traffic after ≥ 60 s of silence (§5.2). Tokio timers keep running in both modes. |
-| `wasm_reservation` | `Default` | `Small` | Smaller wasmtime static memory reservation / guard (sub-spec 3 carry-over I5); exact values chosen in the plan from `mesh-runtime`'s existing knobs. |
+| ~~`wasm_reservation`~~ | — | — | Not a field: replaced by `RuntimeConfig::compact_memory` (on for Android, `cfg!(target_os = "android")`), which gives the smaller wasmtime static memory reservation / guard (sub-spec 3 carry-over I5). *(as implemented)* |
 | `power` | `None` | `Some(PowerHooks)` | Wake-lock callbacks and screen/charging state (§5.3). |
 
 ## 3. `mesh-ffi` surface (UniFFI; async → Kotlin `suspend`)
@@ -63,7 +63,7 @@ Defaults reproduce desktop behaviour exactly.
 | `set_power_policy(policy)` | Changes the policy of the running node and saves it to `meshd.toml`; `NotRunning` while stopped. |
 | `set_wake_lock_sink(sink)` | Kotlin callback interface `{ acquire(tag, max_ms), release(tag) }`. |
 | `admin(request: bytes) -> bytes` | postcard `AdminRequest` → `AdminResponse` over the in-process transport. |
-| `admin_upload(...)`, `admin_logs(...)` | Streaming variants for `DeployStatic` and `LogsTail` (callback interface for log lines). |
+| `admin_deploy_static(...)`, `admin_logs(...)` | Streaming variants for `DeployStatic` and `LogsTail` (callback interface for log lines). |
 
 Panics inside any export are caught (UniFFI → Kotlin exception), logged, and leave the node in a defined state
 (stopped if it panicked during `start`). Logging: `tracing` to `<data>/logs` (as on desktop) and to logcat via a

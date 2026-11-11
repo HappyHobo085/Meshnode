@@ -1,0 +1,21 @@
+[package]
+name = "mesh-ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mesh-admin = { path = "../mesh-admin" }
+mesh-proto = { path = "../mesh-proto" }
+async-trait.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ts-rs = { version = "12", features = ["serde-compat"] }
+
+[dev-dependencies]
+mesh-host = { path = "../mesh-host", features = ["test-hooks"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

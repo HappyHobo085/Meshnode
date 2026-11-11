@@ -35,3 +35,6 @@ wat.workspace = true
 # The contract vectors and their loader (the test-only `vectors` feature); the service's own
 # wasm build never enables it.
 aegis-sync-core = { path = "../../vendor/aegis-sync-core", features = ["vectors"] }
+# The 2.x line the vector keys are (`vector::device_key`), to sign tokens at other instants
+# than the vectors' fixed clock. Already in the lock file through the core.
+ed25519-dalek-v2 = { package = "ed25519-dalek", version = "2" }

@@ -7,11 +7,16 @@
 //! runs; this crate is the glue between it and the kv. Key layout: [`keys`].
 //!
 //! Request flow: parse → bound → `check_token` at the WASI wall clock → the route's admit rule
-//! → the nonce check-and-record in `kv/local` → the handler over kv.
+//! → the nonce check-and-record in `kv/local` (with the per-device nonce cap) → the handler
+//! over kv. Device facts and their rules: [`devices`]; server-wide soft caps: [`caps`];
+//! tombstone retention after a push: [`retention`].
 mod auth;
+mod caps;
+mod devices;
 mod http;
 mod keys;
 mod records;
+mod retention;
 mod store;
 
 wit_bindgen::generate!({

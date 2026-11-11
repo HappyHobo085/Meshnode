@@ -6,17 +6,18 @@ use aegis_sync_core::canon::{canonicalize_body, reject_client_poisoning_stamps};
 use aegis_sync_core::env::Entropy;
 use aegis_sync_core::order::{order_bytes, tie_ord};
 use aegis_sync_core::wire::{
-    MAX_CT_LEN, MAX_FIELD_LEN, MAX_RECORDS_PER_ACCOUNT, MAX_RECORDS_PER_REQUEST,
-    MAX_RESPONSE_RECORDS, WireRecord, hlc_key, hlc_well_formed, wire_bytes,
+    MAX_CT_LEN, MAX_FIELD_LEN, MAX_RECORDS_PER_REQUEST, MAX_RESPONSE_RECORDS, WireRecord, hlc_key,
+    hlc_well_formed, wire_bytes,
 };
 use serde::Deserialize;
 use serde_json::json;
 use wstd::http::{Body, HeaderValue, Response};
 
+use crate::caps::{self, MAX_RECORDS_PER_ACCOUNT, MAX_TOTAL_CT_BYTES, MAX_TOTAL_RECORDS};
 use crate::http::{Resp, json, query_pairs, status};
 use crate::keys;
 use crate::meshnode::kv::store as kv;
-use crate::{auth, store};
+use crate::{auth, retention, store};
 
 // ----------------------------------------------------------------------------- GET
 
@@ -296,7 +297,8 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
         // `ord` is the server's own ordering stamp, never the client's to set.
         r.ord = None;
     }
-    let records = reject_client_poisoning_stamps(records, auth::now_ms());
+    let now = auth::now_ms();
+    let records = reject_client_poisoning_stamps(records, now);
     // `canonicalize_body` needs the stored uuids only to keep a synthesized id (for a record
     // pushed with an empty uuid) off an existing one. The ord it may compute from them is
     // dropped below (the mesh serves `tie_ord` at read time), so each stands in as a default
@@ -337,15 +339,21 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
     // stored record on an equal `hlc`.
     let mut writes = Vec::new();
     let mut new_keys = 0usize;
+    // Ciphertext growth, as native counts it: over every incoming record (stale ones too),
+    // each record's growth only, so an update that keeps or shrinks its size never counts.
+    let mut growth: u64 = 0;
     for (uuid, mut rec) in incoming {
-        match store::stored_hlc(&keys::rec_key(acct, ns, &uuid)) {
-            Some(old) if hlc_key(&rec.hlc) <= hlc_key(&old) => continue,
+        let old = store::stored_meta(&keys::rec_key(acct, ns, &uuid));
+        let old_len = old.as_ref().map_or(0, |o| o.ct_len);
+        growth += rec.ct.len().saturating_sub(old_len) as u64;
+        match &old {
+            Some(o) if hlc_key(&rec.hlc) <= hlc_key(&o.hlc) => continue,
             Some(_) => {}
             None => new_keys += 1,
         }
         rec.uuid = uuid;
         rec.ord = None;
-        writes.push(rec);
+        writes.push((rec, old));
     }
     // Per-account cap over this node's view: refuse to GROW the account past it (updates to
     // existing records always pass). The mesh total may exceed it by what other nodes admit
@@ -356,8 +364,26 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
             return Err(507);
         }
     }
-    for rec in &writes {
-        store::put_record(acct, ns, rec);
+    // The server-wide caps (native order: records, then bytes), soft, over the per-node
+    // counters (`caps.rs`). Only growth is refused: a full server still takes edits and
+    // deletes that add no key and no bytes.
+    if new_keys > 0 || growth > 0 {
+        let totals = caps::totals();
+        if new_keys > 0 && !caps::fits(totals.records, new_keys as u64, MAX_TOTAL_RECORDS as u64) {
+            return Err(507);
+        }
+        if growth > 0 && !caps::fits(totals.ct_bytes, growth, MAX_TOTAL_CT_BYTES) {
+            return Err(507);
+        }
     }
+    let mut ct_delta: i64 = 0;
+    for (rec, old) in &writes {
+        ct_delta += rec.ct.len() as i64 - old.as_ref().map_or(0, |o| o.ct_len) as i64;
+        store::put_record(acct, ns, rec, old.as_ref());
+    }
+    // Retention after the merge, as native reaps after it: this push's own namespace.
+    let pruned = retention::prune(acct, ns, now);
+    caps::add(caps::RECORDS, new_keys as i64 - pruned.records);
+    caps::add(caps::CT_BYTES, ct_delta - pruned.ct_bytes);
     Ok(())
 }

@@ -5,11 +5,13 @@ use aegis_sync_core::wire::MAX_BODY_BYTES;
 use serde_json::Value;
 use wstd::http::{Body, Request, Response, StatusCode};
 
-use crate::records;
+use crate::meshnode::kv::local;
+use crate::{devices, keys, records};
 
 pub type Resp = Response<Body>;
 
 pub async fn serve(mut req: Request<Body>) -> Resp {
+    warn_open_registration();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     // A header that is not visible ASCII is as good as absent (native: `to_str().ok()`).
@@ -27,9 +29,50 @@ pub async fn serve(mut req: Request<Body>) -> Resp {
             Ok(body) => records::post(&body, authz.as_deref()),
             Err(code) => status(code),
         },
-        ("/healthz" | "/v1/records", _) => status(405),
+        ("/v1/devices", "GET") => devices::get(authz.as_deref()),
+        ("/v1/devices", "POST") => match read_body(&mut req).await {
+            Ok(body) => devices::post(&body, authz.as_deref()),
+            Err(code) => status(code),
+        },
+        ("/v1/devices/remove", "POST") => match read_body(&mut req).await {
+            Ok(body) => devices::remove(&body, authz.as_deref()),
+            Err(code) => status(code),
+        },
+        ("/v1/devices/approve", "POST") => match read_body(&mut req).await {
+            Ok(body) => devices::approve(&body, authz.as_deref()),
+            Err(code) => status(code),
+        },
+        (
+            "/healthz"
+            | "/v1/records"
+            | "/v1/devices"
+            | "/v1/devices/remove"
+            | "/v1/devices/approve",
+            _,
+        ) => status(405),
         _ => status(404),
     }
+}
+
+/// How often a node repeats the open-registration warning.
+const WARN_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The native server warns once, at startup, when no registration secret is set. The mesh
+/// service has none at all (spec §5.1: open registration in v1), and it has no startup: every
+/// request runs in a fresh instance. Logging on every request would flood the node log, so
+/// the first request on a node logs it and records that in `kv/local`, and the node logs it
+/// again once a day. An instance logs it at most once.
+fn warn_open_registration() {
+    if local::get(keys::WARNED_OPEN_REGISTRATION).is_some() {
+        return;
+    }
+    eprintln!(
+        "[aegis-sync] WARNING: registration is open: anyone who can reach this service can \
+         create an account on it (bounded only by the per-node caps). The mesh service has no \
+         registration secret."
+    );
+    // A refused write (the store's cap) only means the warning repeats.
+    let _ = local::set(keys::WARNED_OPEN_REGISTRATION, b"1", WARN_EVERY_MS);
 }
 
 /// The request body, refused with `413` past `MAX_BODY_BYTES` (the native body-limit layer).

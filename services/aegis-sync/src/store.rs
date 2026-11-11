@@ -1,7 +1,7 @@
 //! Typed access to `meshnode:kv` in the layout of [`crate::keys`].
 use std::collections::BTreeSet;
 
-use aegis_sync_core::devices::{AccountFacts, DeviceFacts};
+use aegis_sync_core::devices::{AccountFacts, DeviceFacts, LabelFact};
 use aegis_sync_core::order::order_bytes;
 use aegis_sync_core::wire::{WireRecord, hlc_key};
 use serde_json::Value;
@@ -32,13 +32,13 @@ fn id_set(set: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The account's device facts as this node sees them (labels are not read: no record route
-/// needs them).
+/// The account's device facts as this node sees them, without labels (only
+/// `GET /v1/devices` shows them: [`labels`]).
 ///
 /// READ ORDER IS LOAD-BEARING: `devices` first, then `pending`, `approved`, `revoked`. A joiner
 /// is a member only once it is not pending, so if its `devices` entry were visible while its
-/// `pending` entry was not, it would be admitted before the owner approved it. The writer (the
-/// devices endpoints, Task 8) MUST therefore write a joiner's `pending` entry no later than
+/// `pending` entry was not, it would be admitted before the owner approved it. The writer
+/// (`devices::register`) therefore writes a joiner's `pending` entry no later than
 /// its `devices` entry; every device this read sees in `devices` then already has its
 /// `pending` entry visible to the reads that follow. Reading the other sets later can only
 /// show more approvals and more revocations, both of which are real.
@@ -57,6 +57,40 @@ pub fn account_facts(acct: &str) -> AccountFacts {
         revoked,
         labels: Vec::new(),
     }
+}
+
+/// The account's label changes (`LabelFact`s), as this node sees them.
+pub fn labels(acct: &str) -> Vec<LabelFact> {
+    members(&keys::labels_set(acct))
+        .into_iter()
+        .filter_map(|m| serde_json::from_slice(&m).ok())
+        .collect()
+}
+
+/// `device`'s `lastSeenMs`: the newest of every node's register, `None` if no node set one.
+pub fn last_seen(acct: &str, device: &str) -> Option<i64> {
+    let prefix = keys::seen_prefix(acct, device);
+    let mut newest = None;
+    let mut after: Option<String> = None;
+    loop {
+        let batch = store::list_keys(&prefix, after.as_deref(), PAGE);
+        let done = batch.len() < PAGE as usize;
+        for key in &batch {
+            let ms = store::get(key).and_then(|v| std::str::from_utf8(&v).ok()?.parse().ok());
+            newest = newest.max(ms);
+        }
+        if done {
+            return newest;
+        }
+        after = batch.last().cloned();
+    }
+}
+
+/// Sets this node's `last_seen` register for `device` to `now_ms`. Only this node writes it,
+/// so it never conflicts.
+pub fn touch_seen(acct: &str, device: &str, now_ms: i64) {
+    let key = keys::seen_key(acct, device, &crate::caps::node_hex());
+    store::set(&key, now_ms.to_string().as_bytes());
 }
 
 /// The stored record at `key`, if any. A value that does not parse (none is ever written)
@@ -79,17 +113,61 @@ pub fn stored_hlc(key: &str) -> Option<Value> {
     })
 }
 
+/// What the LWW check, the caps and retention need from a stored record.
+pub struct Stored {
+    pub hlc: Value,
+    pub deleted: bool,
+    pub ct_len: usize,
+}
+
+/// The stored record at `key` without its other fields: `hlc` reads as `Value::Null` and
+/// the rest as empty when the value does not parse (none is ever written).
+pub fn stored_meta(key: &str) -> Option<Stored> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Meta {
+        hlc: Value,
+        deleted: bool,
+        ct: String,
+    }
+    store::get(key).map(|v| {
+        let m: Meta = serde_json::from_slice(&v).unwrap_or_default();
+        Stored {
+            hlc: m.hlc,
+            deleted: m.deleted,
+            ct_len: m.ct.len(),
+        }
+    })
+}
+
 /// Writes `rec` (whose `uuid` is set and `ord` is none) as `(acct, ns, rec.uuid)`, ordered by
-/// its client `hlc`. The tie-candidate index entry goes first, so a replica that has the
-/// record also has the entry.
-pub fn put_record(acct: &str, ns: &str, rec: &WireRecord) {
+/// its client `hlc`, over `old` (what this node had stored there). The tie-candidate index
+/// entry and, for a tombstone, its retention-index key go first, so a replica that has the
+/// record also has them; the retention-index key of an `old` tombstone goes after, once the
+/// uuid has moved off it.
+///
+/// A tombstone whose index key would be over the store's key limit (possible only for an
+/// `ns` + `uuid` far longer than a real client's) is stored without one, and so is never
+/// counted or pruned by retention: retention reclaims space, it never decides what a client
+/// sees, so this refuses nothing.
+pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) {
     let bytes = serde_json::to_vec(rec).expect("a WireRecord serializes");
+    let tomb = keys::tomb_key(acct, ns, &rec.hlc, &rec.uuid);
+    if rec.deleted && tomb.len() <= keys::MAX_KEY {
+        store::set(&tomb, b"1");
+    }
     store::set_add(&keys::hlcidx_set(acct, ns, &rec.hlc), rec.uuid.as_bytes());
     store::set_ordered(
         &keys::rec_key(acct, ns, &rec.uuid),
         &order_bytes(&rec.hlc),
         Some(&bytes),
     );
+    if let Some(old) = old.filter(|o| o.deleted) {
+        let old_tomb = keys::tomb_key(acct, ns, &old.hlc, &rec.uuid);
+        if old_tomb.len() <= keys::MAX_KEY {
+            store::delete(&old_tomb);
+        }
+    }
 }
 
 /// The mesh tie rule: does another live record (tombstones included) of `(acct, ns)` with a

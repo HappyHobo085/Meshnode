@@ -25,6 +25,12 @@ futures-lite = "1.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+# TEST ONLY: lowers the server-wide caps (`src/caps.rs`) so the Meshnode harness can reach them
+# with a handful of requests. Built only by `mesh_runtime::test_fixtures::aegis_sync_wasm_test_caps`;
+# `scripts/build-services.sh` and every deploy build without it.
+test-caps = []
+
 [profile.release]
 opt-level = "s"
 debug = false

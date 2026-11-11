@@ -1,10 +1,11 @@
 //! `services/aegis-sync` (the Aegis sync server as a Meshnode WASM service) driven in-process
 //! through `mesh_runtime` over a `MemKv`: the shared contract vectors from the vendored
 //! `aegis-sync-core`, plus the mesh-specific rules (tie `ord`, replay nonces in `kv/local`,
-//! the membership gate) and paging at scale.
+//! the membership gate, the device endpoints, caps, tombstone retention) and paging at scale.
 //!
-//! Task 7 runs the `healthz_*`, `auth_*`, `records_*` and `bounds_*` vectors that need no
-//! devices endpoint; the rest run once those endpoints exist (Task 8).
+//! Every vector that runs on the mesh runs here. The server-wide caps are reached through a
+//! second build of the service with its test-only `test-caps` feature (lowered caps, see
+//! `services/aegis-sync/src/caps.rs`); production builds never enable it.
 
 // The service's own key layout, so seeded state is exactly where the service reads it. Some
 // of it (the store bounds, the account prefix) only the service uses.
@@ -16,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aegis_sync_core::auth::MAX_TTL_MS;
+use aegis_sync_core::auth::{AuthToken, MAX_TTL_MS, canonical};
 use aegis_sync_core::devices::{AccountFacts, DeviceFacts};
 use aegis_sync_core::order::{order_bytes, tie_ord};
 use aegis_sync_core::page::{Page, page_sorted};
@@ -27,7 +28,7 @@ use aegis_sync_core::wire::{
 };
 use bytes::Bytes;
 use mesh_proto::{Limits, NodeId};
-use mesh_runtime::test_fixtures::aegis_sync_wasm;
+use mesh_runtime::test_fixtures::{aegis_sync_wasm, aegis_sync_wasm_test_caps};
 use mesh_runtime::{KvBackend, Loaded, MemKv, RequestCtx, Runtime, RuntimeConfig};
 use serde_json::{Value, json};
 
@@ -50,9 +51,26 @@ struct Svc {
 }
 
 async fn service() -> Svc {
+    service_from(aegis_sync_wasm()).await
+}
+
+/// The service built with `test-caps`: the caps in [`test_caps`].
+async fn service_test_caps() -> Svc {
+    service_from(aegis_sync_wasm_test_caps()).await
+}
+
+/// The values `services/aegis-sync/src/caps.rs` uses under its `test-caps` feature.
+mod test_caps {
+    pub const MAX_ACCOUNTS: usize = 1;
+    pub const MAX_TOTAL_RECORDS: usize = 4;
+    pub const MAX_TOTAL_CT_BYTES: u64 = 40;
+    pub const MAX_SEEN_NONCES_PER_DEVICE: usize = 10;
+}
+
+async fn service_from(path: std::path::PathBuf) -> Svc {
     let rt = Runtime::new(RuntimeConfig::default()).unwrap();
     rt.set_wall_clock_ms(Some(NOW_MS));
-    let wasm = std::fs::read(aegis_sync_wasm()).expect("read aegis_sync.wasm");
+    let wasm = std::fs::read(path).expect("read aegis_sync.wasm");
     let svc = rt.load([0xa5; 32], &wasm).await.expect("load aegis-sync");
     Svc { rt, svc }
 }
@@ -114,6 +132,61 @@ fn req(method: &str, path: &str, auth: Option<String>, body: Option<Value>) -> R
 
 fn auth(acct: &str, dev: &str, nonce: &str) -> Option<String> {
     Some(vector::auth_header(acct, dev, nonce, Tamper::None))
+}
+
+/// Like [`auth`], but issued at `issued_ms` instead of the vectors' fixed `NOW_MS`.
+fn auth_at(acct: &str, dev: &str, nonce: &str, issued_ms: i64) -> Option<String> {
+    use ed25519_dalek_v2::Signer;
+    let token = AuthToken {
+        account_id: vector::account_id(acct),
+        device_id: vector::device_id(dev),
+        issued_ms,
+        expires_ms: issued_ms + MAX_TTL_MS,
+        nonce: nonce.into(),
+    };
+    let sig = vector::device_key(dev).sign(&canonical(&token)).to_bytes();
+    let token_hex = hex::encode(serde_json::to_vec(&token).unwrap());
+    Some(format!(
+        "AegisSig {}.{token_hex}.{}",
+        token.account_id,
+        hex::encode(sig)
+    ))
+}
+
+/// The node id every request runs on (`RequestCtx::node_id`), as the service spells it.
+fn node_hex() -> String {
+    hex::encode([7u8; 32])
+}
+
+/// A `POST /v1/devices` registering `dev` on `acct` with `label`.
+fn register(acct: &str, dev: &str, label: &str, auth: Option<String>) -> Req {
+    let body = json!({
+        "accountId": vector::account_id(acct),
+        "deviceId": vector::device_id(dev),
+        "label": label,
+        "accountSig": vector::register_sig(acct, dev),
+    });
+    req("POST", "/v1/devices", auth, Some(body))
+}
+
+/// A `POST` to a device route (`/v1/devices/remove` or `/approve`) naming `target`.
+fn act(path: &str, acct: &str, actor: &str, target: &str) -> Req {
+    let body = json!({ "deviceId": vector::device_id(target) });
+    req("POST", path, auth(acct, actor, &nonce()), Some(body))
+}
+
+/// Sets both the guest's wall clock and the `kv/local` TTL clock.
+fn set_clock(s: &Svc, kv: &MemKv, now_ms: i64) {
+    s.rt.set_wall_clock_ms(Some(now_ms));
+    kv.set_now_ms(now_ms as u64);
+}
+
+/// This node's share of the per-node counter `metric`.
+async fn own_count(kv: &MemKv, metric: &str) -> Option<i64> {
+    kv.get(&keys::count_key(&node_hex(), metric))
+        .await
+        .unwrap()
+        .map(|v| String::from_utf8(v).unwrap().parse().unwrap())
 }
 
 /// A fresh hex nonce per call.
@@ -229,35 +302,19 @@ fn vectors() -> Vec<Vector> {
     ))
 }
 
-/// Task 7's vectors: the four groups whose routes exist now, minus any vector that calls a
-/// devices endpoint (Task 8).
-fn in_task7(v: &Vector) -> bool {
-    let group_ok = ["healthz_", "auth_", "records_", "bounds_"]
-        .iter()
-        .any(|g| v.name.starts_with(g));
-    group_ok && v.steps().all(|(r, _)| !r.path.starts_with("/v1/devices"))
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_vectors() {
     let all = vectors();
-    let deferred: BTreeSet<&str> = all
+    let skipped: Vec<&str> = all
         .iter()
-        .filter(|v| v.runs_on(Host::Mesh) && !in_task7(v))
+        .filter(|v| !v.runs_on(Host::Mesh))
         .map(|v| v.name.as_str())
         .collect();
-    // Everything deferred is a devices case; a new non-devices vector must run here.
-    for name in &deferred {
-        assert!(
-            name.starts_with("devices_") || *name == "bounds_label_too_long_413",
-            "{name} is deferred but needs no devices endpoint"
-        );
-    }
 
     let s = service().await;
     let mut ran = Vec::new();
     let mut failures = Vec::new();
-    for v in all.iter().filter(|v| v.runs_on(Host::Mesh) && in_task7(v)) {
+    for v in all.iter().filter(|v| v.runs_on(Host::Mesh)) {
         let kv = fresh_kv();
         seed_given(&kv, v).await;
         for (i, (r, expect)) in v.steps().enumerate() {
@@ -281,17 +338,26 @@ async fn contract_vectors() {
         !ran.contains(&"records_cross_uuid_tie_counter_bump"),
         "native_only is skipped"
     );
+    assert_eq!(
+        skipped,
+        ["records_cross_uuid_tie_counter_bump"],
+        "only native_only vectors are skipped"
+    );
+    assert_eq!(ran.len() + skipped.len(), all.len());
     for want in [
         "healthz_ok",
         "auth_replayed_nonce_401",
         "bounds_bad_hlc_400",
+        "bounds_label_too_long_413",
+        "devices_owner_never_pending_ranks_first",
+        "devices_pending_cap_429",
+        "devices_owner_self_remove_handoff",
     ] {
         assert!(ran.contains(&want), "{want} did not run");
     }
-    eprintln!(
-        "ran {} vectors: {ran:?}\ndeferred to Task 8: {deferred:?}",
-        ran.len()
-    );
+    let devices = ran.iter().filter(|n| n.starts_with("devices_")).count();
+    assert_eq!(devices, 13, "every devices_* vector runs");
+    eprintln!("ran {} vectors: {ran:?}\nskipped: {skipped:?}", ran.len());
 }
 
 // ------------------------------------------------------------------------- mesh rules
@@ -797,4 +863,424 @@ async fn nul_in_ns_uuid_or_nonce_is_refused() {
     // The same record without the NUL is stored.
     assert_eq!(s.call(&kv, push("bm", vec![ok])).await.0, 200);
     assert_eq!(kv.list_keys("rec/", None, 10).await.unwrap().len(), 1);
+}
+
+// ------------------------------------------------------------------------- devices
+
+/// The same token twice on one node: the second request is a replay (`401`), on the device
+/// routes as on the record routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_same_node_401() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let first = auth("A", "D1", "aa01");
+    let reg = register("A", "D1", "phone", first.clone());
+    assert_eq!(s.call(&kv, reg.clone()).await.0, 200);
+    assert_eq!(s.call(&kv, reg).await.0, 401, "a replayed registration");
+    let list = req("GET", "/v1/devices", auth("A", "D1", "aa02"), None);
+    assert_eq!(s.call(&kv, list.clone()).await.0, 200);
+    assert_eq!(s.call(&kv, list).await.0, 401, "a replayed GET /v1/devices");
+    let mut approve = act("/v1/devices/approve", "A", "D1", "D2");
+    approve.headers = vec![("authorization".into(), auth("A", "D1", "aa03").unwrap())];
+    assert_eq!(s.call(&kv, approve.clone()).await.0, 404, "nothing pending");
+    assert_eq!(s.call(&kv, approve).await.0, 401, "a replayed approve");
+}
+
+/// D5 through the endpoints on one node: the first device owns the account; when it signs
+/// itself out the role passes to the OLDEST remaining member by `registered_ms`, not the
+/// lowest id; the new owner can act; the last member cannot be removed; the old owner is out
+/// for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_handoff_single_node() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let id = |d: &str| vector::device_id(d);
+    // The joiner with the GREATER id registers first, so only `registered_ms` can pick it.
+    let (early, late) = if id("D2") > id("D3") {
+        ("D2", "D3")
+    } else {
+        ("D3", "D2")
+    };
+    let created = s
+        .call(&kv, register("A", "D1", "phone", auth("A", "D1", &nonce())))
+        .await;
+    assert_eq!(
+        created,
+        (200, Some(json!({ "ok": true, "pending": false })))
+    );
+    for (dev, at) in [(early, NOW_MS + 10_000), (late, NOW_MS + 20_000)] {
+        set_clock(&s, &kv, at);
+        let joined = s
+            .call(&kv, register("A", dev, dev, auth("A", dev, &nonce())))
+            .await;
+        assert_eq!(joined, (200, Some(json!({ "ok": true, "pending": true }))));
+    }
+    set_clock(&s, &kv, NOW_MS + 30_000);
+    // A pending device cannot approve itself or another.
+    let r = s
+        .call(&kv, act("/v1/devices/approve", "A", late, early))
+        .await;
+    assert_eq!(r.0, 403);
+    for dev in [early, late] {
+        let r = s
+            .call(&kv, act("/v1/devices/approve", "A", "D1", dev))
+            .await;
+        assert_eq!(r, (200, Some(json!({ "ok": true }))));
+    }
+    let list = |dev: &str| req("GET", "/v1/devices", auth("A", dev, &nonce()), None);
+    let (status, body) = s.call(&kv, list("D1")).await;
+    assert_eq!(status, 200);
+    let want = json!({
+        "devices": [
+            { "deviceId": id("D1"), "label": "phone", "registeredMs": NOW_MS },
+            { "deviceId": id(early), "label": early, "registeredMs": NOW_MS + 10_000,
+              "lastSeenMs": NOW_MS + 30_000 },
+            { "deviceId": id(late), "label": late, "registeredMs": NOW_MS + 20_000 },
+        ],
+        "pending": [],
+        "ownerDeviceId": id("D1"),
+    });
+    assert!(vector::subset(&want, body.as_ref().unwrap()), "{body:?}");
+
+    // The owner signs itself out: the earlier joiner inherits.
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", "D1", "D1"))
+        .await;
+    assert_eq!(r, (200, Some(json!({ "ok": true }))));
+    let body = s.call(&kv, list(late)).await.1.unwrap();
+    assert_eq!(body["ownerDeviceId"], json!(id(early)), "{body}");
+    assert_eq!(body["devices"].as_array().unwrap().len(), 2);
+    // The later joiner is not the owner; the new owner is.
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", late, early))
+        .await;
+    assert_eq!(r.0, 403);
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", early, late))
+        .await;
+    assert_eq!(r.0, 200);
+    // The last member cannot be removed.
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", early, early))
+        .await;
+    assert_eq!(r.0, 409);
+    // The old owner and the removed joiner are out, and cannot register back in.
+    for gone in ["D1", late] {
+        let get = req("GET", "/v1/records?ns=bm", auth("A", gone, &nonce()), None);
+        assert_eq!(s.call(&kv, get).await.0, 403, "{gone} reads records");
+        let back = register("A", gone, "again", auth("A", gone, &nonce()));
+        assert_eq!(s.call(&kv, back).await.0, 403, "{gone} re-registers");
+    }
+    set_clock(&s, &kv, NOW_MS);
+}
+
+/// `lastSeenMs` is a register per node; the newest across nodes is served, and a
+/// re-registration refreshes this node's.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_seen_is_newest_across_nodes() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let list = || req("GET", "/v1/devices", auth("A", "D1", &nonce()), None);
+    let seen = |body: Option<Value>| body.unwrap()["devices"][0]["lastSeenMs"].clone();
+    // Never seen: the registration time.
+    assert_eq!(seen(s.call(&kv, list()).await.1), json!(1000));
+    let other = hex::encode([9u8; 32]);
+    kv.set(&keys::seen_key(&a, &d1, &other), b"5000".to_vec())
+        .await
+        .unwrap();
+    kv.set(&keys::seen_key(&a, &d1, &node_hex()), b"3000".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(seen(s.call(&kv, list()).await.1), json!(5000));
+    let again = register("A", "D1", "phone", auth("A", "D1", &nonce()));
+    assert_eq!(s.call(&kv, again).await.0, 200);
+    assert_eq!(seen(s.call(&kv, list()).await.1), json!(NOW_MS));
+    let own = kv.get(&keys::seen_key(&a, &d1, &node_hex())).await.unwrap();
+    assert_eq!(own, Some(NOW_MS.to_string().into_bytes()));
+}
+
+/// The open-registration warning is throttled through `kv/local`: the first request on a
+/// node logs it and records that it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_registration_warning_is_recorded_per_node() {
+    let s = service().await;
+    let kv = fresh_kv();
+    assert_eq!(
+        kv.local_get(keys::WARNED_OPEN_REGISTRATION).await.unwrap(),
+        None
+    );
+    assert_eq!(s.call(&kv, req("GET", "/healthz", None, None)).await.0, 200);
+    assert!(
+        kv.local_get(keys::WARNED_OPEN_REGISTRATION)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+// ------------------------------------------------------------------------- caps
+
+/// `MAX_ACCOUNTS` (lowered to 1): creating a second account is `507`, and the refusal spends
+/// no nonce; joining or re-registering on an existing account is not gated by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn caps_account_limit_507() {
+    assert_eq!(test_caps::MAX_ACCOUNTS, 1);
+    let s = service_test_caps().await;
+    let kv = fresh_kv();
+    let first = register("A", "D1", "phone", auth("A", "D1", &nonce()));
+    assert_eq!(s.call(&kv, first).await.0, 200);
+    assert_eq!(own_count(&kv, "accounts").await, Some(1));
+    let n = nonce();
+    let second = register("B", "D2", "laptop", auth("B", "D2", &n));
+    assert_eq!(s.call(&kv, second).await.0, 507);
+    let d2 = vector::device_id("D2");
+    assert_eq!(kv.local_get(&keys::nonce_key(&d2, &n)).await.unwrap(), None);
+    assert!(
+        kv.list_keys("devices/", None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|k| !k.contains(&vector::account_id("B"))),
+        "nothing written for B"
+    );
+    let join = register("A", "D3", "tablet", auth("A", "D3", &nonce()));
+    let joined = s.call(&kv, join).await;
+    assert_eq!(joined, (200, Some(json!({ "ok": true, "pending": true }))));
+    let again = register("A", "D1", "phone 2", auth("A", "D1", &nonce()));
+    assert_eq!(s.call(&kv, again).await.0, 200);
+    assert_eq!(own_count(&kv, "accounts").await, Some(1));
+}
+
+/// `MAX_TOTAL_RECORDS` (4) and `MAX_TOTAL_CT_BYTES` (40), summed over every node's counter:
+/// only new keys and ciphertext growth are refused, so a full server still takes updates
+/// that keep or shrink a record.
+#[tokio::test(flavor = "multi_thread")]
+async fn caps_total_records_and_bytes_507() {
+    assert_eq!(test_caps::MAX_TOTAL_RECORDS, 4);
+    assert_eq!(test_caps::MAX_TOTAL_CT_BYTES, 40);
+    let s = service_test_caps().await;
+    let kv = fresh_kv();
+    let reg = register("A", "D1", "phone", auth("A", "D1", &nonce()));
+    assert_eq!(s.call(&kv, reg).await.0, 200);
+    let push = |records: Vec<WireRecord>| {
+        let body = json!({ "ns": "bm", "records": records });
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+    };
+    let ten = "0123456789";
+    let a = vector::account_id("A");
+    let stored = |kv: &Arc<MemKv>, uuid: &str| {
+        let key = keys::rec_key(&a, "bm", uuid);
+        let kv = kv.clone();
+        async move { kv.get(&key).await.unwrap().is_some() }
+    };
+
+    let three = vec![
+        rec("r1", 1, 0, "n", ten),
+        rec("r2", 1, 0, "n", ten),
+        rec("r3", 1, 0, "n", ten),
+    ];
+    assert_eq!(s.call(&kv, push(three)).await.0, 200);
+    assert_eq!(own_count(&kv, "records").await, Some(3));
+    assert_eq!(own_count(&kv, "ct_bytes").await, Some(30));
+    // 3 + 2 new keys > 4: refused whole.
+    let two = vec![rec("r4", 1, 0, "n", ""), rec("r5", 1, 0, "n", "")];
+    assert_eq!(s.call(&kv, push(two)).await.0, 507);
+    assert!(!stored(&kv, "r4").await);
+    // Exactly at both caps passes.
+    assert_eq!(
+        s.call(&kv, push(vec![rec("r4", 1, 0, "n", ten)])).await.0,
+        200
+    );
+    assert_eq!(own_count(&kv, "records").await, Some(4));
+    assert_eq!(own_count(&kv, "ct_bytes").await, Some(40));
+    // One byte of growth is refused; a shrinking update passes.
+    let grow = rec("r1", 2, 0, "n", "0123456789a");
+    assert_eq!(s.call(&kv, push(vec![grow])).await.0, 507);
+    let shrink = rec("r1", 3, 0, "n", "01234");
+    assert_eq!(s.call(&kv, push(vec![shrink])).await.0, 200);
+    assert_eq!(own_count(&kv, "ct_bytes").await, Some(35));
+    // At the record cap a new key is refused, even an empty one.
+    assert_eq!(
+        s.call(&kv, push(vec![rec("r5", 1, 0, "n", "")])).await.0,
+        507
+    );
+    // The cap is over the sum of every node's counter: another node that pruned one record
+    // (a negative share) makes room for one more.
+    let other = hex::encode([9u8; 32]);
+    kv.set(&keys::count_key(&other, "records"), b"-1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.call(&kv, push(vec![rec("r5", 1, 0, "n", "")])).await.0,
+        200
+    );
+    assert!(stored(&kv, "r5").await);
+    assert_eq!(
+        s.call(&kv, push(vec![rec("r6", 1, 0, "n", "")])).await.0,
+        507
+    );
+    assert_eq!(own_count(&kv, "records").await, Some(5));
+}
+
+/// `MAX_SEEN_NONCES_PER_DEVICE` (lowered to 10): a device holding that many live nonces is
+/// refused (`429`) without spending the new one, other devices are not, and the count frees
+/// once the nonces expire.
+#[tokio::test(flavor = "multi_thread")]
+async fn nonce_cap_per_device_429() {
+    let cap = test_caps::MAX_SEEN_NONCES_PER_DEVICE;
+    assert_eq!(cap, 10);
+    let s = service_test_caps().await;
+    let kv = fresh_kv();
+    let a = vector::account_id("A");
+    let (d1, d2) = (vector::device_id("D1"), vector::device_id("D2"));
+    seed_member(&kv, &a, &d1).await;
+    seed_member(&kv, &a, &d2).await;
+    let get = |auth: Option<String>| req("GET", "/v1/records?ns=bm", auth, None);
+    for _ in 0..cap {
+        let r = s.call(&kv, get(auth("A", "D1", &nonce()))).await;
+        assert_eq!(r.0, 200);
+    }
+    let n = nonce();
+    let refused = s.call(&kv, get(auth("A", "D1", &n))).await;
+    assert_eq!(refused.0, 429);
+    assert_eq!(kv.local_get(&keys::nonce_key(&d1, &n)).await.unwrap(), None);
+    // Per device: D2 is not affected.
+    assert_eq!(s.call(&kv, get(auth("A", "D2", &nonce()))).await.0, 200);
+    // Every counted nonce has expired (ttl 300 001 ms, plus at most one bucket).
+    let later = NOW_MS + MAX_TTL_MS + 1 + keys::NONCE_BUCKET_MS;
+    set_clock(&s, &kv, later);
+    let ok = s.call(&kv, get(auth_at("A", "D1", &n, later))).await;
+    assert_eq!(ok.0, 200, "the cap frees as the nonces expire");
+    set_clock(&s, &kv, NOW_MS);
+}
+
+/// The production cap is `MAX_SEEN_NONCES_PER_DEVICE` (2 000), read from the per-device
+/// bucket counts in `kv/local` (seeded here, so no 2 000 requests are needed).
+#[tokio::test(flavor = "multi_thread")]
+async fn nonce_cap_default_is_2000() {
+    use aegis_sync_core::auth::MAX_SEEN_NONCES_PER_DEVICE;
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    // A token issued at NOW is spent for MAX_TTL_MS + 1 (see `auth.rs`).
+    let bucket = keys::nonce_bucket(NOW_MS + MAX_TTL_MS + 1);
+    let held = (MAX_SEEN_NONCES_PER_DEVICE - 1).to_string();
+    kv.local_set(
+        &keys::nonce_count_key(&d1, bucket),
+        held.into_bytes(),
+        MAX_TTL_MS as u64 * 2,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let get = || req("GET", "/v1/records?ns=bm", auth("A", "D1", &nonce()), None);
+    assert_eq!(s.call(&kv, get()).await.0, 200, "the 2 000th live nonce");
+    assert_eq!(s.call(&kv, get()).await.0, 429, "the 2 001st");
+    let count = kv
+        .local_get(&keys::nonce_count_key(&d1, bucket))
+        .await
+        .unwrap();
+    assert_eq!(count, Some(b"2000".to_vec()));
+}
+
+// ------------------------------------------------------------------------- retention
+
+/// Native retention after a push: per `(account, ns)`, tombstones past the newest 500 AND
+/// older than 90 days are pruned; live records never; fresh tombstones never, however many.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_prunes_old_tombstones() {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let tomb = |uuid: String, wall: i64| WireRecord {
+        deleted: true,
+        ct: String::new(),
+        ..rec(&uuid, wall, 0, "node", "")
+    };
+    let push = |ns: &str, records: Vec<WireRecord>| {
+        let body = json!({ "ns": ns, "records": records });
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+    };
+    let served = |ns: &str| {
+        let get = req(
+            "GET",
+            &format!("/v1/records?ns={ns}"),
+            auth("A", "D1", &nonce()),
+            None,
+        );
+        let s = &s;
+        let kv = kv.clone();
+        async move {
+            let (status, body) = s.call(&kv, get).await;
+            assert_eq!(status, 200);
+            let body = body.unwrap();
+            assert_eq!(body["next"], Value::Null);
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["uuid"].as_str().unwrap().to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    let old = NOW_MS - 100 * DAY;
+
+    // 600 old tombstones and one old live record: the 100 oldest tombstones go.
+    let mut bm: Vec<WireRecord> = (0..600)
+        .map(|i| tomb(format!("t{i:04}"), old + i * 1000))
+        .collect();
+    bm.push(rec("live", old - DAY, 0, "node", "x"));
+    assert_eq!(s.call(&kv, push("bm", bm)).await.0, 200);
+    let left = served("bm").await;
+    assert_eq!(left.len(), 501);
+    assert_eq!(left[0], "live", "a live record is never pruned");
+    let want: Vec<String> = (100..600).map(|i| format!("t{i:04}")).collect();
+    assert_eq!(left[1..], want[..], "the 100 oldest tombstones are gone");
+    assert_eq!(
+        kv.get(&keys::rec_key(&a, "bm", "t0099")).await.unwrap(),
+        None
+    );
+    let index = kv
+        .list_keys(&keys::tomb_prefix(&a, "bm"), None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(index.len(), 500, "pruned tombstones leave the index");
+
+    // 600 tombstones younger than 90 days: all kept.
+    let fresh: Vec<WireRecord> = (0..600)
+        .map(|i| tomb(format!("f{i:04}"), NOW_MS - DAY + i))
+        .collect();
+    assert_eq!(s.call(&kv, push("fresh", fresh)).await.0, 200);
+    assert_eq!(served("fresh").await.len(), 600);
+
+    // 450 old + 100 fresh: 50 over the window, and the oldest 50 are old enough.
+    let mut mix: Vec<WireRecord> = (0..450)
+        .map(|i| tomb(format!("m{i:04}"), old + i))
+        .collect();
+    mix.extend((450..550).map(|i| tomb(format!("m{i:04}"), NOW_MS - DAY + i)));
+    assert_eq!(s.call(&kv, push("mix", mix)).await.0, 200);
+    let left = served("mix").await;
+    assert_eq!(left.len(), 500);
+    assert_eq!(left.first().map(String::as_str), Some("m0050"));
+
+    // A record moved off a tombstone leaves the index; a later push prunes nothing more.
+    let revived = rec("t0100", NOW_MS - DAY, 0, "node", "back");
+    assert_eq!(s.call(&kv, push("bm", vec![revived])).await.0, 200);
+    let index = kv
+        .list_keys(&keys::tomb_prefix(&a, "bm"), None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(index.len(), 499);
+    assert_eq!(served("bm").await.len(), 501);
+
+    // This node's record counter: every key written, less every key pruned.
+    assert_eq!(
+        own_count(&kv, "records").await,
+        Some(601 - 100 + 600 + 550 - 50)
+    );
 }

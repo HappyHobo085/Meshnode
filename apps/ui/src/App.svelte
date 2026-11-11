@@ -5,9 +5,13 @@
   import Icon, { type IconName } from "./lib/design/Icon.svelte";
   import Monogram from "./lib/design/Monogram.svelte";
   import Toast from "./lib/design/Toast.svelte";
-  import { hrefOf, route, type Route } from "./lib/router";
+  import { hrefOf, navigate, route, type Route } from "./lib/router";
   import { banner, members, startPoller, status } from "./lib/stores";
   import { applyTheme } from "./lib/theme";
+  import AddDevice from "./routes/AddDevice.svelte";
+  import FirstRun from "./routes/FirstRun.svelte";
+  import Home from "./routes/Home.svelte";
+  import Join from "./routes/Join.svelte";
 
   interface NavItem {
     label: string;
@@ -32,7 +36,19 @@
 
   let platform: Platform | null = $state(null);
   const self = $derived($members.find((m) => m.isSelf) ?? null);
-  const bare = $derived(BARE.includes($route.name));
+  const uninitialised = $derived($status?.state === "uninitialised");
+  // Before this device belongs to a mesh, Join is part of the full-window first-run flow.
+  const bare = $derived(BARE.includes($route.name) || (uninitialised && $route.name === "join"));
+
+  // A device without a mesh can only create or join one; once it has one, first run is over.
+  $effect(() => {
+    const name = $route.name;
+    if (uninitialised && name !== "first-run" && name !== "join") {
+      navigate({ name: "first-run" }, { replace: true });
+    } else if ($status?.state === "running" && name === "first-run") {
+      navigate({ name: "home" }, { replace: true });
+    }
+  });
 
   onMount(() => {
     const stopTheme = applyTheme();
@@ -88,10 +104,20 @@
   <div class="main">
     <Banner state={$banner} />
     <main id="content" tabindex="-1">
-      <!-- Screens arrive in the next tasks; each route renders its own view here. -->
-      <section class="placeholder" data-route={$route.name} data-platform={platform}>
-        <h1>{NAV.find((n) => n.match.includes($route.name))?.label ?? $route.name}</h1>
-      </section>
+      {#if $route.name === "home"}
+        <Home />
+      {:else if $route.name === "add"}
+        <AddDevice />
+      {:else if $route.name === "join"}
+        <Join />
+      {:else if $route.name === "first-run"}
+        <FirstRun />
+      {:else}
+        <!-- The remaining screens arrive in the next tasks. -->
+        <section class="placeholder" data-route={$route.name} data-platform={platform}>
+          <h1>{NAV.find((n) => n.match.includes($route.name))?.label ?? $route.name}</h1>
+        </section>
+      {/if}
     </main>
   </div>
 

@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import chip from "./Chip.svelte?raw";
 import sheet from "./Sheet.svelte?raw";
 
 /** The rules inside `@media (pointer: coarse) { … }` blocks of a component's <style>. */
@@ -21,4 +22,19 @@ it("sheet_close_button_meets_the_touch_target_on_coarse_pointers", () => {
   const rules = coarseRules(sheet);
   expect(rules).toMatch(/\.close\s*\{[^}]*width:\s*var\(--touch\)/);
   expect(rules).toMatch(/\.close\s*\{[^}]*height:\s*var\(--touch\)/);
+});
+
+it("toggle_chip_meets_the_touch_target_on_coarse_pointers", () => {
+  const rules = coarseRules(chip);
+  const toggle = rules.match(/\.toggle\s*\{([^}]*)\}/);
+  expect(toggle, "a .toggle rule under (pointer: coarse)").not.toBeNull();
+  const body = toggle?.[1] ?? "";
+  // At least 44 px tall: the touch token itself, not a smaller fixed height.
+  expect(body).toMatch(/(min-)?height:\s*var\(--touch\)/);
+  expect(body).not.toMatch(/(^|[^-])height:\s*\d+px/);
+});
+
+it("sheet_close_button_never_shrinks_beside_a_long_title", () => {
+  const close = sheet.match(/\n\s*\.close\s*\{([^}]*)\}/);
+  expect(close?.[1] ?? "").toMatch(/flex-shrink:\s*0/);
 });

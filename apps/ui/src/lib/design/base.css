@@ -208,6 +208,20 @@ svg {
   border: 0;
 }
 
+/* Long user text (device names, tags, service names) never widens its container. */
+.truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wrap {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* The online dot: a gentle pulse, the one ambient motion in the app. */
 @keyframes mesh-pulse {
   0% {

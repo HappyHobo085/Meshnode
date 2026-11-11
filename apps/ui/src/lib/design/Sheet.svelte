@@ -124,9 +124,13 @@
     padding: var(--s-5) var(--s-6) var(--s-3);
   }
   h2 {
+    min-width: 0;
     font-size: var(--fs-lg);
+    overflow-wrap: anywhere;
   }
   .close {
+    /* A long title wraps instead of squeezing the button below its target size. */
+    flex-shrink: 0;
     display: grid;
     place-items: center;
     width: 36px;

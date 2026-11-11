@@ -35,3 +35,11 @@ export function rtt(ms: number | null | undefined): string {
   if (ms < 1000) return `${Math.round(ms)} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
 }
+
+/** A countdown clock, rounded up to the second: "15:00", "14:59", "0:01", "0:00". */
+export function clock(ms: number): string {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}

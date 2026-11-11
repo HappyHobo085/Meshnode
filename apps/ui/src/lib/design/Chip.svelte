@@ -79,9 +79,10 @@
     border-color: color-mix(in oklab, var(--signal) 50%, transparent);
     color: var(--signal);
   }
+  /* Toggle chips are controls: on touch screens they reach the 44 px target. */
   @media (pointer: coarse) {
     .toggle {
-      height: 36px;
+      height: var(--touch);
     }
   }
   .remove {

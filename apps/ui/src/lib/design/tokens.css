@@ -51,11 +51,9 @@
   --danger-ink: light-dark(#ffffff, #2b0d0a);
   --danger-soft: light-dark(rgb(176 52 42 / 0.1), rgb(240 131 120 / 0.13));
 
-  /* Device accent: set `--h` (0–359) on any element; spec: hsl(var(--h) 70% 55%). */
+  /* Device accent: set `--h` (0–359) on any element; spec: hsl(var(--h) 70% 55%). The
+     colours derived from it are computed per element (below the :root block). */
   --h: 172;
-  --accent: hsl(var(--h) 70% 55%);
-  --accent-soft: light-dark(hsl(var(--h) 70% 55% / 0.16), hsl(var(--h) 70% 55% / 0.2));
-  --accent-ink: light-dark(hsl(var(--h) 75% 24%), hsl(var(--h) 80% 80%));
 
   /* Type: Inter for UI, JetBrains Mono for ids, tickets and logs.
      Scale: minor third (×1.2) on a 15 px base. */
@@ -125,6 +123,17 @@
   --safe-right: env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
+}
+
+/* The device accent is computed on every element, not once on :root: a custom property's
+   var() references resolve where it is declared, so an :root-only --accent would keep the
+   default hue even under a card or monogram that sets its own --h. */
+*,
+::before,
+::after {
+  --accent: hsl(var(--h) 70% 55%);
+  --accent-soft: light-dark(hsl(var(--h) 70% 55% / 0.16), hsl(var(--h) 70% 55% / 0.2));
+  --accent-ink: light-dark(hsl(var(--h) 75% 24%), hsl(var(--h) 80% 80%));
 }
 
 @media (prefers-reduced-motion: reduce) {

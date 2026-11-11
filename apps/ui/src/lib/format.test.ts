@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bytes, relativeTime, rtt } from "./format";
+import { bytes, clock, relativeTime, rtt } from "./format";
 
 const now = 1_700_000_000_000;
 const s = 1000;
@@ -35,4 +35,13 @@ describe("format", () => {
     expect(rtt(42.6)).toBe("43 ms");
     expect(rtt(1_250)).toBe("1.3 s");
   });
+});
+
+it("clock_cases", () => {
+  expect(clock(900_000)).toBe("15:00");
+  expect(clock(899_000)).toBe("14:59");
+  expect(clock(3_600_000)).toBe("60:00");
+  expect(clock(1)).toBe("0:01");
+  expect(clock(0)).toBe("0:00");
+  expect(clock(-5_000)).toBe("0:00");
 });

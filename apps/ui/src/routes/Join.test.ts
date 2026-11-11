@@ -80,3 +80,13 @@ it("join_scan_joins_with_the_scanned_ticket", async () => {
   await fireEvent.click(await screen.findByRole("button", { name: "Scan QR code" }));
   await vi.waitFor(() => expect(api.join).toHaveBeenCalledWith("mesh1scanned", "Pixel"));
 });
+
+it("join_scan_needs_a_name", async () => {
+  api.platform.mockResolvedValue("android");
+  render(Join);
+  const scan = await screen.findByRole("button", { name: "Scan QR code" });
+  await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "  " } });
+  expect(scan).toBeDisabled();
+  await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "Pixel" } });
+  expect(scan).toBeEnabled();
+});

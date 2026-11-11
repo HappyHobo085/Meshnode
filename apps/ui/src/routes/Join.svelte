@@ -5,7 +5,7 @@
   import Card from "../lib/design/Card.svelte";
   import Field from "../lib/design/Field.svelte";
   import Icon from "../lib/design/Icon.svelte";
-  import { chosenName, defaultDeviceName, refusalText } from "../lib/device";
+  import { chosenName, refusalText, suggestedName } from "../lib/device";
   import { hrefOf, navigate } from "../lib/router";
   import { refreshNow, status, toast } from "../lib/stores";
 
@@ -29,9 +29,10 @@
       .platform()
       .then((p) => (platform = p))
       .catch(() => (platform = null))
-      .finally(() => {
+      .finally(async () => {
         loaded = true;
-        if (name === "") name = defaultDeviceName(platform);
+        const suggested = await suggestedName(platform);
+        if (name === "") name = suggested;
       });
   });
 
@@ -99,7 +100,13 @@
 
       {#if loaded && android}
         <div class="scan">
-          <Button variant="primary" block busy={scanning || (busy && !pasting)} onclick={scan}>
+          <Button
+            variant="primary"
+            block
+            busy={scanning || (busy && !pasting)}
+            disabled={name.trim() === ""}
+            onclick={scan}
+          >
             <Icon name="scan" size={20} />Scan QR code
           </Button>
           {#if !pasting}
@@ -169,6 +176,11 @@
   }
   .back:hover {
     color: var(--ink);
+  }
+  @media (pointer: coarse) {
+    .back {
+      min-height: var(--touch);
+    }
   }
   .lead {
     color: var(--ink-2);

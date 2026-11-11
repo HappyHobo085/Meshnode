@@ -20,8 +20,11 @@ export function parseQr(svg: string): QrShape | null {
   if (root.localName !== "svg" || doc.getElementsByTagName("parsererror").length > 0) return null;
   const viewBox = root.getAttribute("viewBox")?.trim() ?? "";
   if (!VIEWBOX.test(viewBox)) return null;
-  const d = Array.from(root.getElementsByTagName("path"), (p) => p.getAttribute("d")?.trim() ?? "")
-    .filter((s) => PATH_DATA.test(s))
-    .join("");
-  return d ? { viewBox, d } : null;
+  const paths = Array.from(
+    root.getElementsByTagName("path"),
+    (p) => p.getAttribute("d")?.trim() ?? "",
+  );
+  // One bad path means a partial code that would scan wrong or not at all: draw nothing.
+  if (paths.length === 0 || !paths.every((d) => PATH_DATA.test(d))) return null;
+  return { viewBox, d: paths.join("") };
 }

@@ -13,6 +13,7 @@ const DESKTOP_COMMANDS: &[&str] = &[
     "pick_folder",
     "pick_file",
     "open_url",
+    "default_device_name",
 ];
 
 fn main() {

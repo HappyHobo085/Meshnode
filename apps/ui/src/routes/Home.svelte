@@ -99,7 +99,8 @@
       {#if gateway}
         <div class="gw-row">
           <span class="gw-label">Gateway</span>
-          <button type="button" class="url" aria-label="Copy gateway URL" onclick={copyGateway}>
+          <button type="button" class="url" onclick={copyGateway}>
+            <span class="visually-hidden">Copy gateway URL</span>
             <span class="url-text mono truncate">{gateway}</span>
             <Icon name="copy" size={16} />
           </button>

@@ -1,6 +1,6 @@
 import { writable } from "svelte/store";
 import type { IconName } from "./design/Icon.svelte";
-import type { Platform } from "./api";
+import { api, type Platform } from "./api";
 import type { JoinRefusalDto } from "./generated/JoinRefusalDto";
 
 /** The name typed on First run, carried over to Join so it isn't asked twice. */
@@ -29,6 +29,22 @@ export function defaultDeviceName(
     default:
       return "";
   }
+}
+
+/**
+ * The name First run and Join offer: the host name on desktop (spec §6.2), the phone model
+ * on Android, and the platform's word when neither can be read.
+ */
+export async function suggestedName(platform: Platform | null): Promise<string> {
+  if (platform !== null && platform !== "android") {
+    try {
+      const host = (await api.desktop.defaultDeviceName()).trim();
+      if (host) return host;
+    } catch {
+      // An older desktop shell without the command: fall through to the platform word.
+    }
+  }
+  return defaultDeviceName(platform);
 }
 
 /** A member's platform (`std::env::consts::OS` from Rust) as an icon and a word. */

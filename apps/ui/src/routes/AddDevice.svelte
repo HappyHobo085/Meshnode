@@ -175,7 +175,7 @@
             <path d={qr.d} />
           </svg>
         {:else}
-          <p class="no-qr">This invite is too long for a QR code. Copy the text instead.</p>
+          <p class="no-qr">This invite's QR code couldn't be drawn. Copy the text instead.</p>
         {/if}
       </div>
 
@@ -269,6 +269,11 @@
   }
   .back:hover {
     color: var(--ink);
+  }
+  @media (pointer: coarse) {
+    .back {
+      min-height: var(--touch);
+    }
   }
 
   form {

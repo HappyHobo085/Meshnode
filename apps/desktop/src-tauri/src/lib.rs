@@ -2,6 +2,7 @@
 //! daemon through the shared commands of `mesh-ui-tauri` (over a [`RelocatingTransport`]);
 //! the commands here find, start or install that daemon, open dialogs and the browser.
 
+pub mod hostname;
 pub mod launch;
 pub mod locator;
 pub mod relocating;
@@ -275,6 +276,12 @@ fn open_url(app: AppHandle, url: String) -> Result<(), UiError> {
         .map_err(|e| UiError::new(UiErrorCode::Io, e.to_string()))
 }
 
+/// This machine's host name, offered as the device name on First run.
+#[tauri::command]
+fn default_device_name() -> String {
+    hostname::default_device_name()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -345,6 +352,7 @@ pub fn run() {
             pick_folder,
             pick_file,
             open_url,
+            default_device_name,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Meshnode app");

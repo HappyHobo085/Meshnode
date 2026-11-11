@@ -212,6 +212,8 @@ export const api = {
     /** A file with extension `ext` (e.g. "wasm") from the system dialog, or `null`. */
     pickFile: (ext: string) => picked(call<string>("pick_file", { ext })),
     openUrl: (url: string) => call<void>("open_url", { url }),
+    /** This machine's host name, offered as the device name on First run. */
+    defaultDeviceName: () => call<string>("default_device_name"),
   },
 
   /** Android-only commands (the Rust side lands with the Android shell). */

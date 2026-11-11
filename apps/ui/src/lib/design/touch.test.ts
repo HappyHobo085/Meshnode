@@ -1,5 +1,9 @@
 import { expect, it } from "vitest";
 import chip from "./Chip.svelte?raw";
+import addDevice from "../../routes/AddDevice.svelte?raw";
+import deviceCard from "../../routes/DeviceCard.svelte?raw";
+import home from "../../routes/Home.svelte?raw";
+import join from "../../routes/Join.svelte?raw";
 import sheet from "./Sheet.svelte?raw";
 
 /** The rules inside `@media (pointer: coarse) { … }` blocks of a component's <style>. */
@@ -37,4 +41,19 @@ it("toggle_chip_meets_the_touch_target_on_coarse_pointers", () => {
 it("sheet_close_button_never_shrinks_beside_a_long_title", () => {
   const close = sheet.match(/\n\s*\.close\s*\{([^}]*)\}/);
   expect(close?.[1] ?? "").toMatch(/flex-shrink:\s*0/);
+});
+
+// Every control the screens draw themselves (not through Button/Chip/Field) that is smaller
+// than 44 px by default must reach the touch target on coarse pointers.
+it.each([
+  ["AddDevice", ".back", addDevice],
+  ["AddDevice", ".segment", addDevice],
+  ["Join", ".back", join],
+  ["Home", ".url", home],
+  ["DeviceCard", ".more", deviceCard],
+])("%s %s meets the touch target on coarse pointers", (_name, selector, source) => {
+  const rule = new RegExp(
+    selector.replace(".", "\\.") + String.raw`\s*\{[^}]*(min-)?height:\s*var\(--touch\)`,
+  );
+  expect(coarseRules(source)).toMatch(rule);
 });

@@ -381,6 +381,12 @@
           "markdownDescription": "Enables the daemon_run_user command without any pre-configured scope."
         },
         {
+          "description": "Enables the default_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-default-device-name",
+          "markdownDescription": "Enables the default_device_name command without any pre-configured scope."
+        },
+        {
           "description": "Enables the deploy_static_dir command without any pre-configured scope.",
           "type": "string",
           "const": "allow-deploy-static-dir",
@@ -565,6 +571,12 @@
           "type": "string",
           "const": "deny-daemon-run-user",
           "markdownDescription": "Denies the daemon_run_user command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the default_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-default-device-name",
+          "markdownDescription": "Denies the default_device_name command without any pre-configured scope."
         },
         {
           "description": "Denies the deploy_static_dir command without any pre-configured scope.",

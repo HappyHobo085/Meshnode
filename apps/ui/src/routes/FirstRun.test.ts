@@ -8,17 +8,23 @@ const api = vi.hoisted(() => ({
   status: vi.fn(),
   members: vi.fn(),
   services: vi.fn(),
+  desktop: { defaultDeviceName: vi.fn() },
 }));
 vi.mock("../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/api")>()),
   api,
 }));
 
+import { chosenName } from "../lib/device";
+import { status } from "../lib/stores";
 import FirstRun from "./FirstRun.svelte";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  chosenName.set(null);
+  status.set(null);
   api.platform.mockResolvedValue("desktop-windows");
+  api.desktop.defaultDeviceName.mockResolvedValue("DESKTOP-AB12CD");
   api.status.mockResolvedValue(running());
   api.members.mockResolvedValue([]);
   api.services.mockResolvedValue([]);
@@ -30,7 +36,7 @@ it("first_run_create_calls_init_with_name", async () => {
   render(FirstRun);
   const name = screen.getByLabelText("Device name");
   // The platform default arrives first; the user's own name then wins.
-  await vi.waitFor(() => expect(name).toHaveValue("Windows PC"));
+  await vi.waitFor(() => expect(name).toHaveValue("DESKTOP-AB12CD"));
   await fireEvent.input(name, { target: { value: "  Desk  " } });
   await fireEvent.click(screen.getByRole("button", { name: "Create mesh" }));
   expect(api.init).toHaveBeenCalledWith("Desk");
@@ -57,4 +63,31 @@ it("first_run_join_goes_to_join", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Join a mesh" }));
   expect(location.hash).toBe("#/join");
   expect(api.init).not.toHaveBeenCalled();
+});
+
+it("first_run_falls_back_to_the_platform_word_without_a_hostname", async () => {
+  api.desktop.defaultDeviceName.mockRejectedValue({
+    code: "internal",
+    message: "unknown command",
+    hint: null,
+    reason: null,
+  });
+  render(FirstRun);
+  await vi.waitFor(() => expect(screen.getByLabelText("Device name")).toHaveValue("Windows PC"));
+});
+
+it("first_run_on_android_uses_the_phone_model_not_the_desktop_command", async () => {
+  api.platform.mockResolvedValue("android");
+  render(FirstRun);
+  await vi.waitFor(() => expect(screen.getByLabelText("Device name")).not.toHaveValue(""));
+  expect(api.desktop.defaultDeviceName).not.toHaveBeenCalled();
+});
+
+it("first_run_enter_in_the_name_field_creates_the_mesh", async () => {
+  api.init.mockResolvedValue(running({ name: "Desk" }));
+  render(FirstRun);
+  const name = screen.getByLabelText("Device name");
+  await fireEvent.input(name, { target: { value: "Desk" } });
+  await fireEvent.submit(name.closest("form")!);
+  expect(api.init).toHaveBeenCalledWith("Desk");
 });

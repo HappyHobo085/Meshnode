@@ -36,6 +36,7 @@
     "allow-daemon-install",
     "allow-pick-folder",
     "allow-pick-file",
-    "allow-open-url"
+    "allow-open-url",
+    "allow-default-device-name"
   ]
 }

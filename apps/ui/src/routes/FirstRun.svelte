@@ -6,7 +6,7 @@
   import Field from "../lib/design/Field.svelte";
   import Icon from "../lib/design/Icon.svelte";
   import Monogram from "../lib/design/Monogram.svelte";
-  import { chosenName, defaultDeviceName } from "../lib/device";
+  import { chosenName, suggestedName } from "../lib/device";
   import { navigate } from "../lib/router";
   import { refreshNow, status, toast } from "../lib/stores";
 
@@ -21,9 +21,11 @@
   onMount(() => {
     api
       .platform()
-      .then((p) => {
+      .catch(() => null)
+      .then(suggestedName)
+      .then((suggested) => {
         // Only fill the field if the user hasn't started typing.
-        if (name === "") name = defaultDeviceName(p);
+        if (name === "") name = suggested;
       })
       .catch(() => {});
   });
@@ -63,7 +65,14 @@
   </header>
 
   <!-- The device's name, with a live preview of the tile your other devices will show. -->
-  <div class="naming">
+  <!-- Enter in the name field creates the mesh, like the primary button. -->
+  <form
+    class="naming"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void create();
+    }}
+  >
     <Monogram name={trimmed || "?"} hue={PREVIEW_HUE} size="xl" />
     <Field
       label="Device name"
@@ -72,7 +81,7 @@
       maxlength={64}
       help="How your other devices will see this one. You can change it later."
     />
-  </div>
+  </form>
 
   <div class="choices">
     <Card padding="lg" class="choice">

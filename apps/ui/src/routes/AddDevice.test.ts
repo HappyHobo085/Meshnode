@@ -135,3 +135,18 @@ it("add_device_keeps_only_path_data_from_the_qr", async () => {
   expect(qr.querySelector("path")?.getAttribute("onload")).toBeNull();
   expect(qr.querySelector("path")?.getAttribute("d")).toBe("M0 0h1v1z");
 });
+
+it("add_device_draws_no_partial_qr_when_any_path_is_bad", async () => {
+  api.invite.mockResolvedValue({
+    text: "mesh1x",
+    qrSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 9 9"><path d="M0 0h1v1z"/><path d="M0 0a1 1 0 0 1 2 2"/></svg>',
+    expiresAtMs: t + 900_000,
+  });
+  const { container } = render(AddDevice, { now });
+  await fireEvent.click(screen.getByRole("button", { name: "Create invite" }));
+  await screen.findByRole("timer");
+  expect(container.querySelector("svg.qr")).toBeNull();
+  expect(screen.getByText(/couldn't be drawn/)).toBeInTheDocument();
+  expect(screen.getByText("mesh1x")).toBeInTheDocument();
+});

@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 use aegis_sync_core::auth::verify_account_root;
 use aegis_sync_core::devices::{
-    AccountFacts, DeviceFacts, LabelFact, is_member, is_pending, label, may_remove, owner,
+    AccountFacts, ApprovedFact, DeviceFacts, LabelFact, is_member, is_pending, label, may_remove,
+    owner,
 };
 use aegis_sync_core::wire::MAX_LABEL_LEN;
 use serde::Deserialize;
@@ -242,8 +243,16 @@ pub fn approve(body: &[u8], authz: Option<&str>) -> Resp {
         if !is_pending(&facts, &t.device_id) {
             return Err(404);
         }
-        kv::set_add(&keys::approved_set(&caller.account), t.device_id.as_bytes());
-        store::touch_seen(&caller.account, &t.device_id, auth::now_ms());
+        // The approval carries its time: `owner` ranks approved joiners by WHEN they were
+        // admitted, so approving a device that asked earlier never moves the role.
+        let now = auth::now_ms();
+        let fact = ApprovedFact {
+            device_id: t.device_id.clone(),
+            approved_ms: now,
+        };
+        let member = serde_json::to_vec(&fact).expect("an ApprovedFact serializes");
+        kv::set_add(&keys::approved_set(&caller.account), &member);
+        store::touch_seen(&caller.account, &t.device_id, now);
         Ok(())
     })();
     match result {

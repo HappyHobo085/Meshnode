@@ -3,7 +3,7 @@
 ## aegis-sync-core
 
 - Source: Aegis repository, `sync-server/core`
-- Commit: fefa6d0055048e3712a4257b09e4e933ee1df217
+- Commit: 71e78da3b2a8a09c0e461b854567a0615491dddf
 - Licence: AGPL-3.0-only (same as Meshnode)
 - Destination: `vendor/aegis-sync-core`
 

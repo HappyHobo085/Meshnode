@@ -1,7 +1,7 @@
 //! Typed access to `meshnode:kv` in the layout of [`crate::keys`].
 use std::collections::BTreeSet;
 
-use aegis_sync_core::devices::{AccountFacts, DeviceFacts, LabelFact};
+use aegis_sync_core::devices::{AccountFacts, ApprovedFact, DeviceFacts, LabelFact};
 use aegis_sync_core::order::order_bytes;
 use aegis_sync_core::wire::{WireRecord, hlc_key};
 use serde_json::Value;
@@ -48,15 +48,22 @@ pub fn account_facts(acct: &str) -> AccountFacts {
         .filter_map(|m| serde_json::from_slice(&m).ok())
         .collect();
     let pending = id_set(&keys::pending_set(acct));
-    let approved = id_set(&keys::approved_set(acct));
+    let approvals: Vec<ApprovedFact> = members(&keys::approved_set(acct))
+        .into_iter()
+        .filter_map(|m| serde_json::from_slice(&m).ok())
+        .collect();
     let revoked = id_set(&keys::revoked_set(acct));
-    AccountFacts {
+    let mut facts = AccountFacts {
         devices,
         pending,
-        approved,
         revoked,
-        labels: Vec::new(),
+        ..AccountFacts::default()
+    };
+    // The earliest approval of each device (`AccountFacts::approve` folds in any order).
+    for a in approvals {
+        facts.approve(a);
     }
+    facts
 }
 
 /// The account's label changes (`LabelFact`s), as this node sees them.
@@ -150,7 +157,15 @@ pub fn stored_meta(key: &str) -> Option<Stored> {
 /// `ns` + `uuid` far longer than a real client's) is stored without one, and so is never
 /// counted or pruned by retention: retention reclaims space, it never decides what a client
 /// sees, so this refuses nothing.
-pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) {
+///
+/// Returns whether the record is now stored. A record over a key this node had stored is
+/// always stored (the LWW pre-check let only a strictly newer `hlc` through, and the stored
+/// order is that `hlc`'s). A key that read as absent may still hold the ORDERED mesh tombstone
+/// retention left when it pruned that uuid (`retention.rs`), which outranks an older `hlc`:
+/// the store then keeps the tombstone and drops this write, so that case re-reads the key, and
+/// the retention-index key just written for it is deleted again. The `hlcidx` member stays
+/// (grow-only; its candidate is re-checked when read).
+pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) -> bool {
     let bytes = serde_json::to_vec(rec).expect("a WireRecord serializes");
     let tomb = keys::tomb_key(acct, ns, &rec.hlc, &rec.uuid);
     if rec.deleted && tomb.len() <= keys::MAX_KEY {
@@ -162,12 +177,22 @@ pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) 
         &order_bytes(&rec.hlc),
         Some(&bytes),
     );
+    if old.is_none() {
+        let want = hlc_key(&rec.hlc);
+        let stored =
+            stored_hlc(&keys::rec_key(acct, ns, &rec.uuid)).is_some_and(|h| hlc_key(&h) == want);
+        if !stored && rec.deleted && tomb.len() <= keys::MAX_KEY {
+            store::delete(&tomb);
+        }
+        return stored;
+    }
     if let Some(old) = old.filter(|o| o.deleted) {
         let old_tomb = keys::tomb_key(acct, ns, &old.hlc, &rec.uuid);
         if old_tomb.len() <= keys::MAX_KEY {
             store::delete(&old_tomb);
         }
     }
+    true
 }
 
 /// The mesh tie rule: does another live record (tombstones included) of `(acct, ns)` with a

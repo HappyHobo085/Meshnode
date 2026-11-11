@@ -7,6 +7,9 @@
 //! second build of the service with its test-only `test-caps` feature (lowered caps, see
 //! `services/aegis-sync/src/caps.rs`); production builds never enable it.
 
+// In-process nodes, for the test over the real replicated store.
+mod common;
+
 // The service's own key layout, so seeded state is exactly where the service reads it. Some
 // of it (the store bounds, the account prefix) only the service uses.
 #[allow(dead_code)]
@@ -18,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aegis_sync_core::auth::{AuthToken, MAX_TTL_MS, canonical};
-use aegis_sync_core::devices::{AccountFacts, DeviceFacts};
+use aegis_sync_core::devices::{AccountFacts, ApprovedFact, DeviceFacts};
 use aegis_sync_core::order::{order_bytes, tie_ord};
 use aegis_sync_core::page::{Page, page_sorted};
 use aegis_sync_core::vector::{self, Host, NOW_MS, Req, Tamper, Vector};
@@ -89,6 +92,22 @@ impl Svc {
 
     /// The status and the raw response body.
     async fn send_raw(&self, kv: &Arc<MemKv>, limits: Limits, req: &Req) -> (u16, Bytes) {
+        let backend: Arc<dyn KvBackend> = kv.clone();
+        self.send_to(backend, limits, req).await
+    }
+
+    /// [`Svc::call`] over any backend (the real store's `ServiceKv`, for one).
+    async fn call_on(&self, kv: &Arc<dyn KvBackend>, req: Req) -> (u16, Option<Value>) {
+        let (status, raw) = self.send_to(kv.clone(), SERVICE_LIMITS, &req).await;
+        (status, serde_json::from_slice(&raw).ok())
+    }
+
+    async fn send_to(
+        &self,
+        backend: Arc<dyn KvBackend>,
+        limits: Limits,
+        req: &Req,
+    ) -> (u16, Bytes) {
         let mut b = http::Request::builder()
             .method(req.method.as_str())
             .uri(format!("http://sync.mesh.localhost{}", req.path));
@@ -102,7 +121,6 @@ impl Svc {
             }
             None => Bytes::new(),
         };
-        let backend: Arc<dyn KvBackend> = kv.clone();
         let ctx = RequestCtx {
             service: "sync".into(),
             node_id: NodeId([7; 32]),
@@ -205,12 +223,20 @@ async fn seed_facts(kv: &MemKv, acct: &str, f: &AccountFacts) {
     }
     for (set, ids) in [
         (keys::pending_set(acct), &f.pending),
-        (keys::approved_set(acct), &f.approved),
         (keys::revoked_set(acct), &f.revoked),
     ] {
         for id in ids {
             kv.set_add(&set, id.as_bytes().to_vec()).await.unwrap();
         }
+    }
+    // Approvals are stored as `ApprovedFact`s, as the approve endpoint writes them.
+    for (id, ms) in &f.approved {
+        let fact = ApprovedFact {
+            device_id: id.clone(),
+            approved_ms: *ms,
+        };
+        let m = serde_json::to_vec(&fact).unwrap();
+        kv.set_add(&keys::approved_set(acct), m).await.unwrap();
     }
     for l in &f.labels {
         let m = serde_json::to_vec(l).unwrap();
@@ -350,13 +376,14 @@ async fn contract_vectors() {
         "bounds_bad_hlc_400",
         "bounds_label_too_long_413",
         "devices_owner_never_pending_ranks_first",
+        "devices_owner_stays_after_later_approval",
         "devices_pending_cap_429",
         "devices_owner_self_remove_handoff",
     ] {
         assert!(ran.contains(&want), "{want} did not run");
     }
     let devices = ran.iter().filter(|n| n.starts_with("devices_")).count();
-    assert_eq!(devices, 13, "every devices_* vector runs");
+    assert_eq!(devices, 14, "every devices_* vector runs");
     eprintln!("ran {} vectors: {ran:?}\nskipped: {skipped:?}", ran.len());
 }
 
@@ -505,7 +532,7 @@ async fn record_routes_admit_members_only() {
     let facts = AccountFacts {
         devices: vec![dev("D1", 1), dev("D2", 2), dev("D3", 3), dev("D4", 4)],
         pending: [id("D2"), id("D3")].into(),
-        approved: [id("D3")].into(),
+        approved: [(id("D3"), 3)].into(),
         revoked: [id("D4")].into(),
         ..AccountFacts::default()
     };
@@ -886,20 +913,23 @@ async fn replay_same_node_401() {
     assert_eq!(s.call(&kv, approve).await.0, 401, "a replayed approve");
 }
 
-/// D5 through the endpoints on one node: the first device owns the account; when it signs
-/// itself out the role passes to the OLDEST remaining member by `registered_ms`, not the
-/// lowest id; the new owner can act; the last member cannot be removed; the old owner is out
-/// for good.
+/// D5 through the endpoints on one node, with the clock moving. The first device owns the
+/// account. When it signs out, the role passes to the EARLIEST-APPROVED joiner: here the one
+/// that asked second and has the greater id, so neither request time nor id can pick it. That
+/// owner then approves the joiner that asked FIRST, and keeps the role (the review
+/// reproduction: ranking joiners by request time handed the account to the device just
+/// approved). The owner can act, the other joiner cannot, the last member cannot be removed,
+/// and the removed devices are out for good.
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_handoff_single_node() {
     let s = service().await;
     let kv = fresh_kv();
     let id = |d: &str| vector::device_id(d);
-    // The joiner with the GREATER id registers first, so only `registered_ms` can pick it.
-    let (early, late) = if id("D2") > id("D3") {
-        ("D2", "D3")
-    } else {
+    // `second` asks after `first` and has the greater id; it is approved first.
+    let (first, second) = if id("D2") > id("D3") {
         ("D3", "D2")
+    } else {
+        ("D2", "D3")
     };
     let created = s
         .call(&kv, register("A", "D1", "phone", auth("A", "D1", &nonce())))
@@ -908,7 +938,7 @@ async fn owner_handoff_single_node() {
         created,
         (200, Some(json!({ "ok": true, "pending": false })))
     );
-    for (dev, at) in [(early, NOW_MS + 10_000), (late, NOW_MS + 20_000)] {
+    for (dev, at) in [(first, NOW_MS + 10_000), (second, NOW_MS + 20_000)] {
         set_clock(&s, &kv, at);
         let joined = s
             .call(&kv, register("A", dev, dev, auth("A", dev, &nonce())))
@@ -918,54 +948,57 @@ async fn owner_handoff_single_node() {
     set_clock(&s, &kv, NOW_MS + 30_000);
     // A pending device cannot approve itself or another.
     let r = s
-        .call(&kv, act("/v1/devices/approve", "A", late, early))
+        .call(&kv, act("/v1/devices/approve", "A", first, second))
         .await;
     assert_eq!(r.0, 403);
-    for dev in [early, late] {
-        let r = s
-            .call(&kv, act("/v1/devices/approve", "A", "D1", dev))
-            .await;
-        assert_eq!(r, (200, Some(json!({ "ok": true }))));
-    }
+    let r = s
+        .call(&kv, act("/v1/devices/approve", "A", "D1", second))
+        .await;
+    assert_eq!(r, (200, Some(json!({ "ok": true }))));
     let list = |dev: &str| req("GET", "/v1/devices", auth("A", dev, &nonce()), None);
     let (status, body) = s.call(&kv, list("D1")).await;
     assert_eq!(status, 200);
     let want = json!({
         "devices": [
             { "deviceId": id("D1"), "label": "phone", "registeredMs": NOW_MS },
-            { "deviceId": id(early), "label": early, "registeredMs": NOW_MS + 10_000,
+            { "deviceId": id(second), "label": second, "registeredMs": NOW_MS + 20_000,
               "lastSeenMs": NOW_MS + 30_000 },
-            { "deviceId": id(late), "label": late, "registeredMs": NOW_MS + 20_000 },
         ],
-        "pending": [],
+        "pending": [{ "deviceId": id(first), "registeredMs": NOW_MS + 10_000 }],
         "ownerDeviceId": id("D1"),
     });
     assert!(vector::subset(&want, body.as_ref().unwrap()), "{body:?}");
 
-    // The owner signs itself out: the earlier joiner inherits.
+    // The owner signs itself out: the only (so the earliest-) approved joiner inherits.
     let r = s
         .call(&kv, act("/v1/devices/remove", "A", "D1", "D1"))
         .await;
     assert_eq!(r, (200, Some(json!({ "ok": true }))));
-    let body = s.call(&kv, list(late)).await.1.unwrap();
-    assert_eq!(body["ownerDeviceId"], json!(id(early)), "{body}");
-    assert_eq!(body["devices"].as_array().unwrap().len(), 2);
-    // The later joiner is not the owner; the new owner is.
+    // The new owner approves the device that asked earlier, and stays owner.
+    set_clock(&s, &kv, NOW_MS + 40_000);
     let r = s
-        .call(&kv, act("/v1/devices/remove", "A", late, early))
+        .call(&kv, act("/v1/devices/approve", "A", second, first))
+        .await;
+    assert_eq!(r, (200, Some(json!({ "ok": true }))));
+    let body = s.call(&kv, list(first)).await.1.unwrap();
+    assert_eq!(body["ownerDeviceId"], json!(id(second)), "{body}");
+    assert_eq!(body["devices"].as_array().unwrap().len(), 2);
+    // The later-approved joiner is not the owner; the owner is.
+    let r = s
+        .call(&kv, act("/v1/devices/remove", "A", first, second))
         .await;
     assert_eq!(r.0, 403);
     let r = s
-        .call(&kv, act("/v1/devices/remove", "A", early, late))
+        .call(&kv, act("/v1/devices/remove", "A", second, first))
         .await;
     assert_eq!(r.0, 200);
     // The last member cannot be removed.
     let r = s
-        .call(&kv, act("/v1/devices/remove", "A", early, early))
+        .call(&kv, act("/v1/devices/remove", "A", second, second))
         .await;
     assert_eq!(r.0, 409);
     // The old owner and the removed joiner are out, and cannot register back in.
-    for gone in ["D1", late] {
+    for gone in ["D1", first] {
         let get = req("GET", "/v1/records?ns=bm", auth("A", gone, &nonce()), None);
         assert_eq!(s.call(&kv, get).await.0, 403, "{gone} reads records");
         let back = register("A", gone, "again", auth("A", gone, &nonce()));
@@ -1279,8 +1312,122 @@ async fn retention_prunes_old_tombstones() {
     assert_eq!(served("bm").await.len(), 501);
 
     // This node's record counter: every key written, less every key pruned.
+    let records = 601 - 100 + 600 + 550 - 50;
+    assert_eq!(own_count(&kv, "records").await, Some(records));
+
+    // A stale copy of a pruned uuid (an hlc older than its tombstone's) answers 200 but is not
+    // stored (the store keeps the pruned key's ordered tombstone), and re-pushing it, however
+    // often, grows neither counter nor the tombstone index.
+    let bytes = own_count(&kv, "ct_bytes").await;
+    let stale = rec("t0000", old - DAY, 0, "node", "stale ciphertext");
+    let stale_tomb = tomb("t0001".into(), old - DAY);
+    for _ in 0..3 {
+        let r = s
+            .call(&kv, push("bm", vec![stale.clone(), stale_tomb.clone()]))
+            .await;
+        assert_eq!(r.0, 200);
+    }
+    assert_eq!(own_count(&kv, "records").await, Some(records));
+    assert_eq!(own_count(&kv, "ct_bytes").await, bytes);
     assert_eq!(
-        own_count(&kv, "records").await,
-        Some(601 - 100 + 600 + 550 - 50)
+        kv.get(&keys::rec_key(&a, "bm", "t0000")).await.unwrap(),
+        None
     );
+    let left = served("bm").await;
+    assert!(
+        !left.iter().any(|u| u == "t0000" || u == "t0001"),
+        "{left:?}"
+    );
+    let index = kv
+        .list_keys(&keys::tomb_prefix(&a, "bm"), None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        index.len(),
+        499,
+        "no index key for a write the store refused"
+    );
+}
+
+// ------------------------------------------------------------------------- real store
+
+/// Retention's ordered delete on the REAL replicated store (`mesh-store` through
+/// `ServiceKv`), not MemKv. After a prune, a stale older copy of the pruned uuid answers 200
+/// but is not resurrected: the key keeps the ordered mesh tombstone, the record stays out of
+/// GET, and re-pushing it grows no counter. A copy NEWER than the pruned tombstone is stored,
+/// as natively.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_store_prune_is_not_resurrected_by_a_stale_push() {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let dir = tempfile::tempdir().unwrap();
+    let node = mesh_core::Node::create_mesh(common::test_cfg(dir.path(), "a"))
+        .await
+        .unwrap();
+    let kv: Arc<dyn KvBackend> = Arc::new(mesh_services::ServiceKv::new(
+        node.store().clone(),
+        "sync".into(),
+    ));
+    let s = service().await;
+    let a = vector::account_id("A");
+    let reg = register("A", "D1", "phone", auth("A", "D1", &nonce()));
+    assert_eq!(s.call_on(&kv, reg).await.0, 200);
+    let push = |records: Vec<WireRecord>| {
+        let body = json!({ "ns": "bm", "records": records });
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+    };
+    let served = || async {
+        let get = req("GET", "/v1/records?ns=bm", auth("A", "D1", &nonce()), None);
+        let (status, body) = s.call_on(&kv, get).await;
+        assert_eq!(status, 200);
+        body.unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uuid"].as_str().unwrap().to_string())
+            .collect::<Vec<String>>()
+    };
+    let records_count = || async {
+        kv.get(&keys::count_key(&node_hex(), "records"))
+            .await
+            .unwrap()
+            .map(|v| String::from_utf8(v).unwrap())
+    };
+    let old = NOW_MS - 100 * DAY;
+
+    // 501 tombstones past the age floor: the oldest one is pruned.
+    let tombs: Vec<WireRecord> = (0..501)
+        .map(|i| WireRecord {
+            deleted: true,
+            ..rec(&format!("t{i:04}"), old + i * 1000, 0, "node", "")
+        })
+        .collect();
+    assert_eq!(s.call_on(&kv, push(tombs)).await.0, 200);
+    let left = served().await;
+    assert_eq!(left.len(), 500);
+    assert_eq!(left.first().map(String::as_str), Some("t0001"));
+    let key = keys::rec_key(&a, "bm", "t0000");
+    assert_eq!(
+        kv.get(&key).await.unwrap(),
+        None,
+        "pruned on the real store"
+    );
+    assert_eq!(records_count().await.as_deref(), Some("500"));
+
+    // A stale (older) live copy of the pruned uuid, pushed three times.
+    let stale = rec("t0000", old - DAY, 0, "node", "stale ciphertext");
+    for _ in 0..3 {
+        assert_eq!(s.call_on(&kv, push(vec![stale.clone()])).await.0, 200);
+    }
+    assert_eq!(kv.get(&key).await.unwrap(), None, "not resurrected");
+    assert!(!served().await.contains(&"t0000".to_string()));
+    assert_eq!(records_count().await.as_deref(), Some("500"), "no growth");
+
+    // A copy newer than the pruned tombstone is stored.
+    let newer = rec("t0000", NOW_MS - DAY, 0, "node", "back");
+    assert_eq!(s.call_on(&kv, push(vec![newer])).await.0, 200);
+    assert!(kv.get(&key).await.unwrap().is_some());
+    assert_eq!(served().await.first().map(String::as_str), Some("t0000"));
+    assert_eq!(records_count().await.as_deref(), Some("501"));
+
+    node.shutdown().await;
 }

@@ -8,7 +8,9 @@
 //! - `hlcidx/<acct>/<ns>/<hex(order_bytes(hlc))>`: grow-only set of uuids that were ever
 //!   written with that exact `hlc`. A candidate list for tie detection only.
 //! - `devices/<acct>`: grow-only set of `devices::DeviceFacts` JSON.
-//! - `pending/<acct>`, `approved/<acct>`, `revoked/<acct>`: grow-only sets of device ids.
+//! - `pending/<acct>`, `revoked/<acct>`: grow-only sets of device ids.
+//! - `approved/<acct>`: grow-only set of `devices::ApprovedFact` JSON (device id and the
+//!   approving node's `now_ms`); the earliest approval of a device is the one that counts.
 //! - `labels/<acct>`: grow-only set of `devices::LabelFact` JSON.
 //! - `seen/<acct>/<device>/<node-id-hex>`: one node's register of the device's `lastSeenMs`
 //!   (decimal); only that node writes it, and the newest across nodes is served.

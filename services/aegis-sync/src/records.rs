@@ -376,14 +376,20 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
             return Err(507);
         }
     }
+    // The counters count only what the store actually kept: a key that read as absent can
+    // still refuse an older write (a pruned uuid's ordered tombstone, see `put_record`), and a
+    // client re-pushing such a stale copy must not grow the counts on every push.
+    let mut stored_keys: i64 = 0;
     let mut ct_delta: i64 = 0;
     for (rec, old) in &writes {
-        ct_delta += rec.ct.len() as i64 - old.as_ref().map_or(0, |o| o.ct_len) as i64;
-        store::put_record(acct, ns, rec, old.as_ref());
+        if store::put_record(acct, ns, rec, old.as_ref()) {
+            stored_keys += i64::from(old.is_none());
+            ct_delta += rec.ct.len() as i64 - old.as_ref().map_or(0, |o| o.ct_len) as i64;
+        }
     }
     // Retention after the merge, as native reaps after it: this push's own namespace.
     let pruned = retention::prune(acct, ns, now);
-    caps::add(caps::RECORDS, new_keys as i64 - pruned.records);
+    caps::add(caps::RECORDS, stored_keys - pruned.records);
     caps::add(caps::CT_BYTES, ct_delta - pruned.ct_bytes);
     Ok(())
 }

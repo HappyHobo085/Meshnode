@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 /// The admin protocol version both sides send in [`Hello`].
 pub const PROTOCOL_VERSION: u32 = 1;
+/// The message of the `NotRunning` error a daemon in shutdown answers with (its node may
+/// be fine; the daemon is going away). Clients that talk to a separate daemon process treat
+/// it as the daemon being unreachable.
+pub const DAEMON_STOPPING: &str = "meshd is stopping";
 /// Largest file in a static upload (one [`FileData`] frame).
 pub const MAX_UPLOAD_FILE: u64 = 64 * 1024 * 1024;
 /// Most files in a static upload.

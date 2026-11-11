@@ -2,7 +2,10 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use mesh_admin::{AdminClient, AdminError, AdminRequest, AdminResponse, DeployOpts, Endpoint};
+use mesh_admin::{
+    AdminClient, AdminError, AdminRequest, AdminResponse, DAEMON_STOPPING, DeployOpts, Endpoint,
+    ErrorCode,
+};
 use tokio::sync::mpsc;
 
 use crate::error::{UiError, UiErrorCode};
@@ -34,6 +37,11 @@ fn map_error(e: AdminError) -> UiError {
     match e {
         AdminError::NotRunning => UiError::new(UiErrorCode::DaemonUnreachable, e.to_string()),
         AdminError::Busy => UiError::new(UiErrorCode::Busy, e.to_string()),
+        // A daemon in shutdown: on desktop it is going away, not a stopped node.
+        AdminError::Daemon {
+            code: ErrorCode::NotRunning,
+            message,
+        } if message == DAEMON_STOPPING => UiError::new(UiErrorCode::DaemonUnreachable, message),
         AdminError::Daemon { code, message } => (code, message).into(),
         AdminError::Io(_) => UiError::new(UiErrorCode::Io, e.to_string()),
         other => UiError::internal(other.to_string()),
@@ -119,5 +127,27 @@ impl AdminTransport for PipeTransport {
             let _ = progress.send(total).await;
         }
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopping_daemon_is_unreachable() {
+        // A daemon in shutdown answers NotRunning "meshd is stopping": on desktop that is
+        // a daemon going away (the banner and relocation), not a stopped node.
+        let e = map_error(AdminError::Daemon {
+            code: ErrorCode::NotRunning,
+            message: DAEMON_STOPPING.into(),
+        });
+        assert_eq!(e.code, UiErrorCode::DaemonUnreachable);
+        // A daemon whose node is not running (e.g. not initialised) still says so.
+        let e = map_error(AdminError::Daemon {
+            code: ErrorCode::NotRunning,
+            message: "the node is not running".into(),
+        });
+        assert_eq!(e.code, UiErrorCode::NotRunning);
     }
 }

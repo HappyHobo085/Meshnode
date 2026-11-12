@@ -51,6 +51,9 @@ pub enum SyncMsg {
         mesh: MeshId,
         vv: VersionVector,
         scope: Scope,
+        /// The sender is no source to restore from: its store is stale (spec §7) or it is
+        /// re-bootstrapping. A stale node re-bootstraps only from a peer that says `false`.
+        stale: bool,
     },
     Ops {
         ops: Vec<SignedOp>,
@@ -60,6 +63,12 @@ pub enum SyncMsg {
         upto: u64,
     },
     Done,
+    /// The sender now holds `vv` (it only grows): raises the bound the receiver checks
+    /// `Covered` markers against, without starting a round. Sent in live mode before a
+    /// marker above what the sender's `Hello` announced.
+    Advertise {
+        vv: VersionVector,
+    },
 }
 
 /// Splits ops into `SyncMsg::Ops` batches of at most 256 ops and 1 MiB (sum of encoded op sizes).
@@ -117,6 +126,7 @@ mod tests {
                 mesh: MeshId([7; 32]),
                 vv: VersionVector::default(),
                 scope,
+                stale: true,
             };
             assert_eq!(crate::decode::<SyncMsg>(&crate::encode(&m)).unwrap(), m);
         }

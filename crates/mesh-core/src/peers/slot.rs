@@ -281,6 +281,7 @@ impl SlotTask {
             serve_paused: env.serve_paused.clone(),
             signout: env.signout.clone(),
             incoming: Some(super::PeerManager::incoming_hook(&self.sh)),
+            pulls: env.pulls.clone(),
         };
         {
             let mut s = self.slot.lock();
@@ -351,6 +352,9 @@ impl SlotTask {
             // The session future already closed the connection with `PROTOCOL`.
             SessionEnd::Protocol(m) => warn!(peer, reason = %m, "protocol violation; closed"),
             SessionEnd::Store(e) => warn!(peer, error = %e, "store error; session closed"),
+            SessionEnd::PeerStale => {
+                info!(peer, "both stores are stale; not syncing with this peer");
+            }
             SessionEnd::Stale => {
                 warn!(peer, "store is stale; session stopped");
                 // A stale store must not serve (spec §7); the re-bootstrap clears this.

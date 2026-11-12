@@ -117,6 +117,8 @@ pub(crate) struct Inner {
     pub(crate) serve_paused: Arc<AtomicBool>,
     /// Held for a whole re-bootstrap run: one at a time.
     pub(crate) rebootstrap: tokio::sync::Mutex<()>,
+    /// Completed pulls from Full peers, per re-bootstrap epoch.
+    pub(crate) pulls: Arc<crate::sync::FullPulls>,
     /// Test hook: the next re-bootstrap stops the node right after its step 3.
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     pub(crate) crash_after_reset: AtomicBool,
@@ -461,9 +463,11 @@ pub(crate) async fn start(
         .map_err(join_err)??;
     let invites = Arc::new(Mutex::new(invites));
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
-    // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale.
-    // A removed node has nothing to rebuild (an interrupted run is dropped). Serving is
-    // paused before any session starts.
+    // Spec §7: a re-bootstrap is due at open if one was interrupted. A stale store is not
+    // reset at open: only once a Full peer that is not stale is there to restore from
+    // (a session then ends with `SessionEnd::Stale`; sub-spec 8a ruling C1). A removed
+    // node has nothing to rebuild (an interrupted run is dropped). Serving is paused
+    // before any session starts.
     let removed_self = snap.removed_by(&me).is_some();
     let dir = cfg.data_dir.clone();
     let pending = tokio::task::spawn_blocking(move || read_rebootstrap(&dir))
@@ -473,8 +477,7 @@ pub(crate) async fn start(
         warn!("this node was removed; dropping its interrupted re-bootstrap");
         remove_rebootstrap(&cfg.data_dir)?;
     }
-    let rebootstrap_due =
-        !removed_self && (pending.is_some() || store.call_raw(|s| s.is_stale()).await?);
+    let rebootstrap_due = !removed_self && pending.is_some();
     // The remembered peers of a resumed run: the emptied store holds no addresses.
     let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
         .filter(|_| rebootstrap_due)
@@ -491,6 +494,7 @@ pub(crate) async fn start(
     let lose_events = Arc::new(AtomicBool::new(false));
     let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
+    let pulls = Arc::new(crate::sync::FullPulls::default());
 
     if let Some(ms) = store.call_raw(|s| Ok(s.clock_floor_ahead_ms())).await? {
         warn!(ms, "HLC floor is ahead of the wall clock");
@@ -518,6 +522,7 @@ pub(crate) async fn start(
                 cfg.catch_up_on_incoming_after,
             )),
             on_catch_up: cfg.on_catch_up.clone(),
+            pulls: pulls.clone(),
         },
         cancel.child_token(),
     );
@@ -646,6 +651,7 @@ pub(crate) async fn start(
         status,
         serve_paused,
         rebootstrap: tokio::sync::Mutex::new(()),
+        pulls,
         crash_after_reset: AtomicBool::new(false),
         hold_before_reset: watch::Sender::new(false),
         network_changes: AtomicU64::new(0),
@@ -751,7 +757,8 @@ impl Node {
     }
 
     /// Whether a sync round has completed since this node started (sticky; no race with
-    /// `subscribe`).
+    /// `subscribe`). A round with a client counts: see [`NodeEvent::FirstSyncComplete`]
+    /// for what this does not promise.
     pub fn first_sync_complete(&self) -> bool {
         *self.inner.first_sync.borrow()
     }

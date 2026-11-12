@@ -187,6 +187,8 @@ pub(crate) struct PeerEnv {
     pub catch_up: Arc<CatchUp>,
     /// The host's hook for the catch-up's duration (see [`crate::NodeConfig::on_catch_up`]).
     pub on_catch_up: Option<CatchUpHook>,
+    /// Completed pulls from Full peers (re-bootstrap completion, ruling I2).
+    pub pulls: Arc<crate::sync::FullPulls>,
 }
 
 #[derive(Clone)]

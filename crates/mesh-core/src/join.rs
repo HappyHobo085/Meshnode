@@ -353,11 +353,15 @@ pub(crate) async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, 
         Ok(node) => node,
         Err(e) => {
             // Leave the directory reusable with the same ticket (the join is idempotent).
-            if let Err(e) = remove_genesis(&dir) {
-                warn!(error = %e, "could not remove mesh.json after a failed start");
-            }
-            if let Err(e) = remove_own_role(&dir) {
-                warn!(error = %e, "could not remove role.json after a failed start");
+            match remove_genesis(&dir) {
+                // `role.json` goes only with `mesh.json`: a `mesh.json` left behind
+                // without it would open a client joiner as Full.
+                Ok(()) => {
+                    if let Err(e) = remove_own_role(&dir) {
+                        warn!(error = %e, "could not remove role.json after a failed start");
+                    }
+                }
+                Err(e) => warn!(error = %e, "could not remove mesh.json after a failed start"),
             }
             return Err(e);
         }

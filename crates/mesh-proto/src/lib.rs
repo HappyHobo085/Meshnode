@@ -136,6 +136,10 @@ mod tests {
                 mesh: MeshId([7; 32]),
                 vv,
                 scope: crate::Scope::Full,
+                stale: false,
+            },
+            SyncMsg::Advertise {
+                vv: VersionVector::default(),
             },
             SyncMsg::Ops { ops: vec![op] },
             SyncMsg::Covered {

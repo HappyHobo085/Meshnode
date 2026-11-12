@@ -323,12 +323,16 @@ fn quiet() -> Timings {
 /// The founder's store (node 1) listing node 2 as a host and node 3 as a client, with some
 /// `app` ops of its own.
 fn founder_store(dir: &Path) -> StoreHandle {
+    founder_store_with_clock(dir).0
+}
+
+fn founder_store_with_clock(dir: &Path) -> (StoreHandle, ManualClock) {
     let clock = ManualClock::new(1_000_000);
     let s = CoreStore::open(
         &dir.join("a.redb"),
         mesh(),
         key(1),
-        DynClock(Arc::new(clock)),
+        DynClock(Arc::new(clock.clone())),
     )
     .unwrap();
     s.set_add(MESH_NS, MEMBERS, &member_bytes(&id(1), Role::Host))
@@ -341,7 +345,16 @@ fn founder_store(dir: &Path) -> StoreHandle {
         s.set("app", &format!("a{i}"), b"x").unwrap();
     }
     s.set("_mesh", "test/last", b"x").unwrap();
-    StoreHandle::new(Arc::new(s))
+    (StoreHandle::new(Arc::new(s)), clock)
+}
+
+/// The founder's store, stale: its last full sync was 81 days ago.
+fn stale_founder_store(dir: &Path) -> StoreHandle {
+    let (a, clock) = founder_store_with_clock(dir);
+    a.inner().mark_full_sync(0).unwrap();
+    clock.advance(81 * 86_400_000);
+    assert!(a.inner().is_stale().unwrap());
+    a
 }
 
 struct Raw {
@@ -391,10 +404,15 @@ fn run_against_raw(
 }
 
 fn hello(vv: VersionVector, scope: Scope) -> SyncMsg {
+    hello_stale(vv, scope, false)
+}
+
+fn hello_stale(vv: VersionVector, scope: Scope, stale: bool) -> SyncMsg {
     SyncMsg::Hello {
         mesh: mesh(),
         vv,
         scope,
+        stale,
     }
 }
 
@@ -507,4 +525,145 @@ async fn hello_announces_own_scope() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// Ruling C1: a stale store syncs on with a client (it serves it, says it is stale, and
+/// the round marks no full sync).
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_store_keeps_syncing_with_a_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let synced = a.inner().last_full_sync_ms().unwrap();
+    let (join, mut h, mut raw) = run_against_raw(&a, id(3));
+    raw.send(&hello(VersionVector::default(), Scope::client()))
+        .await;
+    match raw.recv().await {
+        Some(SyncMsg::Hello { stale, .. }) => assert!(stale, "says it is stale"),
+        other => panic!("{other:?}"),
+    }
+    let msgs = raw.until_done().await;
+    assert!(
+        msgs.iter().any(|m| matches!(m, SyncMsg::Ops { .. })),
+        "served"
+    );
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), synced);
+    assert!(!join.is_finished());
+}
+
+/// Ruling C1: a stale store meeting a fresh Full peer ends the session to re-bootstrap
+/// from it, without serving it.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_store_and_fresh_host_end_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let (join, _h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(matches!(end_of(join).await, SessionEnd::Stale));
+    // Nothing was sent to it.
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(1),
+            read_frame::<_, SyncMsg>(&mut raw.r, SYNC_MAX_FRAME)
+        )
+        .await,
+        Ok(Ok(None)) | Ok(Err(_))
+    ));
+}
+
+/// Ruling C1: two stale stores do not sync, and neither is told to re-bootstrap.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_store_and_stale_host_end_peer_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let vv = a.inner().version_vector().unwrap();
+    let (join, _h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello_stale(VersionVector::default(), Scope::Full, true))
+        .await;
+    assert!(matches!(end_of(join).await, SessionEnd::PeerStale));
+    assert_eq!(a.inner().version_vector().unwrap(), vv);
+}
+
+/// Ruling I3: in live mode, a client never gets a `Covered` above what the host has
+/// announced (`Hello` or `Advertise`), and the in-scope op behind it follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_markers_never_above_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    let me = id(1);
+    let vv = a.inner().version_vector().unwrap();
+    let (_join, h, mut raw) = run_against_raw(&a, id(3));
+    raw.send(&hello(vv.clone(), Scope::client())).await;
+    let mut told = match raw.recv().await {
+        Some(SyncMsg::Hello { vv, .. }) => vv,
+        other => panic!("{other:?}"),
+    };
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+
+    // Live: out-of-scope writes, then a `_mesh` write.
+    for i in 0..3 {
+        a.set("app", &format!("live{i}"), b"x".to_vec())
+            .await
+            .unwrap();
+    }
+    a.set(MESH_NS, "test/live", b"x".to_vec()).await.unwrap();
+    let want = a.inner().version_vector().unwrap().get(&me);
+    h.wake.notify_one();
+    let mut covered = 0;
+    loop {
+        match raw.recv().await {
+            Some(SyncMsg::Advertise { vv }) => told = vv,
+            Some(SyncMsg::Covered { origin, upto }) => {
+                assert!(
+                    upto <= told.get(&origin),
+                    "Covered upto {upto} above the announced {}",
+                    told.get(&origin)
+                );
+                covered += 1;
+            }
+            Some(SyncMsg::Ops { ops }) => {
+                assert!(ops.iter().all(|o| o.body.payload.ns() == MESH_NS));
+                if ops.iter().any(|o| o.body.seq == want) {
+                    break;
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(covered >= 1);
+}
+
+/// A client data dir without `role.json` (lost, or from before it existed) still opens as
+/// a client once its `members` record is in the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_dir_without_role_json_opens_partial() {
+    let d = dirs(2);
+    let a = founder(d[0].path()).await;
+    let c = join(
+        d[1].path(),
+        "c",
+        &a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    assert!(c.wait_first_sync(T).await);
+    let ic = c.node_id();
+    wait_until("C's member record", T, || async {
+        c.members()
+            .iter()
+            .any(|m| m.id == ic && m.role == Role::Client)
+    })
+    .await;
+    c.shutdown().await;
+    std::fs::remove_file(d[1].path().join("role.json")).unwrap();
+    let c = Node::open(test_cfg(d[1].path(), "c").0).await.unwrap();
+    assert_eq!(c.scope(), Scope::client());
+    assert!(matches!(
+        c.store().set("svc", "k", b"v".to_vec()).await,
+        Err(NodeError::Store(StoreError::OutOfScope { .. }))
+    ));
+    a.shutdown().await;
+    c.shutdown().await;
 }

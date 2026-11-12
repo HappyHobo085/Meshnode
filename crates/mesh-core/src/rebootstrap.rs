@@ -5,9 +5,15 @@
 //! It exports its unsynced own ops (to `rebootstrap.bin`, before anything is deleted),
 //! empties itself, pulls everything back from its peers, then re-applies the export.
 //!
-//! Detection: when the node opens (`rebootstrap.bin` exists, or the store is stale), and when
-//! a session ends with `SessionEnd::Stale`. Serving is paused (`serve_paused`) from the
-//! moment staleness is seen until step 7; sessions still receive and apply.
+//! Detection: when the node opens with `rebootstrap.bin` (an interrupted run resumes), and
+//! when a session ends with `SessionEnd::Stale`, which it does only when a Full peer that
+//! is not stale itself announced itself (sub-spec 8a ruling C1). A stale store is never
+//! reset without such a source: a stale host with only clients keeps serving them (rounds
+//! with clients do not refresh staleness), and two stale hosts do not sync with each other
+//! and neither resets (`SessionEnd::PeerStale`); both wait for a fresh Full peer. Serving
+//! is paused (`serve_paused`) from the reset decision until step 7; sessions still receive
+//! and apply. The run completes only after a completed pull from a Full peer since the
+//! reset (ruling I2), besides getting its own ops and `members` record back.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,8 +36,9 @@ use crate::node::{Inner, NodeStatus, publish_addr};
 /// How often step 4 re-checks `vv[self]` besides each `RoundComplete` (events are lossy).
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
-/// Runs the re-bootstrap at start (if `due`) and whenever a session reports a stale store.
-/// A failed run is retried after `backoff_max`.
+/// Runs the re-bootstrap at start (if `due`: an interrupted run) and whenever a session
+/// reports a stale store next to a fresh Full peer. A failed run is retried after
+/// `backoff_max`.
 pub(crate) async fn driver(
     inner: Arc<Inner>,
     stale: Arc<Mutex<mpsc::Receiver<NodeId>>>,
@@ -40,8 +47,10 @@ pub(crate) async fn driver(
     let mut stale = stale.lock().await;
     let cancel = inner.cancel.clone();
     let mut due = due;
+    // A stale store is reset only right after a session met a fresh Full peer.
+    let mut fresh_peer = false;
     loop {
-        if due && let Err(e) = run_rebootstrap(&inner).await {
+        if due && let Err(e) = run_rebootstrap(&inner, fresh_peer).await {
             error!(error = %e, "re-bootstrap failed; retrying");
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -56,13 +65,15 @@ pub(crate) async fn driver(
             },
         }
         due = true;
+        fresh_peer = true;
     }
 }
 
-/// Spec §7 steps 1–7. Does nothing (and lets sessions serve again) if the store is not stale
-/// and no re-bootstrap is pending. Returns early, leaving `rebootstrap.bin` for the next
-/// start, when the node is shut down meanwhile.
-pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
+/// Spec §7 steps 1–7. Does nothing (and lets sessions serve again) if no re-bootstrap is
+/// pending and the store is not stale, or is stale but `fresh_peer` is false (no Full,
+/// non-stale peer was just met to restore from; ruling C1). Returns early, leaving
+/// `rebootstrap.bin` for the next start, when the node is shut down meanwhile.
+pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(), NodeError> {
     let _one_at_a_time = inner.rebootstrap.lock().await;
     let dir = inner.cfg.data_dir.clone();
     if matches!(*inner.status.borrow(), NodeStatus::Removed { .. }) {
@@ -78,7 +89,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             file
         }
         None => {
-            if !inner.store.call_raw(|s| s.is_stale()).await? {
+            if !fresh_peer || !inner.store.call_raw(|s| s.is_stale()).await? {
                 resume_serving(inner);
                 return Ok(());
             }
@@ -145,6 +156,10 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             st.next_seq()
         })
         .await?;
+    // Only a pull answering a `Hello` sent from now on counts (ruling I2); new rounds send
+    // one with the emptied vector (a round in progress counts once the next one starts).
+    let epoch = inner.pulls.begin_epoch();
+    inner.peers.start_round_all();
     if next.saturating_sub(1) != file.last_seq {
         // An own op was written after the export: it is gone, and the store would refuse
         // every later local write. Never carry on silently.
@@ -170,7 +185,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     // 5. Then re-apply the export; retried until every exported op was accepted.
     let items = Arc::new(file.items);
     loop {
-        match wait_for_self_seq(inner, s).await? {
+        match wait_for_self_seq(inner, s, epoch).await? {
             Wait::Reached => {}
             Wait::Stopped => return Ok(()),
             Wait::Removed => {
@@ -311,9 +326,12 @@ fn resume_serving(inner: &Inner) {
     }
 }
 
-/// Waits until `vv[self] >= s` and this node's `members` record is back, checking after each completed round, each status change
-/// and every [`CHECK_EVERY`]; gives up if the node stops or is removed meanwhile.
-async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
+/// Waits until `vv[self] >= s`, this node's `members` record is back and a Full peer has
+/// answered a `Hello` sent in `epoch` with everything it holds (ruling I2: own ops back
+/// from a client alone leave every other namespace missing), checking after each
+/// completed round, each status change and every [`CHECK_EVERY`]; gives up if the node
+/// stops or is removed meanwhile.
+async fn wait_for_self_seq(inner: &Inner, s: u64, epoch: u64) -> Result<Wait, NodeError> {
     let (me, founder) = (inner.me, inner.genesis.founder);
     let mut events = inner.events.subscribe();
     let mut status = inner.status.subscribe();
@@ -342,12 +360,13 @@ async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
         if matches!(*status.borrow_and_update(), NodeStatus::Removed { .. }) {
             return Ok(Wait::Removed);
         }
-        if have >= s && member {
+        let pulled = inner.pulls.reached(epoch);
+        if have >= s && member && pulled {
             return Ok(Wait::Reached);
         }
         debug!(
             have,
-            s, member, "waiting for this node's synced ops and members record"
+            s, member, pulled, "waiting for own synced ops, members record and a Full pull"
         );
         loop {
             tokio::select! {

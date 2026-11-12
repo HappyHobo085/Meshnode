@@ -22,7 +22,7 @@ use mesh_store::{StoreError, SyncItem};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::config::Timings;
 use crate::db::StoreHandle;
@@ -63,12 +63,9 @@ pub enum SessionEnd {
     /// The peer broke the protocol; close with `PROTOCOL`.
     Protocol(String),
     Store(StoreError),
-    /// The store is stale and a Full peer that is not stale announced itself: the node
-    /// re-bootstraps from it (spec §7, sub-spec 8a ruling C1).
+    /// The store is stale and a Fresh Full peer announced itself: the node re-bootstraps
+    /// from it (spec §7, sub-spec 8a ruling C1c). Nothing was served to that peer.
     Stale,
-    /// This Full store is stale and so is the Full peer: neither is a source to restore
-    /// from, so they do not sync and neither resets (ruling C1). Redialed with backoff.
-    PeerStale,
 }
 
 /// Completed pulls from Full peers, per re-bootstrap epoch (sub-spec 8a ruling I2).
@@ -272,18 +269,23 @@ fn raise(vv: &mut VersionVector, origin: NodeId, seq: u64) {
     }
 }
 
-/// What a completed round with a Full peer of `peer` freshness records (spec §7 with
-/// sub-spec 8a C1b): a Fresh peer is a full sync; so is an Empty one unless this store is
-/// stale (an empty peer cannot refresh stale data); a Stale peer refreshes nothing, but an
-/// Empty store that took its data from it inherits its staleness.
-fn record_full_round(
+/// What a completed round records (spec §7 with sub-spec 8a C1c), by the freshness the
+/// peer announced in its `Hello`:
+/// - **Fresh:** refreshes this node's last-full-sync time. With a Full peer that is
+///   `mark_full_sync` (it also advances `synced_self_seq` to the peer's `vv[me]`); with a
+///   Partial peer the time only (its vector moves past what it filtered out).
+/// - **Stale:** refreshes nothing; a store that never synced inherits the peer's
+///   staleness ([`mesh_store::Store::inherit_full_sync`], clamped).
+/// - **Empty** (or unknown): nothing. Two Empty stores stay Empty.
+fn record_round(
     s: &crate::db::CoreStore,
     synced: u64,
+    peer_partial: bool,
     peer: Option<Freshness>,
 ) -> Result<(), StoreError> {
     match peer {
+        Some(Freshness::Fresh) if peer_partial => s.refresh_full_sync_time(),
         Some(Freshness::Fresh) => s.mark_full_sync(synced),
-        Some(Freshness::Empty) if !s.is_stale()? => s.mark_full_sync(synced),
         Some(Freshness::Stale { since_ms }) => s.inherit_full_sync(since_ms),
         Some(Freshness::Empty) | None => Ok(()),
     }
@@ -441,13 +443,8 @@ impl Session {
                 peer_fresh,
             )
         };
-        // A Partial peer's vector moves past what it filtered out, so its `vv[me]` does
-        // not prove it holds our ops, and a round with it is no full sync: marking one
-        // would let a re-bootstrap drop own ops only this node holds (spec §7).
-        if !partial {
-            self.call(move |s| record_full_round(s, synced, peer_fresh))
-                .await?;
-        }
+        self.call(move |s| record_round(s, synced, partial, peer_fresh))
+            .await?;
         self.ctx
             .metrics
             .rounds_completed
@@ -561,32 +558,19 @@ impl Session {
         }
     }
 
-    /// Spec §7 with sub-spec 8a rulings C1, C1b and A2, on each `Hello` while this store
-    /// is stale:
-    /// - a **Fresh** Full peer ends the session with [`SessionEnd::Stale`], so the node
-    ///   re-bootstraps from it (the only peer it ever resets from);
-    /// - if this store is Full, a **Stale** Full peer ends it with
-    ///   [`SessionEnd::PeerStale`]: neither serves the other nor resets;
-    /// - an **Empty** Full peer (never synced) is synced with: it holds nothing to
-    ///   resurrect, and takes this store's staleness with the data (`record_full_round`);
-    /// - a Partial peer (a client), or any peer when this store is Partial, is synced
-    ///   with as usual: they exchange only `_mesh`, which a stale host hands every client.
+    /// Spec §7 with sub-spec 8a ruling C1c, on each `Hello`: if this store is stale and the
+    /// peer is a **Fresh Full** peer, the session ends with [`SessionEnd::Stale`] before
+    /// anything is served to it, and the node re-bootstraps from it. That is the only
+    /// reset trigger. Staleness never blocks syncing otherwise: stale, Empty and Partial
+    /// peers are synced with as usual.
     async fn check_stale(&self, peer_scope: &Scope, peer: Freshness) -> Result<(), SessionEnd> {
-        if matches!(peer_scope, Scope::Partial(_)) || !self.call(|s| s.is_stale()).await? {
+        if matches!(peer_scope, Scope::Partial(_)) || peer != Freshness::Fresh {
             return Ok(());
         }
-        let own_full = self.call(|s| Ok(s.scope() == Scope::Full)).await?;
-        match peer {
-            Freshness::Fresh => Err(SessionEnd::Stale),
-            Freshness::Stale { .. } if own_full => {
-                info!(
-                    peer = %self.ctx.peer.short(),
-                    "this store and the peer's are both stale; not syncing with it"
-                );
-                Err(SessionEnd::PeerStale)
-            }
-            Freshness::Stale { .. } | Freshness::Empty => Ok(()),
+        if self.call(|s| s.is_stale()).await? {
+            return Err(SessionEnd::Stale);
         }
+        Ok(())
     }
 
     /// Refuses a peer whose announced scope contradicts its role in `_mesh` (host ⇔
@@ -772,19 +756,19 @@ impl Session {
         if self.paused() || !self.lock().live {
             return Ok(());
         }
-        // A stale Full store serves no Full peer but an Empty one (spec §7, C1b): it would
-        // hand on what the other replicas may have GC'd the tombstones of. Live mode from
-        // before the store went stale ends here; the peer's next `Hello` decides
-        // (`check_stale`).
+        // A stale store never serves a Fresh Full peer (spec §7, C1c): it would hand on what
+        // the other replicas may have GC'd the tombstones of; the peer's `Hello` makes it
+        // re-bootstrap instead. A Full peer whose freshness is unknown (forgotten when a
+        // round completes, as it may have changed) counts as Fresh until its next `Hello`.
         let gated = {
             let st = self.lock();
-            !st.peer_partial() && !matches!(st.peer_freshness, Some(Freshness::Empty))
+            !st.peer_partial()
+                && !matches!(
+                    st.peer_freshness,
+                    Some(Freshness::Empty | Freshness::Stale { .. })
+                )
         };
-        if gated
-            && self
-                .call(|s| Ok(s.scope() == Scope::Full && s.is_stale()?))
-                .await?
-        {
+        if gated && self.call(|s| s.is_stale()).await? {
             return Ok(());
         }
         let Some(gen_flushed) = self.flush(w).await? else {

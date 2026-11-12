@@ -233,22 +233,47 @@ impl<W: WallClock> Store<W> {
         Ok(())
     }
 
-    /// A store that never synced took everything from a peer whose last full sync was at
-    /// `at_ms` (a stale peer, sub-spec 8a C1b): records that time as its own, so it is as
-    /// stale as its source and never a restore source for that data. Does nothing once a
-    /// full sync is recorded. `synced_self_seq` is not touched: a stale source proves
-    /// nothing about this node's own ops.
+    /// A store that never synced completed a round with a stale peer whose last full sync
+    /// was at `at_ms` (sub-spec 8a C1c): records that time as its own, clamped to at most
+    /// `now - STALE_MS - 1`, so the store is stale like its source (whatever the peer
+    /// claims) and never a restore source for that data. Does nothing once a full sync is
+    /// recorded. `synced_self_seq` is not touched: a stale source proves nothing about this
+    /// node's own ops.
     pub fn inherit_full_sync(&self, at_ms: u64) -> Result<(), StoreError> {
-        let _clock = self.lock_clock();
+        let clock = self.lock_clock();
+        let latest_stale = clock
+            .wall()
+            .now_ms()
+            .saturating_sub(crate::STALE_MS)
+            .saturating_sub(1);
         let tx = self.db.begin_write()?;
         {
             let mut m = tx.open_table(META)?;
             if meta_u64(&m, meta::LAST_FULL_SYNC_MS)?.is_none() {
                 m.insert(
                     meta::LAST_FULL_SYNC_MS.as_bytes(),
-                    keys::u64_value(at_ms).as_slice(),
+                    keys::u64_value(at_ms.min(latest_stale)).as_slice(),
                 )?;
             }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A round with a Fresh peer that is no full replica (a client, sub-spec 8a C1c):
+    /// `last_full_sync_ms = wall.now_ms()`, like [`Store::mark_full_sync`], but
+    /// `synced_self_seq` is left as it is (a Partial peer's vector proves nothing about
+    /// this node's own ops).
+    pub fn refresh_full_sync_time(&self) -> Result<(), StoreError> {
+        let clock = self.lock_clock();
+        let now = clock.wall().now_ms();
+        let tx = self.db.begin_write()?;
+        {
+            let mut m = tx.open_table(META)?;
+            m.insert(
+                meta::LAST_FULL_SYNC_MS.as_bytes(),
+                keys::u64_value(now).as_slice(),
+            )?;
         }
         tx.commit()?;
         Ok(())

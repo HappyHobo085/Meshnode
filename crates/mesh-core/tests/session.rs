@@ -82,6 +82,8 @@ fn pair_nodes(dir: &std::path::Path, own_a: u64, own_b: u64) -> (TestNode, TestN
     let a = open(dir, 1, "a.redb");
     let b = open(dir, 2, "b.redb");
     let s = a.store.inner();
+    // The founder starts Fresh, as `Node::create_mesh` makes it (sub-spec 8a C1c).
+    s.mark_full_sync(0).unwrap();
     s.set_add(MESH_NS, MEMBERS, &member_bytes(&id(1), Role::Host))
         .unwrap();
     s.set_add(MESH_NS, MEMBERS, &member_bytes(&id(2), Role::Host))
@@ -453,6 +455,9 @@ async fn max_size_op_replicates() {
 async fn drop_mid_round_does_not_mark_sync() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = pair_nodes(dir.path(), 2000, 0);
+    // The founder starts Fresh; the dropped round must not record anything over that.
+    let a_synced = a.store.inner().last_full_sync_ms().unwrap();
+    let a_seq = a.store.inner().synced_self_seq().unwrap();
     let (side, mut raw) = run_against_raw(&a, b.id);
     // B has nothing: it says so and sends Done at once; A's own Done never goes out.
     raw.send(&SyncMsg::Hello {
@@ -473,7 +478,8 @@ async fn drop_mid_round_does_not_mark_sync() {
     }
     drop(raw);
     assert!(matches!(end_of(side).await, SessionEnd::Closed));
-    assert_eq!(a.store.inner().last_full_sync_ms().unwrap(), None);
+    assert_eq!(a.store.inner().last_full_sync_ms().unwrap(), a_synced);
+    assert_eq!(a.store.inner().synced_self_seq().unwrap(), a_seq);
     assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), None);
 
     let mut p = run_pair(&a, &b, quiet());

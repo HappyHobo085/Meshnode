@@ -531,16 +531,20 @@ async fn hello_announces_own_scope() {
     }
 }
 
-/// Ruling C1: a stale store syncs on with a client (it serves it, says it is stale, and
-/// the round marks no full sync).
+/// Ruling C1c: a stale store syncs on with a stale client (it serves it, says it is
+/// stale, and the round refreshes nothing).
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_store_keeps_syncing_with_a_client() {
     let dir = tempfile::tempdir().unwrap();
     let a = stale_founder_store(dir.path());
     let synced = a.inner().last_full_sync_ms().unwrap();
     let (join, mut h, mut raw) = run_against_raw(&a, id(3));
-    raw.send(&hello(VersionVector::default(), Scope::client()))
-        .await;
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::client(),
+        STALE,
+    ))
+    .await;
     match raw.recv().await {
         Some(SyncMsg::Hello { freshness, .. }) => {
             assert!(
@@ -582,17 +586,97 @@ async fn stale_store_and_fresh_host_end_stale() {
     ));
 }
 
-/// Ruling C1: two stale stores do not sync, and neither is told to re-bootstrap.
+/// Ruling C1c (replaces the C1 `PeerStale` refusal): two stale stores sync as usual; the
+/// round refreshes nothing and nothing resets.
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_store_and_stale_host_end_peer_stale() {
+async fn stale_store_syncs_with_stale_host() {
     let dir = tempfile::tempdir().unwrap();
     let a = stale_founder_store(dir.path());
-    let vv = a.inner().version_vector().unwrap();
-    let (join, _h, mut raw) = run_against_raw(&a, id(2));
+    let synced = a.inner().last_full_sync_ms().unwrap();
+    let (join, mut h, mut raw) = run_against_raw(&a, id(2));
     raw.send(&hello_with(VersionVector::default(), Scope::Full, STALE))
         .await;
-    assert!(matches!(end_of(join).await, SessionEnd::PeerStale));
-    assert_eq!(a.inner().version_vector().unwrap(), vv);
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    let msgs = raw.until_done().await;
+    assert!(
+        msgs.iter().any(|m| matches!(m, SyncMsg::Ops { .. })),
+        "served"
+    );
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), synced);
+    assert!(a.inner().is_stale().unwrap());
+    assert!(!join.is_finished());
+}
+
+/// Ruling C1c: a round with a Fresh client refreshes the last-full-sync time (a stale host
+/// turns Fresh through it) but not `synced_self_seq`.
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_client_round_refreshes_time_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let seq = a.inner().synced_self_seq().unwrap();
+    let mut vv = VersionVector::default();
+    vv.set(id(1), 100);
+    let (join, mut h, mut raw) = run_against_raw(&a, id(3));
+    raw.send(&hello(vv, Scope::client())).await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert!(!a.inner().is_stale().unwrap(), "refreshed by a Fresh peer");
+    assert_eq!(a.inner().synced_self_seq().unwrap(), seq);
+    assert!(!join.is_finished());
+}
+
+/// Ruling C1c: two Empty stores that complete a round both stay Empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_pair_stays_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
+    let (join, mut h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Empty,
+    ))
+    .await;
+    match raw.recv().await {
+        Some(SyncMsg::Hello { freshness, .. }) => assert_eq!(freshness, Freshness::Empty),
+        other => panic!("{other:?}"),
+    }
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
+    assert_eq!(a.inner().synced_self_seq().unwrap(), None);
+    assert!(!join.is_finished());
+}
+
+/// Ruling C1c: an inherited `since_ms` is clamped, so the store is stale whatever a stale
+/// peer claims.
+#[tokio::test(flavor = "multi_thread")]
+async fn inherited_staleness_is_clamped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, clock) = founder_store_with_clock(dir.path());
+    clock.advance(200 * 86_400_000);
+    let now = mesh_hlc::WallClock::now_ms(&clock);
+    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    // A "stale" peer whose time is recent (lie or clock skew).
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Stale { since_ms: now },
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    let t = a.inner().last_full_sync_ms().unwrap().unwrap();
+    assert_eq!(t, now - mesh_store::STALE_MS - 1);
+    assert!(a.inner().is_stale().unwrap());
 }
 
 /// Ruling I3: in live mode, a client never gets a `Covered` above what the host has

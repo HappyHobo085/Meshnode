@@ -704,6 +704,11 @@ impl Node {
         let node = start(cfg, key, genesis, Vec::new()).await?;
         let store = node.store().clone();
         let r = async {
+            // A new mesh's founder holds all of it: it starts Fresh (sub-spec 8a C1c), so
+            // the members it brings in become Fresh through it. Without this no node of a
+            // new mesh would ever be Fresh (an Empty pair stays Empty) and staleness would
+            // never apply.
+            store.call_raw(|s| s.mark_full_sync(0)).await?;
             store
                 .set_add(MESH_NS, MEMBERS, member_bytes(&me, Role::Host).to_vec())
                 .await?;

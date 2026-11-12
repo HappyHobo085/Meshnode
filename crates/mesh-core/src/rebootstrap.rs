@@ -6,12 +6,15 @@
 //! empties itself, pulls everything back from its peers, then re-applies the export.
 //!
 //! Detection: when the node opens with `rebootstrap.bin` (an interrupted run resumes), and
-//! when a session ends with `SessionEnd::Stale`, which it does only when a Full peer that
-//! is not stale itself announced itself (sub-spec 8a ruling C1). A stale store is never
-//! reset without such a source: a stale host with only clients keeps serving them (rounds
-//! with clients do not refresh staleness), and two stale hosts do not sync with each other
-//! and neither resets (`SessionEnd::PeerStale`); both wait for a fresh Full peer. Serving
-//! is paused (`serve_paused`) from the reset decision until step 7; sessions still receive
+//! when a session ends with `SessionEnd::Stale`, which it does only when this store is
+//! stale and a **Fresh Full** peer announced itself (sub-spec 8a ruling C1c). A stale
+//! store is never reset otherwise, and staleness never blocks syncing: a stale node syncs
+//! with stale, Empty and Partial peers as usual. A round with a Fresh peer (host or
+//! client) refreshes the last full sync; one with a Stale or Empty peer refreshes nothing,
+//! and a never-synced (Empty) store inherits a Stale peer's staleness. So a mesh where
+//! every node is stale stays stale but fully working (no owner action is needed): all its
+//! nodes keep syncing, and they re-bootstrap once a Fresh Full peer appears. Serving is
+//! paused (`serve_paused`) from the reset decision until step 7; sessions still receive
 //! and apply. The run completes only after a completed pull from a Full peer since the
 //! reset (ruling I2), besides getting its own ops and `members` record back.
 

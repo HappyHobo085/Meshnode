@@ -13,7 +13,9 @@ use serde::Deserialize;
 use serde_json::json;
 use wstd::http::{Body, HeaderValue, Response};
 
-use crate::caps::{self, MAX_RECORDS_PER_ACCOUNT, MAX_TOTAL_CT_BYTES, MAX_TOTAL_RECORDS};
+use crate::caps::{
+    self, MAX_HLCIDX_PER_ACCOUNT, MAX_RECORDS_PER_ACCOUNT, MAX_TOTAL_CT_BYTES, MAX_TOTAL_RECORDS,
+};
 use crate::http::{Resp, json, query_pairs, status};
 use crate::keys;
 use crate::meshnode::kv::store as kv;
@@ -376,19 +378,42 @@ fn post_inner(body: &[u8], authz: Option<&str>) -> Result<(), u16> {
             return Err(507);
         }
     }
+    // The tie index grows by one permanent member per new `(uuid, hlc)`, updates included, so
+    // the members the account adds are capped too (`caps.rs`), checked for the whole request
+    // before anything is written. A write over a stored record is always at a new hlc for its
+    // uuid (strictly newer than any it was stored at). A key that read as absent may be a
+    // pruned uuid re-pushed at an hlc it already has a member for, which adds nothing, so that
+    // case asks the set: a client re-pushing a stale copy does not grow the count every push.
+    let idx_added = writes
+        .iter()
+        .filter(|(rec, old)| {
+            old.is_some()
+                || !store::has_member(&keys::hlcidx_set(acct, ns, &rec.hlc), rec.uuid.as_bytes())
+        })
+        .count() as u64;
+    if idx_added > 0
+        && !caps::fits(
+            caps::hlcidx_members(acct),
+            idx_added,
+            MAX_HLCIDX_PER_ACCOUNT,
+        )
+    {
+        return Err(507);
+    }
     // The counters count only what the store actually kept: a key that read as absent can
     // still refuse an older write (a pruned uuid's ordered tombstone, see `put_record`), and a
     // client re-pushing such a stale copy must not grow the counts on every push.
     let mut stored_keys: i64 = 0;
     let mut ct_delta: i64 = 0;
     for (rec, old) in &writes {
-        if store::put_record(acct, ns, rec, old.as_ref()) {
+        if store::put_record(acct, ns, rec, old.as_ref(), now) {
             stored_keys += i64::from(old.is_none());
             ct_delta += rec.ct.len() as i64 - old.as_ref().map_or(0, |o| o.ct_len) as i64;
         }
     }
     // Retention after the merge, as native reaps after it: this push's own namespace.
     let pruned = retention::prune(acct, ns, now);
+    caps::add_hlcidx(acct, idx_added);
     caps::add(caps::RECORDS, stored_keys - pruned.records);
     caps::add(caps::CT_BYTES, ct_delta - pruned.ct_bytes);
     Ok(())

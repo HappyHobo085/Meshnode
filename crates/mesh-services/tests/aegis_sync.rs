@@ -35,7 +35,11 @@ use mesh_runtime::test_fixtures::{aegis_sync_wasm, aegis_sync_wasm_test_caps};
 use mesh_runtime::{KvBackend, Loaded, MemKv, RequestCtx, Runtime, RuntimeConfig};
 use serde_json::{Value, json};
 
-/// The service's deploy defaults (spec §5.3): 64 MB, 30 s, 8 MiB.
+/// The limits the documented deploy sets (spec §5.3, `docs/manual-checks/sub-spec-7.md`):
+/// `meshd deploy wasm sync <file> --memory-mb 64 --timeout-ms 30000 --max-body 8388608`.
+/// These are NOT the daemon's defaults: a deploy without the flags gets a 10 s timeout
+/// (`Limits::default()`). `apps/meshd` pins what the flags produce
+/// (`deploy_wasm_limit_flags_set_the_documented_sync_limits`).
 const SERVICE_LIMITS: Limits = Limits {
     memory_mb: 64,
     request_timeout_ms: 30_000,
@@ -68,6 +72,7 @@ mod test_caps {
     pub const MAX_TOTAL_RECORDS: usize = 4;
     pub const MAX_TOTAL_CT_BYTES: u64 = 40;
     pub const MAX_SEEN_NONCES_PER_DEVICE: usize = 10;
+    pub const MAX_HLCIDX_PER_ACCOUNT: u64 = 8;
 }
 
 async fn service_from(path: std::path::PathBuf) -> Svc {
@@ -205,6 +210,14 @@ async fn own_count(kv: &MemKv, metric: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|v| String::from_utf8(v).unwrap().parse().unwrap())
+}
+
+/// The `hlcidx` members this node added for `acct` (0 before the first).
+async fn hlcidx_count(kv: &MemKv, acct: &str) -> i64 {
+    kv.get(&keys::hlcidx_count_key(acct, &node_hex()))
+        .await
+        .unwrap()
+        .map_or(0, |v| String::from_utf8(v).unwrap().parse().unwrap())
 }
 
 /// A fresh hex nonce per call.
@@ -827,8 +840,8 @@ async fn paging_large_namespace() {
 }
 
 /// A namespace whose records add up to far more than the 6 MiB page budget (640 records of
-/// 64 KiB ciphertext, about 40 MiB) is served across several pages under the service's
-/// default limits (64 MB, 30 s, 8 MiB body): every record exactly once, every response body at
+/// 64 KiB ciphertext, about 40 MiB) is served across several pages under the documented
+/// deploy limits (64 MB, 30 s, 8 MiB body): every record exactly once, every response body at
 /// most 6 MiB.
 #[tokio::test(flavor = "multi_thread")]
 async fn paging_byte_budget_spans_pages() {
@@ -1275,7 +1288,10 @@ async fn nonce_cap_default_is_2000() {
 // ------------------------------------------------------------------------- retention
 
 /// Native retention after a push: per `(account, ns)`, tombstones past the newest 500 AND
-/// older than 90 days are pruned; live records never; fresh tombstones never, however many.
+/// stored on this node more than 90 days ago are pruned; live records never; fresh tombstones
+/// never, however many. The age floor counts from when the node first stored a tombstone,
+/// not from the client's `hlc.wall_ms`: these tombstones are all stamped 100 days in the past,
+/// and nothing goes until the node's clock has moved 90 days on.
 #[tokio::test(flavor = "multi_thread")]
 async fn retention_prunes_old_tombstones() {
     const DAY: i64 = 24 * 60 * 60 * 1000;
@@ -1288,15 +1304,20 @@ async fn retention_prunes_old_tombstones() {
         ct: String::new(),
         ..rec(&uuid, wall, 0, "node", "")
     };
-    let push = |ns: &str, records: Vec<WireRecord>| {
+    let push = |ns: &str, records: Vec<WireRecord>, at: i64| {
         let body = json!({ "ns": ns, "records": records });
-        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+        req(
+            "POST",
+            "/v1/records",
+            auth_at("A", "D1", &nonce(), at),
+            Some(body),
+        )
     };
-    let served = |ns: &str| {
+    let served = |ns: &str, at: i64| {
         let get = req(
             "GET",
             &format!("/v1/records?ns={ns}"),
-            auth("A", "D1", &nonce()),
+            auth_at("A", "D1", &nonce(), at),
             None,
         );
         let s = &s;
@@ -1315,14 +1336,25 @@ async fn retention_prunes_old_tombstones() {
         }
     };
     let old = NOW_MS - 100 * DAY;
+    let later = NOW_MS + 91 * DAY;
 
-    // 600 old tombstones and one old live record: the 100 oldest tombstones go.
+    // Stored now: 600 old-stamped tombstones and one old live record in `bm`, 450 old-stamped
+    // tombstones in `mix`. Nothing is pruned yet.
     let mut bm: Vec<WireRecord> = (0..600)
         .map(|i| tomb(format!("t{i:04}"), old + i * 1000))
         .collect();
     bm.push(rec("live", old - DAY, 0, "node", "x"));
-    assert_eq!(s.call(&kv, push("bm", bm)).await.0, 200);
-    let left = served("bm").await;
+    assert_eq!(s.call(&kv, push("bm", bm, NOW_MS)).await.0, 200);
+    assert_eq!(served("bm", NOW_MS).await.len(), 601);
+    let mix: Vec<WireRecord> = (0..450)
+        .map(|i| tomb(format!("m{i:04}"), old + i))
+        .collect();
+    assert_eq!(s.call(&kv, push("mix", mix, NOW_MS)).await.0, 200);
+
+    // 91 days on, the next push to `bm` (an empty one) prunes its 100 oldest tombstones.
+    set_clock(&s, &kv, later);
+    assert_eq!(s.call(&kv, push("bm", vec![], later)).await.0, 200);
+    let left = served("bm", later).await;
     assert_eq!(left.len(), 501);
     assert_eq!(left[0], "live", "a live record is never pruned");
     let want: Vec<String> = (100..600).map(|i| format!("t{i:04}")).collect();
@@ -1337,56 +1369,61 @@ async fn retention_prunes_old_tombstones() {
         .unwrap();
     assert_eq!(index.len(), 500, "pruned tombstones leave the index");
 
-    // 600 tombstones younger than 90 days: all kept.
+    // 600 tombstones stored now: all kept, though they are as old by stamp as `bm`'s.
     let fresh: Vec<WireRecord> = (0..600)
-        .map(|i| tomb(format!("f{i:04}"), NOW_MS - DAY + i))
+        .map(|i| tomb(format!("f{i:04}"), old + i))
         .collect();
-    assert_eq!(s.call(&kv, push("fresh", fresh)).await.0, 200);
-    assert_eq!(served("fresh").await.len(), 600);
+    assert_eq!(s.call(&kv, push("fresh", fresh, later)).await.0, 200);
+    assert_eq!(served("fresh", later).await.len(), 600);
 
-    // 450 old + 100 fresh: 50 over the window, and the oldest 50 are old enough.
-    let mut mix: Vec<WireRecord> = (0..450)
-        .map(|i| tomb(format!("m{i:04}"), old + i))
+    // `mix`: the 450 stored 91 days ago + 100 stored now is 50 over the window, and the oldest
+    // 50 were stored long enough ago.
+    let newer: Vec<WireRecord> = (450..550)
+        .map(|i| tomb(format!("m{i:04}"), later - DAY + i))
         .collect();
-    mix.extend((450..550).map(|i| tomb(format!("m{i:04}"), NOW_MS - DAY + i)));
-    assert_eq!(s.call(&kv, push("mix", mix)).await.0, 200);
-    let left = served("mix").await;
+    assert_eq!(s.call(&kv, push("mix", newer, later)).await.0, 200);
+    let left = served("mix", later).await;
     assert_eq!(left.len(), 500);
     assert_eq!(left.first().map(String::as_str), Some("m0050"));
 
     // A record moved off a tombstone leaves the index; a later push prunes nothing more.
-    let revived = rec("t0100", NOW_MS - DAY, 0, "node", "back");
-    assert_eq!(s.call(&kv, push("bm", vec![revived])).await.0, 200);
+    let revived = rec("t0100", later - DAY, 0, "node", "back");
+    assert_eq!(s.call(&kv, push("bm", vec![revived], later)).await.0, 200);
     let index = kv
         .list_keys(&keys::tomb_prefix(&a, "bm"), None, 1000)
         .await
         .unwrap();
     assert_eq!(index.len(), 499);
-    assert_eq!(served("bm").await.len(), 501);
+    assert_eq!(served("bm", later).await.len(), 501);
 
     // This node's record counter: every key written, less every key pruned.
-    let records = 601 - 100 + 600 + 550 - 50;
+    let records = 601 - 100 + 450 + 600 + 100 - 50;
     assert_eq!(own_count(&kv, "records").await, Some(records));
 
     // A stale copy of a pruned uuid (an hlc older than its tombstone's) answers 200 but is not
     // stored (the store keeps the pruned key's ordered tombstone), and re-pushing it, however
-    // often, grows neither counter nor the tombstone index.
+    // often, grows neither counter nor the tombstone index. Its `hlcidx` member is added once
+    // (the first push is a new hlc for that uuid) and then counted no more.
     let bytes = own_count(&kv, "ct_bytes").await;
     let stale = rec("t0000", old - DAY, 0, "node", "stale ciphertext");
     let stale_tomb = tomb("t0001".into(), old - DAY);
-    for _ in 0..3 {
-        let r = s
-            .call(&kv, push("bm", vec![stale.clone(), stale_tomb.clone()]))
-            .await;
-        assert_eq!(r.0, 200);
+    let idx_before = hlcidx_count(&kv, &a).await;
+    let first = push("bm", vec![stale.clone(), stale_tomb.clone()], later);
+    assert_eq!(s.call(&kv, first).await.0, 200);
+    let idx_after = hlcidx_count(&kv, &a).await;
+    assert_eq!(idx_after, idx_before + 2, "two new (uuid, hlc) members");
+    for _ in 0..2 {
+        let again = push("bm", vec![stale.clone(), stale_tomb.clone()], later);
+        assert_eq!(s.call(&kv, again).await.0, 200);
     }
+    assert_eq!(hlcidx_count(&kv, &a).await, idx_after, "no recount");
     assert_eq!(own_count(&kv, "records").await, Some(records));
     assert_eq!(own_count(&kv, "ct_bytes").await, bytes);
     assert_eq!(
         kv.get(&keys::rec_key(&a, "bm", "t0000")).await.unwrap(),
         None
     );
-    let left = served("bm").await;
+    let left = served("bm", later).await;
     assert!(
         !left.iter().any(|u| u == "t0000" || u == "t0001"),
         "{left:?}"
@@ -1400,6 +1437,154 @@ async fn retention_prunes_old_tombstones() {
         499,
         "no index key for a write the store refused"
     );
+}
+
+/// I2(a): a client cannot get tombstones pruned at once by stamping them in the past. 600
+/// tombstones stamped in 1970 are all kept (and counted) until this node has held them for 90
+/// days; the index records when the node stored each one. An index value that does not read
+/// as a time starts its clock at the scan that finds it, never at the client's stamp.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_age_counts_from_node_storage_not_client_stamp() {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let push = |records: Vec<WireRecord>, at: i64| {
+        let body = json!({ "ns": "old", "records": records });
+        req(
+            "POST",
+            "/v1/records",
+            auth_at("A", "D1", &nonce(), at),
+            Some(body),
+        )
+    };
+    let tombs: Vec<WireRecord> = (0..600)
+        .map(|i| WireRecord {
+            deleted: true,
+            ..rec(&format!("o{i:04}"), i, 0, "node", "")
+        })
+        .collect();
+    assert_eq!(s.call(&kv, push(tombs, NOW_MS)).await.0, 200);
+    let prefix = keys::tomb_prefix(&a, "old");
+    let index = kv.list_keys(&prefix, None, 1000).await.unwrap();
+    assert_eq!(index.len(), 600, "none pruned");
+    for key in &index {
+        let at = kv.get(key).await.unwrap().unwrap();
+        assert_eq!(
+            at,
+            NOW_MS.to_string().into_bytes(),
+            "{key}: when it was stored"
+        );
+    }
+    assert_eq!(own_count(&kv, "records").await, Some(600));
+    let listed = kv
+        .list_keys(&keys::rec_prefix(&a, "old"), None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 600);
+
+    // One ms short of 90 days held: still nothing.
+    let short = NOW_MS + 90 * DAY - 1;
+    set_clock(&s, &kv, short);
+    assert_eq!(s.call(&kv, push(vec![], short)).await.0, 200);
+    assert_eq!(kv.list_keys(&prefix, None, 1000).await.unwrap().len(), 600);
+    assert_eq!(own_count(&kv, "records").await, Some(600));
+
+    // One index value of the oldest 100 does not read as a time.
+    let hlc50 = json!({ "wall_ms": 50, "counter": 0, "node": "node" });
+    let odd = keys::tomb_key(&a, "old", &hlc50, "o0050");
+    assert!(kv.get(&odd).await.unwrap().is_some());
+    kv.set(&odd, b"garbage".to_vec()).await.unwrap();
+
+    // At 90 days held, the oldest 100 by hlc are the candidates: 99 go, and the odd one stays,
+    // its clock started now.
+    let due = NOW_MS + 90 * DAY;
+    set_clock(&s, &kv, due);
+    assert_eq!(s.call(&kv, push(vec![], due)).await.0, 200);
+    let index = kv.list_keys(&prefix, None, 1000).await.unwrap();
+    assert_eq!(index.len(), 501);
+    assert_eq!(
+        kv.get(&odd).await.unwrap(),
+        Some(due.to_string().into_bytes()),
+        "the odd one's clock starts at the scan"
+    );
+    let kept = keys::rec_key(&a, "old", "o0050");
+    assert!(kv.get(&kept).await.unwrap().is_some());
+    let gone = keys::rec_key(&a, "old", "o0049");
+    assert_eq!(kv.get(&gone).await.unwrap(), None);
+    assert_eq!(own_count(&kv, "records").await, Some(501));
+    let listed = kv
+        .list_keys(&keys::rec_prefix(&a, "old"), None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 501, "the counter matches what is stored");
+}
+
+/// I2(b): every new `(uuid, hlc)` adds a permanent `hlcidx` member, so the members a node adds
+/// per account are counted (`idxcount/<acct>/<node>`) and capped at
+/// `MAX_HLCIDX_PER_ACCOUNT` (4 × `MAX_RECORDS_PER_ACCOUNT`; 8 under `test-caps`), summed over
+/// every node. A push that would pass the cap is refused whole with 507 before anything is
+/// written; a stale push (no write) adds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn caps_hlcidx_members_per_account_507() {
+    assert_eq!(test_caps::MAX_HLCIDX_PER_ACCOUNT, 8);
+    let s = service_test_caps().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let push = |acct: &str, dev: &str, records: Vec<WireRecord>| {
+        let body = json!({ "ns": "bm", "records": records });
+        req("POST", "/v1/records", auth(acct, dev, &nonce()), Some(body))
+    };
+    let stored_wall = |uuid: &str| {
+        let key = keys::rec_key(&a, "bm", uuid);
+        let kv = kv.clone();
+        async move {
+            let raw = kv.get(&key).await.unwrap().unwrap();
+            let v: Value = serde_json::from_slice(&raw).unwrap();
+            v["hlc"]["wall_ms"].as_i64().unwrap()
+        }
+    };
+
+    let two = vec![rec("r1", 1, 0, "n", "x"), rec("r2", 1, 0, "n", "x")];
+    assert_eq!(s.call(&kv, push("A", "D1", two)).await.0, 200);
+    assert_eq!(hlcidx_count(&kv, &a).await, 2);
+    // Three rounds of updates to both: 2 + 6 = 8, exactly at the cap.
+    for wall in 2..5 {
+        let both = vec![rec("r1", wall, 0, "n", "x"), rec("r2", wall, 0, "n", "x")];
+        assert_eq!(s.call(&kv, push("A", "D1", both)).await.0, 200);
+    }
+    assert_eq!(hlcidx_count(&kv, &a).await, 8);
+    // A stale push writes nothing and counts nothing.
+    let stale = vec![rec("r1", 2, 0, "n", "x")];
+    assert_eq!(s.call(&kv, push("A", "D1", stale)).await.0, 200);
+    assert_eq!(hlcidx_count(&kv, &a).await, 8);
+    // One more update is refused, and nothing of it is written.
+    let over = vec![rec("r1", 9, 0, "n", "y")];
+    assert_eq!(s.call(&kv, push("A", "D1", over)).await.0, 507);
+    assert_eq!(stored_wall("r1").await, 4);
+    let hlc9 = json!({ "wall_ms": 9, "counter": 0, "node": "n" });
+    let set = keys::hlcidx_set(&a, "bm", &hlc9);
+    assert!(kv.set_members(&set, None, 10).await.unwrap().is_empty());
+    assert_eq!(hlcidx_count(&kv, &a).await, 8);
+
+    // Another account has its own count.
+    let (b, d2) = (vector::account_id("B"), vector::device_id("D2"));
+    seed_member(&kv, &b, &d2).await;
+    let first = vec![rec("r1", 9, 0, "n", "y")];
+    assert_eq!(s.call(&kv, push("B", "D2", first)).await.0, 200);
+    assert_eq!(hlcidx_count(&kv, &b).await, 1);
+    // The cap is over every node's count: with 6 more from another node, B can add 1, not 2.
+    let elsewhere = hex::encode([9u8; 32]);
+    kv.set(&keys::hlcidx_count_key(&b, &elsewhere), b"6".to_vec())
+        .await
+        .unwrap();
+    let two_more = vec![rec("r2", 1, 0, "n", "y"), rec("r3", 1, 0, "n", "y")];
+    assert_eq!(s.call(&kv, push("B", "D2", two_more)).await.0, 507);
+    let one_more = vec![rec("r2", 1, 0, "n", "y")];
+    assert_eq!(s.call(&kv, push("B", "D2", one_more)).await.0, 200);
+    assert_eq!(hlcidx_count(&kv, &b).await, 2);
 }
 
 // ------------------------------------------------------------------------- real store
@@ -1424,12 +1609,24 @@ async fn real_store_prune_is_not_resurrected_by_a_stale_push() {
     let a = vector::account_id("A");
     let reg = register("A", "D1", "phone", auth("A", "D1", &nonce()));
     assert_eq!(s.call_on(&kv, reg).await.0, 200);
+    // The guest's clock (tokens are issued at it).
+    let at = std::cell::Cell::new(NOW_MS);
     let push = |records: Vec<WireRecord>| {
         let body = json!({ "ns": "bm", "records": records });
-        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+        req(
+            "POST",
+            "/v1/records",
+            auth_at("A", "D1", &nonce(), at.get()),
+            Some(body),
+        )
     };
     let served = || async {
-        let get = req("GET", "/v1/records?ns=bm", auth("A", "D1", &nonce()), None);
+        let get = req(
+            "GET",
+            "/v1/records?ns=bm",
+            auth_at("A", "D1", &nonce(), at.get()),
+            None,
+        );
         let (status, body) = s.call_on(&kv, get).await;
         assert_eq!(status, 200);
         body.unwrap()["records"]
@@ -1447,7 +1644,8 @@ async fn real_store_prune_is_not_resurrected_by_a_stale_push() {
     };
     let old = NOW_MS - 100 * DAY;
 
-    // 501 tombstones past the age floor: the oldest one is pruned.
+    // 501 tombstones stamped 100 days ago: kept until the node has held them 90 days, then
+    // the oldest one is pruned.
     let tombs: Vec<WireRecord> = (0..501)
         .map(|i| WireRecord {
             deleted: true,
@@ -1455,6 +1653,11 @@ async fn real_store_prune_is_not_resurrected_by_a_stale_push() {
         })
         .collect();
     assert_eq!(s.call_on(&kv, push(tombs)).await.0, 200);
+    assert_eq!(served().await.len(), 501);
+    assert_eq!(records_count().await.as_deref(), Some("501"));
+    at.set(NOW_MS + 91 * DAY);
+    s.rt.set_wall_clock_ms(Some(at.get()));
+    assert_eq!(s.call_on(&kv, push(vec![])).await.0, 200);
     let left = served().await;
     assert_eq!(left.len(), 500);
     assert_eq!(left.first().map(String::as_str), Some("t0001"));
@@ -1476,7 +1679,7 @@ async fn real_store_prune_is_not_resurrected_by_a_stale_push() {
     assert_eq!(records_count().await.as_deref(), Some("500"), "no growth");
 
     // A copy newer than the pruned tombstone is stored.
-    let newer = rec("t0000", NOW_MS - DAY, 0, "node", "back");
+    let newer = rec("t0000", at.get() - DAY, 0, "node", "back");
     assert_eq!(s.call_on(&kv, push(vec![newer])).await.0, 200);
     assert!(kv.get(&key).await.unwrap().is_some());
     assert_eq!(served().await.first().map(String::as_str), Some("t0000"));

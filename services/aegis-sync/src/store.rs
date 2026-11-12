@@ -25,6 +25,25 @@ fn members(set: &str) -> Vec<Vec<u8>> {
     }
 }
 
+/// Is `member` (a UTF-8 string's bytes, as every member this service writes) in `set`? One
+/// `set-members` call, listing from just below `member`: `member` with its last byte lowered
+/// by one and `0xFF` appended. Anything between that and `member` would contain `0xFF` after
+/// the shared prefix, which no UTF-8 string does, so the first member listed is `member`
+/// exactly when it is in the set. (A last byte of 0 never occurs: NUL is refused in a uuid.)
+pub fn has_member(set: &str, member: &[u8]) -> bool {
+    let Some((&last, head)) = member.split_last() else {
+        return false;
+    };
+    if last == 0 {
+        return members(set).iter().any(|m| m == member);
+    }
+    let mut below = head.to_vec();
+    below.extend_from_slice(&[last - 1, 0xFF]);
+    store::set_members(set, Some(&below), 1)
+        .first()
+        .is_some_and(|m| m == member)
+}
+
 fn id_set(set: &str) -> BTreeSet<String> {
     members(set)
         .into_iter()
@@ -148,10 +167,14 @@ pub fn stored_meta(key: &str) -> Option<Stored> {
 }
 
 /// Writes `rec` (whose `uuid` is set and `ord` is none) as `(acct, ns, rec.uuid)`, ordered by
-/// its client `hlc`, over `old` (what this node had stored there). The tie-candidate index
-/// entry and, for a tombstone, its retention-index key go first, so a replica that has the
-/// record also has them; the retention-index key of an `old` tombstone goes after, once the
-/// uuid has moved off it.
+/// its client `hlc`, over `old` (what this node had stored there), at node time `now_ms`. The
+/// tie-candidate index entry and, for a tombstone, its retention-index key go first, so a
+/// replica that has the record also has them; the retention-index key of an `old` tombstone
+/// goes after, once the uuid has moved off it.
+///
+/// The retention-index key's value is when a node first stored the tombstone: `now_ms`, or
+/// the time already there if it is earlier. Retention's age floor counts from it, never from
+/// the client's `hlc.wall_ms`, which the client chooses (`retention.rs`).
 ///
 /// A tombstone whose index key would be over the store's key limit (possible only for an
 /// `ns` + `uuid` far longer than a real client's) is stored without one, and so is never
@@ -165,11 +188,18 @@ pub fn stored_meta(key: &str) -> Option<Stored> {
 /// the store then keeps the tombstone and drops this write, so that case re-reads the key, and
 /// the retention-index key just written for it is deleted again. The `hlcidx` member stays
 /// (grow-only; its candidate is re-checked when read).
-pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) -> bool {
+pub fn put_record(
+    acct: &str,
+    ns: &str,
+    rec: &WireRecord,
+    old: Option<&Stored>,
+    now_ms: i64,
+) -> bool {
     let bytes = serde_json::to_vec(rec).expect("a WireRecord serializes");
     let tomb = keys::tomb_key(acct, ns, &rec.hlc, &rec.uuid);
     if rec.deleted && tomb.len() <= keys::MAX_KEY {
-        store::set(&tomb, b"1");
+        let first = stored_ms(&tomb).map_or(now_ms, |t| t.min(now_ms));
+        store::set(&tomb, first.to_string().as_bytes());
     }
     store::set_add(&keys::hlcidx_set(acct, ns, &rec.hlc), rec.uuid.as_bytes());
     store::set_ordered(
@@ -193,6 +223,11 @@ pub fn put_record(acct: &str, ns: &str, rec: &WireRecord, old: Option<&Stored>) 
         }
     }
     true
+}
+
+/// A decimal node-clock time stored at `key` (a retention-index value), if it reads as one.
+pub fn stored_ms(key: &str) -> Option<i64> {
+    store::get(key).and_then(|v| std::str::from_utf8(&v).ok()?.parse().ok())
 }
 
 /// The mesh tie rule: does another live record (tombstones included) of `(acct, ns)` with a

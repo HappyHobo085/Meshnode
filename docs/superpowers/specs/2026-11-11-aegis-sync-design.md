@@ -121,7 +121,11 @@ split are both "owner" until heal; afterwards the earlier one is owner and the o
 
 ### 5.3 Build and deploy
 `scripts/build-services.sh` builds `services/aegis-sync` → `target/wasm32-wasip2/release/aegis_sync.wasm`;
-deploy with `meshd deploy wasm sync <file>` (or the UI). Default limits: 64 MB memory, 30 s timeout, 8 MiB body.
+deploy with `meshd deploy wasm sync <file> --memory-mb 64 --timeout-ms 30000 --max-body 8388608` (or the UI).
+The service runs with 64 MB memory, a 30 s timeout and an 8 MiB body. These are *not* all the daemon's defaults:
+`Limits::default()` has a 10 s timeout, so the flags are part of the deploy *(as built)*. The UI Deploy form has
+no limit fields and deploys with the defaults, so after a UI deploy set Memory 64 MB, Request timeout 30 s and
+Largest request 8 MiB under the service's Limits and save.
 Port mapping `7801 → sync` already exists, so Aegis uses `http://127.0.0.1:7801`.
 
 ## 6. Vendoring
@@ -189,6 +193,10 @@ Where this section and the text above disagree, this section is what was built. 
 - **Nonces (§5.1).** TTL is `max(MAX_TTL_MS, expires_ms - now + 1)`, not the token TTL alone. Replay protection is per node, accepted for v1.
 - **`kv/local` (§4).** Writes bypass the write gate and survive `reset_to_empty`. A count table and a due time avoid scans. Keys are capped at 512 bytes. The GC drops namespaces of purged generations (it keeps one while the active instance has not switched generation).
 - **Retention (§5.1).** Runs only on the pushed `(acct, ns)`. A prune is an ordered delete, so stale copies are not resurrected. Each pruned record leaves a permanent empty row of about 100 to 300 bytes that the mesh GC never removes. Cap counters are soft and count only stored writes.
+- **Retention age (§5.1).** The 90-day floor counts from when a node first stored the tombstone, not from the client's `hlc.wall_ms` (native). The time is the value of the tombstone's index key `tomb/…` (decimal node-clock ms; the earliest is kept if one is already there), and a tombstone is pruned once `now - first_stored_ms >= 90 days` and it is outside the newest 500 by hlc. Measured on the client's stamp, a client could push more than 500 tombstones stamped in 1970 and have the same push prune them at once, each leaving a permanent row that no cap counted. The index key replicates with its value, so a replica measures from the writing node's clock, never the client's. An index value that does not read as a time starts its clock at the retention scan that finds it; it never falls back to the hlc time, which would reopen the hole.
+- **Tie-index cap (§5.1).** `hlcidx/<acct>/<ns>/<hlc>` gains a permanent member for every new `(uuid, hlc)` a record is stored at, updates included, and updates touch neither the record nor the byte caps. So each node counts the members it adds per account (`idxcount/<acct>/<node-id-hex>`), and a push that would take the account's sum over nodes past `4 × MAX_RECORDS_PER_ACCOUNT` (200 000) is refused with 507 before anything is written. The count is soft like the other caps. Together with the retention age, this makes "per-node soft caps bound growth" (§1) hold for record churn and past-dated tombstones.
+- **Deploy limits (§5.3).** The service needs `--timeout-ms 30000` at deploy (with `--memory-mb 64 --max-body 8388608`); the daemon's default timeout is 10 s. The UI Deploy form has no limit fields, so a UI deploy is followed by setting the limits on the service's detail sheet. `apps/meshd` has a test that the documented command produces these limits.
+- **Revocation on a mesh (§5.1, §8.6).** Revoking a device in Aegis stops only that device's Aegis client. If the device is itself a member of the Meshnode mesh (as every device that syncs through its own gateway is), its node keeps receiving the account's replicated records, which the device can read with the account's data key, and as a mesh member it can write the service's store directly (for example add an approval). Natively, revocation stops the pulls. A lost or stolen device must therefore also be removed from the mesh (`meshd remove <id prefix>`, or Remove device in the UI); the manual check's step 6 does both.
 - **Open-registration warning.** Logged once per node per day (a `kv/local` marker).
 - **Owner approvals across nodes.** Concurrent approvals on different nodes before sync are still ordered by node clocks; this only affects which new device is the heir.
 - **Licence (§7).** Meshnode is AGPL-3.0-only. `vendor/VENDORED.md` records the Aegis commit (`71e78da`) that `vendor/aegis-sync-core` copies.

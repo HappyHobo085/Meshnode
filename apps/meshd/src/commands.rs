@@ -673,6 +673,42 @@ mod tests {
         }
     }
 
+    /// The deploy command `docs/manual-checks/sub-spec-7.md` and spec 7 §5.3 give for the Aegis
+    /// sync service sets 64 MB, 30 s and 8 MiB; without the flags the timeout is the daemon's
+    /// 10 s default.
+    #[test]
+    fn deploy_wasm_limit_flags_set_the_documented_sync_limits() {
+        use clap::Parser;
+        let limits_for = |extra: &[&str]| {
+            let mut argv = vec!["meshd", "deploy", "wasm", "sync", "aegis_sync.wasm"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Deploy(Deploy::Wasm { name, limits, .. }) => {
+                    assert_eq!(name, "sync");
+                    limits_of(&limits, Limits::default())
+                }
+                other => panic!("parsed as {other:?}"),
+            }
+        };
+        let documented = [
+            "--memory-mb",
+            "64",
+            "--timeout-ms",
+            "30000",
+            "--max-body",
+            "8388608",
+        ];
+        assert_eq!(
+            limits_for(&documented),
+            Limits {
+                memory_mb: 64,
+                request_timeout_ms: 30_000,
+                max_body_bytes: 8 * 1024 * 1024,
+            }
+        );
+        assert_eq!(limits_for(&[]).request_timeout_ms, 10_000);
+    }
+
     #[test]
     fn remove_ambiguous_prefix_error() {
         let members = [member(0xab, 0x01, "pc"), member(0xab, 0x02, "laptop")];

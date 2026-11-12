@@ -6,7 +6,8 @@
 //! - `rec/<acct>/<ns>/<uuid>`: one record, written with `set-ordered(order_bytes(hlc))`; the
 //!   value is the record's canonical `WireRecord` JSON (never an `ord`; see `records.rs`).
 //! - `hlcidx/<acct>/<ns>/<hex(order_bytes(hlc))>`: grow-only set of uuids that were ever
-//!   written with that exact `hlc`. A candidate list for tie detection only.
+//!   written with that exact `hlc`. A candidate list for tie detection only. Never compacted,
+//!   so the members an account adds are counted and capped (`idxcount/`, below).
 //! - `devices/<acct>`: grow-only set of `devices::DeviceFacts` JSON.
 //! - `pending/<acct>`, `revoked/<acct>`: grow-only sets of device ids.
 //! - `approved/<acct>`: grow-only set of `devices::ApprovedFact` JSON (device id and the
@@ -14,11 +15,16 @@
 //! - `labels/<acct>`: grow-only set of `devices::LabelFact` JSON.
 //! - `seen/<acct>/<device>/<node-id-hex>`: one node's register of the device's `lastSeenMs`
 //!   (decimal); only that node writes it, and the newest across nodes is served.
-//! - `tomb/<acct>/<ns>/<hex(order_bytes(hlc))>/<uuid>`: the tombstone index (value `1`), one
-//!   key per stored tombstone, in hlc order, for retention (`retention.rs`). A candidate list:
-//!   the record itself is re-read before anything is pruned.
+//! - `tomb/<acct>/<ns>/<hex(order_bytes(hlc))>/<uuid>`: the tombstone index, one key per
+//!   stored tombstone, in hlc order, for retention (`retention.rs`). Its value is when a node
+//!   first stored the tombstone (decimal node-clock ms; retention's age floor counts from it,
+//!   never from the client's stamp). A candidate list: the record itself is re-read before
+//!   anything is pruned.
 //! - `count/<node-id-hex>/<metric>`: this node's share of a server-wide count (decimal `i64`,
 //!   may go negative); the mesh-wide value is the sum over nodes (`caps.rs`).
+//! - `idxcount/<acct>/<node-id-hex>`: this node's count of the `hlcidx` members it added for
+//!   the account (decimal); the account's total is the sum over nodes, capped at
+//!   `caps::MAX_HLCIDX_PER_ACCOUNT` (`caps.rs`).
 //!
 //! Node-local (`meshnode:kv/local`):
 //! - `nonce/<device>/<nonce>`: a spent replay nonce.
@@ -120,6 +126,16 @@ pub const COUNT_PREFIX: &str = "count/";
 /// `node_hex`'s share of the server-wide count `metric`.
 pub fn count_key(node_hex: &str, metric: &str) -> String {
     format!("{COUNT_PREFIX}{node_hex}/{metric}")
+}
+
+/// Every node's `hlcidx` member count for `acct` starts with this.
+pub fn hlcidx_count_prefix(acct: &str) -> String {
+    format!("idxcount/{acct}/")
+}
+
+/// `node_hex`'s count of the `hlcidx` members it added for `acct`.
+pub fn hlcidx_count_key(acct: &str, node_hex: &str) -> String {
+    format!("{}{node_hex}", hlcidx_count_prefix(acct))
 }
 
 /// The `kv/local` key recording a spent `(device, nonce)`.

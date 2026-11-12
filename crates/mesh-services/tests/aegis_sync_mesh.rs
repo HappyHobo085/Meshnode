@@ -34,7 +34,11 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-/// The service's deploy defaults (spec §5.3): 64 MB, 30 s, 8 MiB.
+/// The limits the documented deploy sets (spec §5.3, `docs/manual-checks/sub-spec-7.md`):
+/// `meshd deploy wasm sync <file> --memory-mb 64 --timeout-ms 30000 --max-body 8388608`.
+/// These are NOT the daemon's defaults: a deploy without the flags gets a 10 s timeout
+/// (`Limits::default()`). `apps/meshd` pins what the flags produce
+/// (`deploy_wasm_limit_flags_set_the_documented_sync_limits`).
 const SERVICE_LIMITS: Limits = Limits {
     memory_mb: 64,
     request_timeout_ms: 30_000,
@@ -716,8 +720,8 @@ async fn local_store_not_replicated_across_nodes() {
 // ------------------------------------------------------------------------- timing
 
 /// A full 5 000-record page served from a real node's replicated store (not `MemKv`), well
-/// inside the service's 30 s request limit. One node: replicating 5 000 records to a second
-/// node is not what is timed. The records are seeded straight into the node's store in the
+/// inside the 30 s request limit the documented deploy sets (and inside the daemon's 10 s
+/// default). One node: replicating 5 000 records to a second node is not what is timed. The records are seeded straight into the node's store in the
 /// service's layout (as [`seed_record`] does), so only the GET is a timed service request;
 /// pushing them through the service would take 5 POSTs of several seconds each in a debug
 /// build. The page is checked record for record, so a seed that missed the layout fails.

@@ -3,9 +3,21 @@
 //!
 //! A tombstone is what tells a device that was offline during a delete that the record is
 //! gone, so it is kept while it is EITHER among the newest [`TOMBSTONE_RETENTION_PER_NS`] of
-//! its `(account, ns)` (by hlc) OR younger than [`TOMBSTONE_MIN_AGE_MS`] (its hlc `wall_ms`
-//! against the node clock). Past both, it is pruned: the native server removes the record
-//! outright. Live records are never pruned.
+//! its `(account, ns)` (by hlc) OR held for less than [`TOMBSTONE_MIN_AGE_MS`]. Past both, it is
+//! pruned: the native server removes the record outright. Live records are never pruned.
+//!
+//! The age is how long the mesh has held the tombstone, `now - first_stored_ms`, where
+//! `first_stored_ms` is the node clock when a node first stored it, kept as the value of its
+//! index key (`store::put_record`). Native measures the client's own `hlc.wall_ms`, which the
+//! client chooses: a client could push more than 500 tombstones of new uuids stamped in 1970
+//! and have the same push prune them at once, each prune leaving a permanent row (below) that
+//! no cap counts. Measured from storage, nothing is pruned for 90 days, so the records cap and
+//! the counters bound it.
+//!
+//! The index key replicates with its value, so a replica reads the time the writing node
+//! stored the tombstone: a node's clock, never the client's. An index value that does not read
+//! as a time (none is written) starts its clock at the scan that finds it: the scan writes its
+//! own `now` there. It never falls back to the hlc `wall_ms`, which would reopen the hole.
 //!
 //! Differences from native, all from the mesh having no single store to sweep:
 //! - Scope: native prunes EVERY namespace of every account on every push (and the pulled
@@ -23,14 +35,18 @@
 //! Finding the tombstones without reading the namespace: every stored tombstone has a key in
 //! the index `tomb/<acct>/<ns>/<hex(order_bytes(hlc))>/<uuid>` (`records.rs` writes it before
 //! the tombstone and deletes it once the uuid moves off that tombstone), so `list-keys` returns
-//! them oldest first, and the doomed set is a prefix of that order: the oldest
-//! `count - 500`, cut short at the first one inside the age floor. Each candidate's CURRENT
-//! record is re-read before anything is pruned; an index key whose record is no longer that
-//! tombstone (a concurrent write on another node moved it) is stale, is deleted, and does not
-//! count. Stale keys the walk has not reached are still counted, so after such a race a
-//! namespace can keep fewer than 500 tombstones, by at most that many; nothing younger than the
-//! floor is ever pruned.
-use aegis_sync_core::auth::unhex;
+//! them oldest first by hlc, and the candidates are a prefix of that order: the oldest
+//! `count - 500`. Each is pruned only if it was first stored at least 90 days ago; a younger
+//! one is kept and the walk goes on. The walk stops early at the first hlc `wall_ms` more than
+//! `MAX_FUTURE_SKEW_MS` past the floor: a node stores no stamp further ahead of its clock than
+//! that, so that tombstone and every later one were stored inside the floor. Ordinary deletes
+//! (stamped about when they are stored) therefore cost no walk past the first young one.
+//! Each candidate's CURRENT record is re-read before anything is pruned; an index key whose
+//! record is no longer that tombstone (a concurrent write on another node moved it) is stale,
+//! and is deleted. Stale keys are counted, so after such a race a namespace can keep fewer
+//! than 500 tombstones, by at most that many; nothing held for less than the floor is ever
+//! pruned.
+use aegis_sync_core::auth::{MAX_FUTURE_SKEW_MS, unhex};
 use aegis_sync_core::order::order_bytes;
 
 use crate::keys;
@@ -39,7 +55,8 @@ use crate::store::{self, PAGE};
 
 /// Tombstones always kept per `(account, ns)`: the newest this many (native value).
 pub const TOMBSTONE_RETENTION_PER_NS: usize = 500;
-/// Tombstones younger than this are never pruned (native value: 90 days).
+/// Tombstones held for less than this are never pruned (native value: 90 days; measured from
+/// when a node first stored the tombstone, see the module docs).
 pub const TOMBSTONE_MIN_AGE_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 
 /// What a prune removed, for the node's counters.
@@ -53,19 +70,22 @@ pub struct Pruned {
 pub fn prune(acct: &str, ns: &str, now_ms: i64) -> Pruned {
     let mut pruned = Pruned::default();
     let prefix = keys::tomb_prefix(acct, ns);
-    let mut left = count(&prefix);
-    if left <= TOMBSTONE_RETENTION_PER_NS {
+    // The oldest `count - 500` by hlc are the candidates; the newest 500 are always kept.
+    let mut candidates = count(&prefix).saturating_sub(TOMBSTONE_RETENTION_PER_NS);
+    if candidates == 0 {
         return pruned;
     }
+    // A candidate first stored at or before `floor` has been held for the minimum age.
     let floor = now_ms.saturating_sub(TOMBSTONE_MIN_AGE_MS);
     let mut after: Option<String> = None;
     'walk: loop {
         let batch = kv::list_keys(&prefix, after.as_deref(), PAGE);
         let done = batch.len() < PAGE as usize;
         for key in &batch {
-            if left <= TOMBSTONE_RETENTION_PER_NS {
+            if candidates == 0 {
                 break 'walk;
             }
+            candidates -= 1;
             let entry = key[prefix.len()..]
                 .split_once('/')
                 .and_then(|(order, uuid)| {
@@ -74,11 +94,22 @@ pub fn prune(acct: &str, ns: &str, now_ms: i64) -> Pruned {
                 });
             let Some((wall, order, uuid)) = entry else {
                 kv::delete(key); // not a key this service writes
-                left -= 1;
                 continue;
             };
-            if wall >= floor {
-                break 'walk; // this one and every later one are inside the age floor
+            if wall.saturating_sub(MAX_FUTURE_SKEW_MS) > floor {
+                // Stamped further past the floor than any node accepts ahead of its clock:
+                // this one and every later one were stored inside the floor.
+                break 'walk;
+            }
+            match first_stored(key) {
+                Held::Gone => continue,
+                Held::Unknown => {
+                    // No time to measure from: its clock starts now.
+                    kv::set(key, now_ms.to_string().as_bytes());
+                    continue;
+                }
+                Held::Since(t) if t > floor => continue,
+                Held::Since(_) => {}
             }
             let rec_key = keys::rec_key(acct, ns, uuid);
             match store::stored_meta(&rec_key) {
@@ -90,7 +121,6 @@ pub fn prune(acct: &str, ns: &str, now_ms: i64) -> Pruned {
                 _ => {} // stale: the uuid has moved off this tombstone
             }
             kv::delete(key);
-            left -= 1;
         }
         if done {
             break;
@@ -106,6 +136,26 @@ pub fn prune(acct: &str, ns: &str, now_ms: i64) -> Pruned {
         );
     }
     pruned
+}
+
+/// What an index key's value says about when its tombstone was first stored.
+enum Held {
+    /// The key was deleted after it was listed.
+    Gone,
+    /// The value is not a time (none is written).
+    Unknown,
+    /// First stored at this node-clock time.
+    Since(i64),
+}
+
+fn first_stored(key: &str) -> Held {
+    match kv::get(key) {
+        None => Held::Gone,
+        Some(v) => match std::str::from_utf8(&v).ok().and_then(|t| t.parse().ok()) {
+            Some(t) => Held::Since(t),
+            None => Held::Unknown,
+        },
+    }
 }
 
 /// The index keys under `prefix`.

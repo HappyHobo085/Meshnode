@@ -11,6 +11,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
 use mesh_proto::{
     InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, RemovalRecord, Role,
+    Scope,
 };
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
@@ -26,11 +27,12 @@ use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::join::{JoinHandler, JoinInner};
 use crate::local::{
-    Invites, load_or_create_key, read_genesis, read_rebootstrap, remove_rebootstrap, write_genesis,
+    Invites, load_or_create_key, read_genesis, read_own_role, read_rebootstrap, remove_rebootstrap,
+    write_genesis, write_own_role,
 };
 use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
-    encode_info, encode_removal, info_key, member_bytes,
+    encode_info, encode_removal, info_key, member_bytes, scope_of_role,
 };
 use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
@@ -192,6 +194,11 @@ impl NodeHandle {
 
     pub fn blobs(&self) -> &Blobs {
         &self.inner.blobs
+    }
+
+    /// The namespaces this node replicates (see [`Node::scope`]).
+    pub fn scope(&self) -> Scope {
+        self.inner.store.raw().scope()
     }
 
     pub fn members(&self) -> Vec<MemberStatus> {
@@ -397,6 +404,23 @@ async fn first_sync(
     }
 }
 
+/// The scope of this node's store (sub-spec 8a §3), from its role in `_mesh` (`listed`)
+/// and the role it entered the mesh with (`joined_as`, from `role.json`).
+///
+/// A client is Partial. So is a node that joined as a client and is now listed as a host
+/// (re-invited as host): its store still lacks every other namespace and its vector has
+/// moved past those ops, so as Full it would serve markers over ops it never held and a
+/// peer would take them as seen. It stays Partial until a re-bootstrap as Full (role
+/// upgrade) rebuilds the store. A node listed nowhere yet (a joiner before its first
+/// sync) goes by `joined_as`; with neither, it is a host (the pre-8a default).
+pub(crate) fn own_scope(listed: Option<Role>, joined_as: Option<Role>) -> Scope {
+    if listed == Some(Role::Client) || joined_as == Some(Role::Client) {
+        scope_of_role(Role::Client)
+    } else {
+        scope_of_role(Role::Host)
+    }
+}
+
 /// Starts a node on an established membership: opens the store, binds the endpoint, mounts
 /// the gated `sync/1` handler, publishes the address, runs the first rescan and spawns
 /// the reactor, the address watcher and the peer tasks.
@@ -410,13 +434,26 @@ pub(crate) async fn start(
     let mesh = genesis.mesh_id();
     let path = cfg.data_dir.join(STORE_FILE);
     let (k, wall) = (key.clone(), DynClock(cfg.wall.clone()));
-    let store = tokio::task::spawn_blocking(move || CoreStore::open(&path, mesh, k, wall))
+    let dir = cfg.data_dir.clone();
+    let joined_as = tokio::task::spawn_blocking(move || read_own_role(&dir))
         .await
-        .map_err(join_err)?
-        .map_err(|e| match e {
-            StoreError::WrongMesh => NodeError::WrongMesh,
-            e => NodeError::Store(e),
-        })?;
+        .map_err(join_err)??;
+    let g = genesis.clone();
+    // The scope is set right after the open, before anything can write or serve a diff
+    // (the store is `Full` until then).
+    let (store, snap) = tokio::task::spawn_blocking(move || {
+        let store = CoreStore::open(&path, mesh, k, wall)?;
+        let snap = MembershipSnapshot::load(&store, &g)?;
+        store.set_scope(own_scope(snap.role(&me), joined_as));
+        Ok((store, snap))
+    })
+    .await
+    .map_err(join_err)?
+    .map_err(|e| match e {
+        StoreError::WrongMesh => NodeError::WrongMesh,
+        e => NodeError::Store(e),
+    })?;
+    debug!(scope = ?store.scope(), "store opened");
     let store = StoreHandle::new(Arc::new(store));
     let dir = cfg.data_dir.clone();
     let invites = tokio::task::spawn_blocking(move || Invites::load(&dir))
@@ -424,10 +461,6 @@ pub(crate) async fn start(
         .map_err(join_err)??;
     let invites = Arc::new(Mutex::new(invites));
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
-    let g = genesis.clone();
-    let snap = store
-        .call_raw(move |s| MembershipSnapshot::load(s, &g))
-        .await?;
     // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale.
     // A removed node has nothing to rebuild (an interrupted run is dropped). Serving is
     // paused before any session starts.
@@ -660,6 +693,7 @@ impl Node {
             founder: me,
             nonce: rand::random(),
         };
+        write_own_role(&cfg.data_dir, Role::Host)?;
         write_genesis(&cfg.data_dir, &genesis)?;
         let node = start(cfg, key, genesis, Vec::new()).await?;
         let store = node.store().clone();
@@ -753,6 +787,13 @@ impl Node {
 
     pub fn mesh(&self) -> MeshId {
         self.inner.genesis.mesh_id()
+    }
+
+    /// The namespaces this node replicates (sub-spec 8a §3): `Scope::client()` (only
+    /// `_mesh`) for a client-role member, `Full` otherwise. Set from the node's own role
+    /// when its store is opened, before any local write or sync.
+    pub fn scope(&self) -> Scope {
+        self.inner.store.raw().scope()
     }
 
     /// Every member of the mesh, with this node's view of its link.
@@ -1012,10 +1053,19 @@ impl Node {
     /// would, without any connection. The reactor then reacts as usual.
     pub async fn deliver_from(&self, other: &Node) -> Result<(), NodeError> {
         let mine = self.inner.store.call_raw(|s| s.version_vector()).await?;
+        let scope = self.scope();
+        // As a session would: served within this node's scope, and a Partial sender's
+        // markers ignored.
+        let from_partial = matches!(other.scope(), Scope::Partial(_));
         let (items, theirs) = other
             .inner
             .store
-            .call_raw(move |s| Ok((s.diff_since(&mine, 100_000)?, s.version_vector()?)))
+            .call_raw(move |s| {
+                Ok((
+                    s.diff_since_scoped(&mine, 100_000, &scope)?,
+                    s.version_vector()?,
+                ))
+            })
             .await?;
         let acc = self.inner.acc.clone();
         self.inner
@@ -1025,6 +1075,7 @@ impl Node {
                 for item in items {
                     match item {
                         mesh_store::SyncItem::Op(op) => ops.push(op),
+                        mesh_store::SyncItem::Covered { .. } if from_partial => {}
                         mesh_store::SyncItem::Covered { origin, upto } => {
                             s.apply_batch(std::mem::take(&mut ops), &*acc)?;
                             s.apply_covered(origin, upto, theirs.get(&origin), &*acc)?;

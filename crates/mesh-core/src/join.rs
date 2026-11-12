@@ -25,7 +25,8 @@ use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, JOIN_MAX_FRAME, read_frame, write_frame};
 use crate::local::{
-    InviteEntry, Invites, load_or_create_key, read_genesis, remove_genesis, write_genesis,
+    InviteEntry, Invites, load_or_create_key, read_genesis, remove_genesis, remove_own_role,
+    write_genesis, write_own_role,
 };
 use crate::membership::{
     CONSUMED, MEMBERS, MESH_NS, MembershipSnapshot, addr_key, encode_addr, encode_info, info_key,
@@ -343,6 +344,9 @@ pub(crate) async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, 
         peers.push((inviter_id, ticket.inviter.clone()));
     }
     let dir = cfg.data_dir.clone();
+    // Before `mesh.json`: the store opens with this role's scope (sub-spec 8a §3), so a
+    // client never starts as Full before its `members` record arrives.
+    write_own_role(&dir, ticket.role)?;
     write_genesis(&dir, &genesis)?;
     let ids: Vec<NodeId> = peers.iter().map(|(id, _)| *id).collect();
     let node = match start(cfg, key, genesis, peers).await {
@@ -351,6 +355,9 @@ pub(crate) async fn join(cfg: NodeConfig, ticket: InviteTicket) -> Result<Node, 
             // Leave the directory reusable with the same ticket (the join is idempotent).
             if let Err(e) = remove_genesis(&dir) {
                 warn!(error = %e, "could not remove mesh.json after a failed start");
+            }
+            if let Err(e) = remove_own_role(&dir) {
+                warn!(error = %e, "could not remove role.json after a failed start");
             }
             return Err(e);
         }

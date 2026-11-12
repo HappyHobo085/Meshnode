@@ -14,8 +14,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncItem {
     Op(SignedOp),
-    /// Everything of `origin` up to and including `upto` that the sender holds no op row
-    /// for (compacted or GC'd); the receiver may treat it as seen.
+    /// Everything of `origin` up to and including `upto` that the sender does not send:
+    /// seqs it holds no op row for (compacted or GC'd) and, in a scoped diff
+    /// ([`Store::diff_since_scoped`]), ops outside the peer's scope. From a Full sender the
+    /// receiver may treat it as seen. A Partial sender's markers may mean "filtered", so a
+    /// Full receiver must ignore every marker a Partial peer sends (sub-spec 8a §3).
     Covered {
         origin: NodeId,
         upto: u64,
@@ -55,6 +58,12 @@ impl<W: WallClock> Store<W> {
     /// ops whose namespace `scope` does not admit becomes ONE `Covered { origin, upto }`;
     /// admitted ops are sent as [`SyncItem::Op`]. Items count toward `limit` exactly as
     /// in `diff_since`; with `Scope::Full` the output is identical to it.
+    ///
+    /// Scan budget: one call walks at most `4 × limit` op rows, filtered rows included, so
+    /// a long filtered run never holds one long read transaction. When the budget runs out
+    /// inside a filtered or compacted run, the call ends with a `Covered` marker up to the
+    /// last seq walked, and the next page (from the peer's raised vector) resumes there.
+    /// (Each admitted row yields an item, so with `Full` the budget is never reached.)
     pub fn diff_since_scoped(
         &self,
         theirs: &VersionVector,
@@ -65,6 +74,8 @@ impl<W: WallClock> Store<W> {
         if limit == 0 {
             return Ok(items);
         }
+        let budget = limit.saturating_mul(4);
+        let mut walked = 0usize;
         let tx = self.db.begin_read()?;
         let vv = tx.open_table(VV)?;
         let ops = tx.open_table(OPS)?;
@@ -86,7 +97,14 @@ impl<W: WallClock> Store<W> {
                 let (ok, ov) = r?;
                 let (_, seq) = keys::split_op_key("ops", ok.value())?;
                 let row: OpRow = tables::decode("ops", ov.value())?;
+                walked += 1;
                 if !scope.admits(row.op.body.payload.ns()) {
+                    if walked >= budget {
+                        // `expected..=seq` is all filtered or compacted; `items.len() <
+                        // limit` here, so the marker keeps the page within `limit`.
+                        items.push(SyncItem::Covered { origin, upto: seq });
+                        return Ok(items);
+                    }
                     continue;
                 }
                 if seq > expected {
@@ -99,7 +117,7 @@ impl<W: WallClock> Store<W> {
                     }
                 }
                 items.push(SyncItem::Op(row.op));
-                if items.len() >= limit {
+                if items.len() >= limit || walked >= budget {
                     return Ok(items);
                 }
                 expected = seq + 1;

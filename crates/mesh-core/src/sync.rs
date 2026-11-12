@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mesh_proto::{
-    MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, SignedOp, SyncMsg, VersionVector, batch_ops,
+    MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Scope, SignedOp, SyncMsg, VersionVector,
+    batch_ops,
 };
 use mesh_store::{StoreError, SyncItem};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -28,7 +29,7 @@ use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, SYNC_MAX_FRAME, read_frame, write_frame};
-use crate::membership::MeshAcceptor;
+use crate::membership::{MeshAcceptor, scope_of_role};
 
 /// Items per `diff_since` page.
 const PAGE: usize = 256;
@@ -180,7 +181,18 @@ struct State {
     hello_gen: u64,
     /// Live mode is on once the peer's first `Hello` arrived.
     live: bool,
+    /// The scope from the peer's latest `Hello` (`None` before the first). Decides what
+    /// we serve it and whether its `Covered` markers count (sub-spec 8a §3).
+    peer_scope: Option<Scope>,
     round: Round,
+}
+
+impl State {
+    /// The peer announced a Partial scope: its `Covered` markers may mean "filtered",
+    /// and its `vv[me]` does not prove it holds our ops.
+    fn peer_partial(&self) -> bool {
+        matches!(self.peer_scope, Some(Scope::Partial(_)))
+    }
 }
 
 /// Why a round start was requested.
@@ -332,17 +344,22 @@ impl Session {
     }
 
     /// Completes the round if both `Done`s have crossed: `mark_full_sync` with the peer's
-    /// confirmed `vv[me]`, count it and emit `RoundComplete`.
+    /// confirmed `vv[me]` (not with a Partial peer), count it and emit `RoundComplete`.
     async fn maybe_complete(&self) -> Result<(), SessionEnd> {
-        let synced = {
+        let (synced, partial) = {
             let mut st = self.lock();
             if !st.round.complete() {
                 return Ok(());
             }
             st.round = Round::default();
-            st.advertised.get(&self.ctx.me)
+            (st.advertised.get(&self.ctx.me), st.peer_partial())
         };
-        self.call(move |s| s.mark_full_sync(synced)).await?;
+        // A Partial peer's vector moves past what it filtered out, so its `vv[me]` does
+        // not prove it holds our ops, and a round with it is no full sync: marking one
+        // would let a re-bootstrap drop own ops only this node holds (spec §7).
+        if !partial {
+            self.call(move |s| s.mark_full_sync(synced)).await?;
+        }
         self.ctx
             .metrics
             .rounds_completed
@@ -385,16 +402,32 @@ impl Session {
 
     async fn on_message(&self, msg: SyncMsg) -> Result<(), SessionEnd> {
         match msg {
-            SyncMsg::Hello { mesh, vv, .. } => {
+            SyncMsg::Hello { mesh, vv, scope } => {
                 if mesh != self.ctx.mesh {
                     return Err(SessionEnd::Protocol("Hello for another mesh".into()));
                 }
-                self.on_hello(vv);
+                self.check_scope(&scope).await?;
+                self.on_hello(vv, scope);
                 Ok(())
             }
             SyncMsg::Ops { ops } => self.on_ops(ops).await,
             SyncMsg::Covered { origin, upto } => {
-                let advertised = self.lock().advertised.get(&origin);
+                let (advertised, partial) = {
+                    let st = self.lock();
+                    (st.advertised.get(&origin), st.peer_partial())
+                };
+                if partial {
+                    // Sub-spec 8a §3: from a Partial peer a marker may mean "filtered", not
+                    // "compacted"; the gap waits in `pending` for a Full peer. `known` is
+                    // not raised either (the scoped diff we serve covers it anyway).
+                    debug!(
+                        peer = %self.ctx.peer.short(),
+                        origin = %origin.short(),
+                        upto,
+                        "ignoring Covered from a partial peer"
+                    );
+                    return Ok(());
+                }
                 let acc = self.ctx.acc.clone();
                 self.call(move |s| s.apply_covered(origin, upto, advertised, &*acc))
                     .await?;
@@ -417,7 +450,22 @@ impl Session {
         }
     }
 
-    fn on_hello(&self, vv: VersionVector) {
+    /// Refuses a peer whose announced scope contradicts its role in `_mesh` (host ⇔
+    /// `Full`, client ⇔ `Scope::client()`), like an unknown member. A peer with no role
+    /// yet (a provisional peer during a join) is taken at its word: serving it scoped and
+    /// ignoring its markers is always safe, and `Full` is today's treatment.
+    async fn check_scope(&self, scope: &Scope) -> Result<(), SessionEnd> {
+        let (acc, peer) = (self.ctx.acc.clone(), self.ctx.peer);
+        let role = self.call(move |s| acc.role_of(s, &peer)).await?;
+        match role {
+            Some(role) if scope_of_role(role) != *scope => Err(SessionEnd::Protocol(format!(
+                "Hello scope {scope:?} contradicts the peer's role {role:?}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn on_hello(&self, vv: VersionVector, scope: Scope) {
         self.ctx.signout.peer_hello(&self.ctx.me, &vv);
         let mut st = self.lock();
         if st.round.awaiting_reply {
@@ -439,6 +487,7 @@ impl Session {
         }
         st.advertised = vv.clone();
         st.known = vv;
+        st.peer_scope = Some(scope);
         st.hello_gen += 1;
         st.live = true;
         drop(st);
@@ -563,17 +612,9 @@ impl Session {
             if self.call(|s| s.is_stale()).await? {
                 return Err(SessionEnd::Stale);
             }
-            let vv = self.call(|s| s.version_vector()).await?;
+            let (vv, scope) = self.call(|s| Ok((s.version_vector()?, s.scope()))).await?;
             let mesh = self.ctx.mesh;
-            self.send(
-                w,
-                &SyncMsg::Hello {
-                    mesh,
-                    vv,
-                    scope: mesh_proto::Scope::Full,
-                },
-            )
-            .await?;
+            self.send(w, &SyncMsg::Hello { mesh, vv, scope }).await?;
         }
 
         if self.paused() || !self.lock().live {
@@ -601,19 +642,24 @@ impl Session {
         Ok(())
     }
 
-    /// Streams `diff_since(known)` page by page until a page is empty, raising `known` for
-    /// every item sent. Returns the `hello_gen` the empty page was computed under, or
-    /// `None` if serving was paused meanwhile.
+    /// Streams `diff_since_scoped(known, peer scope)` page by page until a page is empty,
+    /// raising `known` for every item sent. A Partial peer gets only what its scope
+    /// admits; the rest of each origin goes as `Covered` markers. Returns the `hello_gen`
+    /// the empty page was computed under, or `None` if serving was paused meanwhile.
     async fn flush<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<Option<u64>, SessionEnd> {
         loop {
             if self.paused() {
                 return Ok(None);
             }
-            let (known, gen_now) = {
+            let (known, gen_now, scope) = {
                 let st = self.lock();
-                (st.known.clone(), st.hello_gen)
+                // `live` (checked by the caller) implies a Hello, so the scope is known.
+                let scope = st.peer_scope.clone().unwrap_or(Scope::Full);
+                (st.known.clone(), st.hello_gen, scope)
             };
-            let items = self.call(move |s| s.diff_since(&known, PAGE)).await?;
+            let items = self
+                .call(move |s| s.diff_since_scoped(&known, PAGE, &scope))
+                .await?;
             if items.is_empty() {
                 return Ok(Some(gen_now));
             }

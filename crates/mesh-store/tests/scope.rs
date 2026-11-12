@@ -249,3 +249,143 @@ fn remote_ops_unaffected_by_scope() {
     assert!(b.set_contains("svc", "s", b"m").unwrap());
     assert_eq!(b.version_vector().unwrap().get(&node(1)), 2);
 }
+
+/// Concatenates every page of a scoped diff, raising `theirs` from each page as a peer
+/// would (an op raises its seq, a marker its `upto`).
+fn page_through(
+    s: &mesh_store::Store<ManualClock>,
+    limit: usize,
+    scope: &Scope,
+) -> (Vec<SyncItem>, usize) {
+    let mut theirs = VersionVector::default();
+    let mut all = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = s.diff_since_scoped(&theirs, limit, scope).unwrap();
+        if page.is_empty() {
+            return (all, pages);
+        }
+        assert!(page.len() <= limit, "page of {} > {limit}", page.len());
+        pages += 1;
+        for item in &page {
+            let (origin, seq) = match item {
+                SyncItem::Op(op) => (op.body.origin, op.body.seq),
+                SyncItem::Covered { origin, upto } => (*origin, *upto),
+            };
+            assert!(seq > theirs.get(&origin), "page went backwards: {item:?}");
+            theirs.set(origin, seq);
+        }
+        all.extend(page);
+        assert!(pages < 10_000, "no progress");
+    }
+}
+
+/// The seqs of `origin` that `items` deliver as ops, and the highest seq they reach.
+fn reach(items: &[SyncItem], origin: mesh_proto::NodeId) -> (Vec<u64>, u64) {
+    let mut ops = Vec::new();
+    let mut top = 0;
+    for i in items {
+        match i {
+            SyncItem::Op(op) if op.body.origin == origin => {
+                ops.push(op.body.seq);
+                top = top.max(op.body.seq);
+            }
+            SyncItem::Covered { origin: o, upto } if *o == origin => top = top.max(*upto),
+            _ => {}
+        }
+    }
+    (ops, top)
+}
+
+#[test]
+fn scoped_pages_to_completion() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    // Mixed runs: short and long filtered runs, compacted seqs inside both.
+    let mut mesh_seqs = Vec::new();
+    for i in 1..=60u64 {
+        let ns = if i % 7 == 0 || (20..35).contains(&i) || i == 60 {
+            "_mesh"
+        } else {
+            "svc"
+        };
+        a.set(ns, &format!("k{i}"), b"v").unwrap();
+        if ns == "_mesh" {
+            mesh_seqs.push(i);
+        }
+    }
+    for gone in [3, 21, 40, 41] {
+        a.__test_drop_op(node(1), gone).unwrap();
+        mesh_seqs.retain(|s| *s != gone);
+    }
+    let b = store(dir.path(), 2, &clock);
+    for i in 0..30 {
+        b.set("svc", &format!("x{i}"), b"v").unwrap();
+    }
+    b.set("_mesh", "last", b"v").unwrap();
+    // `a` learns `b`'s ops so it serves two origins.
+    for item in b
+        .diff_since_scoped(&VersionVector::default(), 1000, &Scope::Full)
+        .unwrap()
+    {
+        if let SyncItem::Op(op) = item {
+            a.apply(op, &AcceptAll).unwrap();
+        }
+    }
+    let unpaged = a
+        .diff_since_scoped(&VersionVector::default(), 10_000, &Scope::client())
+        .unwrap();
+    for limit in [1, 2, 3, 5, 8, 100] {
+        let (all, _) = page_through(&a, limit, &Scope::client());
+        // Every in-scope op exactly once, in order, and each origin reached in full.
+        assert_eq!(
+            reach(&all, node(1)),
+            (mesh_seqs.clone(), 60),
+            "limit {limit}"
+        );
+        assert_eq!(reach(&all, node(2)), (vec![31], 31), "limit {limit}");
+        let ops = |v: &[SyncItem]| -> Vec<SyncItem> {
+            v.iter()
+                .filter(|i| matches!(i, SyncItem::Op(_)))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(ops(&all), ops(&unpaged), "limit {limit}");
+    }
+    // Full pages through to the same thing as one big Full diff.
+    let full = a
+        .diff_since_scoped(&VersionVector::default(), 10_000, &Scope::Full)
+        .unwrap();
+    assert_eq!(page_through(&a, 3, &Scope::Full).0, full);
+}
+
+#[test]
+fn scoped_scan_budget_bounds_a_call() {
+    let (dir, clock) = setup();
+    let a = store(dir.path(), 1, &clock);
+    // 1 in scope, then 100 filtered, then 1 in scope.
+    a.set("_mesh", "first", b"v").unwrap();
+    for i in 0..100 {
+        a.set("svc", &format!("k{i}"), b"v").unwrap();
+    }
+    a.set("_mesh", "last", b"v").unwrap();
+    // limit 2 => at most 8 rows walked: the op at 1, then 7 filtered rows (2..=8).
+    let page = a
+        .diff_since_scoped(&VersionVector::default(), 2, &Scope::client())
+        .unwrap();
+    assert_eq!(shape(&page), vec![(1, 0), (0, 8)]);
+    // The next page resumes after the marker.
+    let mut theirs = VersionVector::default();
+    theirs.set(node(1), 8);
+    let page = a.diff_since_scoped(&theirs, 2, &Scope::client()).unwrap();
+    assert_eq!(shape(&page), vec![(0, 16)]);
+    // A big limit is not cut short.
+    let page = a
+        .diff_since_scoped(&VersionVector::default(), 100, &Scope::client())
+        .unwrap();
+    assert_eq!(shape(&page), vec![(1, 0), (0, 101), (102, 0)]);
+    // Paging through with a small limit still gets everything.
+    let (all, pages) = page_through(&a, 2, &Scope::client());
+    assert_eq!(reach(&all, node(1)), (vec![1, 102], 102));
+    assert!(pages >= 100 / 8, "{pages} pages");
+}

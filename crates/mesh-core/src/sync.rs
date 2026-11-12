@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mesh_proto::{
-    MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Scope, SignedOp, SyncMsg, VersionVector,
-    batch_ops,
+    Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Scope, SignedOp, SyncMsg,
+    VersionVector, batch_ops,
 };
 use mesh_store::{StoreError, SyncItem};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -66,8 +66,8 @@ pub enum SessionEnd {
     /// The store is stale and a Full peer that is not stale announced itself: the node
     /// re-bootstraps from it (spec §7, sub-spec 8a ruling C1).
     Stale,
-    /// The store is stale and so is the Full peer: neither is a source to restore from,
-    /// so they do not sync and neither resets (ruling C1). Redialed with backoff.
+    /// This Full store is stale and so is the Full peer: neither is a source to restore
+    /// from, so they do not sync and neither resets (ruling C1). Redialed with backoff.
     PeerStale,
 }
 
@@ -228,6 +228,8 @@ struct State {
     /// The scope from the peer's latest `Hello` (`None` before the first). Decides what
     /// we serve it and whether its `Covered` markers count (sub-spec 8a §3).
     peer_scope: Option<Scope>,
+    /// The freshness from the peer's latest `Hello`.
+    peer_freshness: Option<Freshness>,
     round: Round,
 }
 
@@ -237,6 +239,20 @@ impl State {
     fn peer_partial(&self) -> bool {
         matches!(self.peer_scope, Some(Scope::Partial(_)))
     }
+}
+
+/// This store's freshness for its `Hello` (sub-spec 8a C1b): re-bootstrapping (`paused`)
+/// counts as stale, never as a source.
+fn own_freshness(s: &crate::db::CoreStore, paused: bool) -> Result<Freshness, StoreError> {
+    let last = s.last_full_sync_ms()?;
+    Ok(match last {
+        _ if paused => Freshness::Stale {
+            since_ms: last.unwrap_or(0),
+        },
+        None => Freshness::Empty,
+        Some(since_ms) if s.is_stale()? => Freshness::Stale { since_ms },
+        Some(_) => Freshness::Fresh,
+    })
 }
 
 /// Why a round start was requested.
@@ -253,6 +269,23 @@ enum Start {
 fn raise(vv: &mut VersionVector, origin: NodeId, seq: u64) {
     if vv.get(&origin) < seq {
         vv.set(origin, seq);
+    }
+}
+
+/// What a completed round with a Full peer of `peer` freshness records (spec §7 with
+/// sub-spec 8a C1b): a Fresh peer is a full sync; so is an Empty one unless this store is
+/// stale (an empty peer cannot refresh stale data); a Stale peer refreshes nothing, but an
+/// Empty store that took its data from it inherits its staleness.
+fn record_full_round(
+    s: &crate::db::CoreStore,
+    synced: u64,
+    peer: Option<Freshness>,
+) -> Result<(), StoreError> {
+    match peer {
+        Some(Freshness::Fresh) => s.mark_full_sync(synced),
+        Some(Freshness::Empty) if !s.is_stale()? => s.mark_full_sync(synced),
+        Some(Freshness::Stale { since_ms }) => s.inherit_full_sync(since_ms),
+        Some(Freshness::Empty) | None => Ok(()),
     }
 }
 
@@ -393,19 +426,27 @@ impl Session {
     /// Completes the round if both `Done`s have crossed: `mark_full_sync` with the peer's
     /// confirmed `vv[me]` (not with a Partial peer), count it and emit `RoundComplete`.
     async fn maybe_complete(&self) -> Result<(), SessionEnd> {
-        let (synced, partial) = {
+        let (synced, partial, peer_fresh) = {
             let mut st = self.lock();
             if !st.round.complete() {
                 return Ok(());
             }
             st.round = Round::default();
-            (st.advertised.get(&self.ctx.me), st.peer_partial())
+            // The round changed the peer's freshness (an Empty peer is empty no more): until
+            // its next Hello say, it is unknown, so a stale store does not serve it live.
+            let peer_fresh = st.peer_freshness.take();
+            (
+                st.advertised.get(&self.ctx.me),
+                st.peer_partial(),
+                peer_fresh,
+            )
         };
         // A Partial peer's vector moves past what it filtered out, so its `vv[me]` does
         // not prove it holds our ops, and a round with it is no full sync: marking one
         // would let a re-bootstrap drop own ops only this node holds (spec §7).
         if !partial {
-            self.call(move |s| s.mark_full_sync(synced)).await?;
+            self.call(move |s| record_full_round(s, synced, peer_fresh))
+                .await?;
         }
         self.ctx
             .metrics
@@ -453,19 +494,23 @@ impl Session {
                 mesh,
                 vv,
                 scope,
-                stale,
+                freshness,
             } => {
                 if mesh != self.ctx.mesh {
                     return Err(SessionEnd::Protocol("Hello for another mesh".into()));
                 }
                 self.check_scope(&scope).await?;
-                self.check_stale(&scope, stale).await?;
-                self.on_hello(vv, scope);
+                self.check_stale(&scope, freshness).await?;
+                self.on_hello(vv, scope, freshness);
                 Ok(())
             }
             SyncMsg::Advertise { vv } => {
-                self.ctx.signout.peer_hello(&self.ctx.me, &vv);
                 let mut st = self.lock();
+                // Before the peer's Hello its scope and role are unchecked (ruling A1).
+                if st.peer_scope.is_none() {
+                    return Err(SessionEnd::Protocol("Advertise before Hello".into()));
+                }
+                self.ctx.signout.peer_hello(&self.ctx.me, &vv);
                 for (o, &seq) in &vv.0 {
                     raise(&mut st.advertised, *o, seq);
                     raise(&mut st.known, *o, seq);
@@ -516,24 +561,32 @@ impl Session {
         }
     }
 
-    /// Spec §7 with sub-spec 8a ruling C1, on each `Hello` from a Full peer while this
-    /// store is stale: a peer that is no restore source either ends the session
-    /// ([`SessionEnd::PeerStale`]; nothing is served or reset), a fresh one ends it with
-    /// [`SessionEnd::Stale`] so the node re-bootstraps from it. Nothing is served to a Full
-    /// peer from a stale store. With a Partial peer (a client) a stale node syncs on as
-    /// usual: a client cannot restore it, and such rounds do not refresh its staleness.
-    async fn check_stale(&self, peer_scope: &Scope, peer_stale: bool) -> Result<(), SessionEnd> {
+    /// Spec §7 with sub-spec 8a rulings C1, C1b and A2, on each `Hello` while this store
+    /// is stale:
+    /// - a **Fresh** Full peer ends the session with [`SessionEnd::Stale`], so the node
+    ///   re-bootstraps from it (the only peer it ever resets from);
+    /// - if this store is Full, a **Stale** Full peer ends it with
+    ///   [`SessionEnd::PeerStale`]: neither serves the other nor resets;
+    /// - an **Empty** Full peer (never synced) is synced with: it holds nothing to
+    ///   resurrect, and takes this store's staleness with the data (`record_full_round`);
+    /// - a Partial peer (a client), or any peer when this store is Partial, is synced
+    ///   with as usual: they exchange only `_mesh`, which a stale host hands every client.
+    async fn check_stale(&self, peer_scope: &Scope, peer: Freshness) -> Result<(), SessionEnd> {
         if matches!(peer_scope, Scope::Partial(_)) || !self.call(|s| s.is_stale()).await? {
             return Ok(());
         }
-        if peer_stale {
-            info!(
-                peer = %self.ctx.peer.short(),
-                "this store and the peer's are both stale; not syncing with it"
-            );
-            return Err(SessionEnd::PeerStale);
+        let own_full = self.call(|s| Ok(s.scope() == Scope::Full)).await?;
+        match peer {
+            Freshness::Fresh => Err(SessionEnd::Stale),
+            Freshness::Stale { .. } if own_full => {
+                info!(
+                    peer = %self.ctx.peer.short(),
+                    "this store and the peer's are both stale; not syncing with it"
+                );
+                Err(SessionEnd::PeerStale)
+            }
+            Freshness::Stale { .. } | Freshness::Empty => Ok(()),
         }
-        Err(SessionEnd::Stale)
     }
 
     /// Refuses a peer whose announced scope contradicts its role in `_mesh` (host ⇔
@@ -551,7 +604,7 @@ impl Session {
         }
     }
 
-    fn on_hello(&self, vv: VersionVector, scope: Scope) {
+    fn on_hello(&self, vv: VersionVector, scope: Scope, freshness: Freshness) {
         self.ctx.signout.peer_hello(&self.ctx.me, &vv);
         let mut st = self.lock();
         if st.round.awaiting_reply {
@@ -574,6 +627,7 @@ impl Session {
         st.advertised = vv.clone();
         st.known = vv;
         st.peer_scope = Some(scope);
+        st.peer_freshness = Some(freshness);
         st.hello_gen += 1;
         st.live = true;
         drop(st);
@@ -696,10 +750,10 @@ impl Session {
         if send_hello {
             // Spec §7 / ruling C1: a stale (or re-bootstrapping) node says so; whether it
             // syncs is decided on the peer's `Hello` (`check_stale`).
-            let (vv, scope, stale) = self
-                .call(|s| Ok((s.version_vector()?, s.scope(), s.is_stale()?)))
+            let paused = self.paused();
+            let (vv, scope, freshness) = self
+                .call(move |s| Ok((s.version_vector()?, s.scope(), own_freshness(s, paused)?)))
                 .await?;
-            let stale = stale || self.paused();
             {
                 let mut st = self.lock();
                 st.round.hello_epoch = self.ctx.pulls.current();
@@ -710,7 +764,7 @@ impl Session {
                 mesh,
                 vv,
                 scope,
-                stale,
+                freshness,
             };
             self.send(w, &hello).await?;
         }
@@ -718,10 +772,19 @@ impl Session {
         if self.paused() || !self.lock().live {
             return Ok(());
         }
-        // A stale store serves no Full peer (spec §7): it would hand on what the other
-        // replicas may have GC'd the tombstones of. Live mode from before the store went
-        // stale ends here; the peer's next `Hello` decides (`check_stale`).
-        if !self.lock().peer_partial() && self.call(|s| s.is_stale()).await? {
+        // A stale Full store serves no Full peer but an Empty one (spec §7, C1b): it would
+        // hand on what the other replicas may have GC'd the tombstones of. Live mode from
+        // before the store went stale ends here; the peer's next `Hello` decides
+        // (`check_stale`).
+        let gated = {
+            let st = self.lock();
+            !st.peer_partial() && !matches!(st.peer_freshness, Some(Freshness::Empty))
+        };
+        if gated
+            && self
+                .call(|s| Ok(s.scope() == Scope::Full && s.is_stale()?))
+                .await?
+        {
             return Ok(());
         }
         let Some(gen_flushed) = self.flush(w).await? else {

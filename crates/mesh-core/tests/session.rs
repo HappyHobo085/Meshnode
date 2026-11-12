@@ -169,7 +169,7 @@ impl Raw {
             mesh: mesh(),
             vv,
             scope: mesh_proto::Scope::Full,
-            stale: false,
+            freshness: mesh_proto::Freshness::Fresh,
         }
     }
 
@@ -361,7 +361,7 @@ async fn covered_above_advertised_ignored() {
         mesh: mesh(),
         vv: hello_vv,
         scope: mesh_proto::Scope::Full,
-        stale: false,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Covered { origin: x, upto: 7 }).await;
@@ -394,7 +394,7 @@ async fn oversized_batch_is_protocol_error() {
         mesh: mesh(),
         vv: VersionVector::default(),
         scope: mesh_proto::Scope::Full,
-        stale: false,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Ops { ops }).await;
@@ -426,7 +426,7 @@ async fn hello_from_other_mesh_is_protocol_error() {
         mesh: MeshId([0xEE; 32]),
         vv: VersionVector::default(),
         scope: mesh_proto::Scope::Full,
-        stale: false,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     assert!(matches!(end_of(side).await, SessionEnd::Protocol(_)));
@@ -459,7 +459,7 @@ async fn drop_mid_round_does_not_mark_sync() {
         mesh: mesh(),
         vv: VersionVector::default(),
         scope: mesh_proto::Scope::Full,
-        stale: false,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Done).await;

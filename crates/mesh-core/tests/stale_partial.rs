@@ -413,3 +413,130 @@ async fn live_mesh_write_after_svc_writes_reaches_client_at_once() {
     a.shutdown().await;
     c.shutdown().await;
 }
+
+/// Ruling C1b: a stale host serves a new, never-synced (Empty) host without resetting;
+/// the new host takes the stale host's freshness and reports Stale. When a Fresh host
+/// appears, both re-bootstrap from it and keep their data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_serves_a_new_empty_host_which_turns_stale() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let now = now_of(&t.clocks[0]);
+    let Quad { a, b, c, d, .. } = t;
+    let mut ea = a.subscribe();
+
+    // E: a new host, invited by stale A, shut out from the fresh hosts B and D.
+    let de = tempfile::tempdir().unwrap();
+    let ie = NodeId(
+        mesh_core::local::load_or_create_key(de.path())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    b.partition(&[ie]);
+    d.partition(&[ie]);
+    let (e, _ce) = join(&de, "e", now, a.invite(Role::Host, TTL).await.unwrap()).await;
+    let mut ee = e.subscribe();
+    wait_until("E has the data from A", T, || async {
+        val(&e, "a-synced").await.is_some() && val(&e, "b-data").await.is_some()
+    })
+    .await;
+    wait_until("E reports stale", T, || async { is_stale(&e).await }).await;
+    assert!(
+        !saw_rebootstrap(&mut ea),
+        "A must not reset from an empty host"
+    );
+    assert_eq!(a.status(), NodeStatus::Running);
+    assert_eq!(val(&a, "b-data").await, Some(b"2".to_vec()));
+    e.store().set(NS, "e-data", b"5".to_vec()).await.unwrap();
+    assert!(!saw_rebootstrap(&mut ee));
+
+    // A Fresh host comes back: both re-bootstrap from it and nothing is lost.
+    a.heal();
+    b.heal();
+    d.heal();
+    wait_rebootstrap_done(&mut ea).await;
+    wait_rebootstrap_done(&mut ee).await;
+    converged(&[&a, &b, &d, &e], T).await;
+    for n in [&a, &b, &e] {
+        for k in ["a-synced", "b-data", "e-data"] {
+            assert!(val(n, k).await.is_some(), "{k} missing");
+        }
+    }
+    assert!(!is_stale(&a).await && !is_stale(&e).await);
+    for n in [a, b, c, d, e] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling A2: a stale client and a stale host (its only host) keep syncing `_mesh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_client_and_stale_host_keep_syncing() {
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let (b, _cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    let (c, cc) = join(
+        &dirs[2],
+        "c",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    full_sync_since(&a, day0).await;
+    full_sync_since(&c, day0).await;
+    let (ia, ib, ic) = (a.node_id(), b.node_id(), c.node_id());
+    // Apart while the clock jumps (no round may straddle it), B gone for good.
+    a.partition(&[ib, ic]);
+    c.partition(&[ib, ia]);
+    b.partition(&[ia, ic]);
+    wait_until("A and C apart", T, || async {
+        !a.members().iter().any(|m| m.id == ic && m.online)
+            && !c.members().iter().any(|m| m.id == ia && m.online)
+    })
+    .await;
+    for clock in [&ca, &cc] {
+        clock.set(day0 + 81 * DAY);
+    }
+    assert!(is_stale(&a).await && is_stale(&c).await);
+    a.heal();
+    c.heal();
+    a.partition(&[ib]);
+    c.partition(&[ib]);
+    // Rounds between them: neither refreshes the other.
+    more_rounds(&a, ic, 1).await;
+    assert!(is_stale(&a).await && is_stale(&c).await);
+    let (mut ea, mut ec) = (a.subscribe(), c.subscribe());
+    a.set_info(Some("a-later".into()), None).await.unwrap();
+    wait_until("C sees A's write", T, || async {
+        c.members()
+            .iter()
+            .any(|m| m.id == ia && m.info.as_ref().is_some_and(|i| i.name == "a-later"))
+    })
+    .await;
+    c.set_info(Some("c-later".into()), None).await.unwrap();
+    wait_until("A sees C's write", T, || async {
+        a.members()
+            .iter()
+            .any(|m| m.id == ic && m.info.as_ref().is_some_and(|i| i.name == "c-later"))
+    })
+    .await;
+    more_rounds(&c, ia, 2).await;
+    assert!(!saw_rebootstrap(&mut ea) && !saw_rebootstrap(&mut ec));
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}

@@ -233,6 +233,27 @@ impl<W: WallClock> Store<W> {
         Ok(())
     }
 
+    /// A store that never synced took everything from a peer whose last full sync was at
+    /// `at_ms` (a stale peer, sub-spec 8a C1b): records that time as its own, so it is as
+    /// stale as its source and never a restore source for that data. Does nothing once a
+    /// full sync is recorded. `synced_self_seq` is not touched: a stale source proves
+    /// nothing about this node's own ops.
+    pub fn inherit_full_sync(&self, at_ms: u64) -> Result<(), StoreError> {
+        let _clock = self.lock_clock();
+        let tx = self.db.begin_write()?;
+        {
+            let mut m = tx.open_table(META)?;
+            if meta_u64(&m, meta::LAST_FULL_SYNC_MS)?.is_none() {
+                m.insert(
+                    meta::LAST_FULL_SYNC_MS.as_bytes(),
+                    keys::u64_value(at_ms).as_slice(),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Wall time of the last `mark_full_sync`, if any.
     pub fn last_full_sync_ms(&self) -> Result<Option<u64>, StoreError> {
         let tx = self.db.begin_read()?;

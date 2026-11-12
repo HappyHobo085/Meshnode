@@ -45,15 +45,27 @@ impl Scope {
     }
 }
 
+/// How recent a sync peer's data is, announced in `Hello` (spec §7, sub-spec 8a C1b).
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Freshness {
+    /// A full sync within the staleness window: a source a stale node may restore from.
+    Fresh,
+    /// No full sync for longer than the staleness window (its last one at `since_ms`), or
+    /// re-bootstrapping. Never a restore source.
+    Stale { since_ms: u64 },
+    /// Has never completed a full sync (a new store): nothing to restore from, and nothing
+    /// that could resurrect data either.
+    Empty,
+}
+
 #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum SyncMsg {
     Hello {
         mesh: MeshId,
         vv: VersionVector,
         scope: Scope,
-        /// The sender is no source to restore from: its store is stale (spec §7) or it is
-        /// re-bootstrapping. A stale node re-bootstraps only from a peer that says `false`.
-        stale: bool,
+        /// Whether the sender's data can be trusted as recent (spec §7, sub-spec 8a C1b).
+        freshness: Freshness,
     },
     Ops {
         ops: Vec<SignedOp>,
@@ -126,7 +138,7 @@ mod tests {
                 mesh: MeshId([7; 32]),
                 vv: VersionVector::default(),
                 scope,
-                stale: true,
+                freshness: Freshness::Stale { since_ms: 9 },
             };
             assert_eq!(crate::decode::<SyncMsg>(&crate::encode(&m)).unwrap(), m);
         }

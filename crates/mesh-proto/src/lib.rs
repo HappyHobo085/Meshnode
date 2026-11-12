@@ -19,7 +19,9 @@ pub use service::{
     Limits, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, Placement, ServiceKind, ServiceManifest,
     valid_service_name,
 };
-pub use sync::{MAX_BATCH_BYTES, MAX_BATCH_OPS, Scope, SyncMsg, VersionVector, batch_ops};
+pub use sync::{
+    Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, Scope, SyncMsg, VersionVector, batch_ops,
+};
 pub use ticket::InviteTicket;
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -136,7 +138,7 @@ mod tests {
                 mesh: MeshId([7; 32]),
                 vv,
                 scope: crate::Scope::Full,
-                stale: false,
+                freshness: crate::Freshness::Empty,
             },
             SyncMsg::Advertise {
                 vv: VersionVector::default(),

@@ -72,7 +72,6 @@ mod test_caps {
     pub const MAX_TOTAL_RECORDS: usize = 4;
     pub const MAX_TOTAL_CT_BYTES: u64 = 40;
     pub const MAX_SEEN_NONCES_PER_DEVICE: usize = 10;
-    pub const MAX_HLCIDX_PER_ACCOUNT: u64 = 8;
 }
 
 async fn service_from(path: std::path::PathBuf) -> Svc {
@@ -212,14 +211,6 @@ async fn own_count(kv: &MemKv, metric: &str) -> Option<i64> {
         .map(|v| String::from_utf8(v).unwrap().parse().unwrap())
 }
 
-/// The `hlcidx` members this node added for `acct` (0 before the first).
-async fn hlcidx_count(kv: &MemKv, acct: &str) -> i64 {
-    kv.get(&keys::hlcidx_count_key(acct, &node_hex()))
-        .await
-        .unwrap()
-        .map_or(0, |v| String::from_utf8(v).unwrap().parse().unwrap())
-}
-
 /// A fresh hex nonce per call.
 fn nonce() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -258,10 +249,12 @@ async fn seed_facts(kv: &MemKv, acct: &str, f: &AccountFacts) {
 }
 
 async fn seed_record(kv: &MemKv, acct: &str, ns: &str, rec: &WireRecord) {
-    let set = keys::hlcidx_set(acct, ns, &rec.hlc);
-    kv.set_add(&set, rec.uuid.as_bytes().to_vec())
-        .await
-        .unwrap();
+    kv.set(
+        &keys::hlcidx_key(acct, ns, &rec.hlc, &rec.uuid),
+        keys::HLCIDX_VALUE.to_vec(),
+    )
+    .await
+    .unwrap();
     let mut stored = rec.clone();
     stored.ord = None;
     kv.set_ordered(
@@ -1402,21 +1395,28 @@ async fn retention_prunes_old_tombstones() {
 
     // A stale copy of a pruned uuid (an hlc older than its tombstone's) answers 200 but is not
     // stored (the store keeps the pruned key's ordered tombstone), and re-pushing it, however
-    // often, grows neither counter nor the tombstone index. Its `hlcidx` member is added once
-    // (the first push is a new hlc for that uuid) and then counted no more.
+    // often, grows neither counter nor the tombstone index, and leaves no tie-index key (the
+    // pruned uuid's own key went with the prune).
     let bytes = own_count(&kv, "ct_bytes").await;
     let stale = rec("t0000", old - DAY, 0, "node", "stale ciphertext");
     let stale_tomb = tomb("t0001".into(), old - DAY);
-    let idx_before = hlcidx_count(&kv, &a).await;
-    let first = push("bm", vec![stale.clone(), stale_tomb.clone()], later);
-    assert_eq!(s.call(&kv, first).await.0, 200);
-    let idx_after = hlcidx_count(&kv, &a).await;
-    assert_eq!(idx_after, idx_before + 2, "two new (uuid, hlc) members");
-    for _ in 0..2 {
+    let tie_keys = |uuid: &'static str| {
+        let kv = kv.clone();
+        let prefix = format!("hlcidx/{a}/bm/");
+        async move {
+            let keys = kv.list_keys(&prefix, None, 2000).await.unwrap();
+            keys.into_iter()
+                .filter(|k| k.ends_with(&format!("/{uuid}")))
+                .count()
+        }
+    };
+    assert_eq!(tie_keys("t0000").await, 0, "pruned with its record");
+    for _ in 0..3 {
         let again = push("bm", vec![stale.clone(), stale_tomb.clone()], later);
         assert_eq!(s.call(&kv, again).await.0, 200);
     }
-    assert_eq!(hlcidx_count(&kv, &a).await, idx_after, "no recount");
+    assert_eq!(tie_keys("t0000").await, 0);
+    assert_eq!(tie_keys("t0001").await, 0);
     assert_eq!(own_count(&kv, "records").await, Some(records));
     assert_eq!(own_count(&kv, "ct_bytes").await, bytes);
     assert_eq!(
@@ -1521,70 +1521,95 @@ async fn retention_age_counts_from_node_storage_not_client_stamp() {
     assert_eq!(listed.len(), 501, "the counter matches what is stored");
 }
 
-/// I2(b): every new `(uuid, hlc)` adds a permanent `hlcidx` member, so the members a node adds
-/// per account are counted (`idxcount/<acct>/<node>`) and capped at
-/// `MAX_HLCIDX_PER_ACCOUNT` (4 × `MAX_RECORDS_PER_ACCOUNT`; 8 under `test-caps`), summed over
-/// every node. A push that would pass the cap is refused whole with 507 before anything is
-/// written; a stale push (no write) adds nothing.
+/// The tie index holds one plain key per stored record, at the hlc it is stored at: an update
+/// plain-deletes the key of the hlc it moved off, so a uuid edited 50 times leaves exactly one
+/// live index key (the mesh GC later removes the 49 delete tombstones). A stale push, which
+/// the store does not keep, leaves no key either.
 #[tokio::test(flavor = "multi_thread")]
-async fn caps_hlcidx_members_per_account_507() {
-    assert_eq!(test_caps::MAX_HLCIDX_PER_ACCOUNT, 8);
-    let s = service_test_caps().await;
+async fn hlcidx_one_live_key_per_record() {
+    let s = service().await;
     let kv = fresh_kv();
     let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
     seed_member(&kv, &a, &d1).await;
-    let push = |acct: &str, dev: &str, records: Vec<WireRecord>| {
+    let push = |records: Vec<WireRecord>| {
         let body = json!({ "ns": "bm", "records": records });
-        req("POST", "/v1/records", auth(acct, dev, &nonce()), Some(body))
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
     };
-    let stored_wall = |uuid: &str| {
-        let key = keys::rec_key(&a, "bm", uuid);
+    let index = || {
         let kv = kv.clone();
-        async move {
-            let raw = kv.get(&key).await.unwrap().unwrap();
-            let v: Value = serde_json::from_slice(&raw).unwrap();
-            v["hlc"]["wall_ms"].as_i64().unwrap()
-        }
+        let prefix = format!("hlcidx/{a}/");
+        async move { kv.list_keys(&prefix, None, 1000).await.unwrap() }
     };
 
-    let two = vec![rec("r1", 1, 0, "n", "x"), rec("r2", 1, 0, "n", "x")];
-    assert_eq!(s.call(&kv, push("A", "D1", two)).await.0, 200);
-    assert_eq!(hlcidx_count(&kv, &a).await, 2);
-    // Three rounds of updates to both: 2 + 6 = 8, exactly at the cap.
-    for wall in 2..5 {
-        let both = vec![rec("r1", wall, 0, "n", "x"), rec("r2", wall, 0, "n", "x")];
-        assert_eq!(s.call(&kv, push("A", "D1", both)).await.0, 200);
+    for wall in 1..=50 {
+        let edit = vec![rec("r1", wall, 0, "n", &format!("v{wall}"))];
+        assert_eq!(s.call(&kv, push(edit)).await.0, 200);
     }
-    assert_eq!(hlcidx_count(&kv, &a).await, 8);
-    // A stale push writes nothing and counts nothing.
-    let stale = vec![rec("r1", 2, 0, "n", "x")];
-    assert_eq!(s.call(&kv, push("A", "D1", stale)).await.0, 200);
-    assert_eq!(hlcidx_count(&kv, &a).await, 8);
-    // One more update is refused, and nothing of it is written.
-    let over = vec![rec("r1", 9, 0, "n", "y")];
-    assert_eq!(s.call(&kv, push("A", "D1", over)).await.0, 507);
-    assert_eq!(stored_wall("r1").await, 4);
-    let hlc9 = json!({ "wall_ms": 9, "counter": 0, "node": "n" });
-    let set = keys::hlcidx_set(&a, "bm", &hlc9);
-    assert!(kv.set_members(&set, None, 10).await.unwrap().is_empty());
-    assert_eq!(hlcidx_count(&kv, &a).await, 8);
+    let hlc50 = json!({ "wall_ms": 50, "counter": 0, "node": "n" });
+    assert_eq!(
+        index().await,
+        vec![keys::hlcidx_key(&a, "bm", &hlc50, "r1")]
+    );
 
-    // Another account has its own count.
-    let (b, d2) = (vector::account_id("B"), vector::device_id("D2"));
-    seed_member(&kv, &b, &d2).await;
-    let first = vec![rec("r1", 9, 0, "n", "y")];
-    assert_eq!(s.call(&kv, push("B", "D2", first)).await.0, 200);
-    assert_eq!(hlcidx_count(&kv, &b).await, 1);
-    // The cap is over every node's count: with 6 more from another node, B can add 1, not 2.
-    let elsewhere = hex::encode([9u8; 32]);
-    kv.set(&keys::hlcidx_count_key(&b, &elsewhere), b"6".to_vec())
+    // A stale copy is not stored and leaves no key.
+    let stale = vec![rec("r1", 7, 0, "n", "old")];
+    assert_eq!(s.call(&kv, push(stale)).await.0, 200);
+    assert_eq!(index().await.len(), 1);
+
+    // Deleting moves the key to the tombstone's hlc.
+    let gone = vec![dead("r1", 51)];
+    assert_eq!(s.call(&kv, push(gone)).await.0, 200);
+    let hlc51 = json!({ "wall_ms": 51, "counter": 0, "node": "n" });
+    assert_eq!(
+        index().await,
+        vec![keys::hlcidx_key(&a, "bm", &hlc51, "r1")]
+    );
+}
+
+/// The store's 512-byte key limit on the tie-index key: a LIVE record whose index key would be
+/// too long is refused with 413 (mesh-only, as for a too-long record key) and nothing is
+/// written; a tombstone with the same uuid is still stored, without an index key.
+#[tokio::test(flavor = "multi_thread")]
+async fn hlcidx_key_too_long_live_413_tombstone_stored() {
+    let s = service().await;
+    let kv = fresh_kv();
+    let (a, d1) = (vector::account_id("A"), vector::device_id("D1"));
+    seed_member(&kv, &a, &d1).await;
+    let push = |records: Vec<WireRecord>| {
+        let body = json!({ "ns": "bm", "records": records });
+        req("POST", "/v1/records", auth("A", "D1", &nonce()), Some(body))
+    };
+    let hlc = json!({ "wall_ms": 5, "counter": 0, "node": "n" });
+    // The longest uuid whose record key fits; its index key does not.
+    let room = keys::MAX_KEY - keys::rec_key(&a, "bm", "").len();
+    let uuid = "u".repeat(room);
+    assert!(keys::rec_key(&a, "bm", &uuid).len() <= keys::MAX_KEY);
+    assert!(keys::hlcidx_key(&a, "bm", &hlc, &uuid).len() > keys::MAX_KEY);
+
+    let live = vec![rec(&uuid, 5, 0, "n", "x")];
+    assert_eq!(s.call(&kv, push(live)).await.0, 413);
+    assert_eq!(kv.get(&keys::rec_key(&a, "bm", &uuid)).await.unwrap(), None);
+
+    let dead = vec![dead(&uuid, 5)];
+    assert_eq!(s.call(&kv, push(dead)).await.0, 200);
+    let raw = kv
+        .get(&keys::rec_key(&a, "bm", &uuid))
         .await
+        .unwrap()
         .unwrap();
-    let two_more = vec![rec("r2", 1, 0, "n", "y"), rec("r3", 1, 0, "n", "y")];
-    assert_eq!(s.call(&kv, push("B", "D2", two_more)).await.0, 507);
-    let one_more = vec![rec("r2", 1, 0, "n", "y")];
-    assert_eq!(s.call(&kv, push("B", "D2", one_more)).await.0, 200);
-    assert_eq!(hlcidx_count(&kv, &b).await, 2);
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(v["deleted"], json!(true));
+    let prefix = format!("hlcidx/{a}/");
+    assert!(kv.list_keys(&prefix, None, 10).await.unwrap().is_empty());
+}
+
+/// A tombstone of `uuid` at `wall` (counter 0, node `n`).
+fn dead(uuid: &str, wall: i64) -> WireRecord {
+    WireRecord {
+        deleted: true,
+        ct: String::new(),
+        ..rec(uuid, wall, 0, "n", "")
+    }
 }
 
 // ------------------------------------------------------------------------- real store

@@ -115,6 +115,11 @@ pub fn prune(acct: &str, ns: &str, now_ms: i64) -> Pruned {
             match store::stored_meta(&rec_key) {
                 Some(m) if m.deleted && order_bytes(&m.hlc) == order => {
                     kv::set_ordered(&rec_key, &order, None);
+                    // The pruned uuid is no longer a tie partner at that hlc.
+                    let idx = keys::hlcidx_key(acct, ns, &m.hlc, uuid);
+                    if idx.len() <= keys::MAX_KEY {
+                        kv::delete(&idx);
+                    }
                     pruned.records += 1;
                     pruned.ct_bytes += m.ct_len as i64;
                 }

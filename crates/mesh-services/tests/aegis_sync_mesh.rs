@@ -345,16 +345,18 @@ fn by_greater_id(x: &'static str, y: &'static str) -> (&'static str, &'static st
     }
 }
 
-/// Writes `rec` into `(acct, ns)` exactly as the service stores a pushed record: its uuid in
-/// the hlc candidate index, then the record under its key, ordered by its hlc, with no `ord`
+/// Writes `rec` into `(acct, ns)` exactly as the service stores a pushed record: its tie-index
+/// key, then the record under its key, ordered by its hlc, with no `ord`
 /// (the same layout as `seed_record` in `aegis_sync.rs`). Live records only: a tombstone
 /// would also need the retention index.
 async fn seed_record(kv: &Arc<dyn KvBackend>, acct: &str, ns: &str, rec: &WireRecord) {
     assert!(!rec.deleted, "live records only");
-    let set = keys::hlcidx_set(acct, ns, &rec.hlc);
-    kv.set_add(&set, rec.uuid.as_bytes().to_vec())
-        .await
-        .unwrap();
+    kv.set(
+        &keys::hlcidx_key(acct, ns, &rec.hlc, &rec.uuid),
+        keys::HLCIDX_VALUE.to_vec(),
+    )
+    .await
+    .unwrap();
     let mut stored = rec.clone();
     stored.ord = None;
     kv.set_ordered(

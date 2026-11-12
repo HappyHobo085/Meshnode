@@ -25,25 +25,6 @@ fn members(set: &str) -> Vec<Vec<u8>> {
     }
 }
 
-/// Is `member` (a UTF-8 string's bytes, as every member this service writes) in `set`? One
-/// `set-members` call, listing from just below `member`: `member` with its last byte lowered
-/// by one and `0xFF` appended. Anything between that and `member` would contain `0xFF` after
-/// the shared prefix, which no UTF-8 string does, so the first member listed is `member`
-/// exactly when it is in the set. (A last byte of 0 never occurs: NUL is refused in a uuid.)
-pub fn has_member(set: &str, member: &[u8]) -> bool {
-    let Some((&last, head)) = member.split_last() else {
-        return false;
-    };
-    if last == 0 {
-        return members(set).iter().any(|m| m == member);
-    }
-    let mut below = head.to_vec();
-    below.extend_from_slice(&[last - 1, 0xFF]);
-    store::set_members(set, Some(&below), 1)
-        .first()
-        .is_some_and(|m| m == member)
-}
-
 fn id_set(set: &str) -> BTreeSet<String> {
     members(set)
         .into_iter()
@@ -168,26 +149,29 @@ pub fn stored_meta(key: &str) -> Option<Stored> {
 
 /// Writes `rec` (whose `uuid` is set and `ord` is none) as `(acct, ns, rec.uuid)`, ordered by
 /// its client `hlc`, over `old` (what this node had stored there), at node time `now_ms`. The
-/// tie-candidate index entry and, for a tombstone, its retention-index key go first, so a
-/// replica that has the record also has them; the retention-index key of an `old` tombstone
-/// goes after, once the uuid has moved off it.
+/// tie-index key and, for a tombstone, its retention-index key go first, so a replica that has
+/// the record also has them; the index keys of `old` are plain-deleted after, once the record
+/// is stored and the uuid has moved off them. The mesh GC removes those delete tombstones after
+/// 90 days, so neither index grows with edits, only with live records and recent churn.
 ///
 /// The retention-index key's value is when a node first stored the tombstone: `now_ms`, or
 /// the time already there if it is earlier. Retention's age floor counts from it, never from
 /// the client's `hlc.wall_ms`, which the client chooses (`retention.rs`).
 ///
-/// A tombstone whose index key would be over the store's key limit (possible only for an
-/// `ns` + `uuid` far longer than a real client's) is stored without one, and so is never
-/// counted or pruned by retention: retention reclaims space, it never decides what a client
-/// sees, so this refuses nothing.
+/// A tombstone whose retention-index or tie-index key would be over the store's key limit
+/// (possible only for an `ns` + `uuid` far longer than a real client's) is stored without that
+/// key. Without a retention-index key it is never counted or pruned by retention, which
+/// reclaims space and never decides what a client sees. Without a tie-index key it is not
+/// found as a tie partner of a record with a higher uuid at the same hlc, which then is served
+/// without `tie_ord`. A LIVE record whose tie-index key would be too long is refused with 413
+/// before anything is written (`records.rs`), as one whose record key is too long.
 ///
 /// Returns whether the record is now stored. A record over a key this node had stored is
 /// always stored (the LWW pre-check let only a strictly newer `hlc` through, and the stored
 /// order is that `hlc`'s). A key that read as absent may still hold the ORDERED mesh tombstone
 /// retention left when it pruned that uuid (`retention.rs`), which outranks an older `hlc`:
 /// the store then keeps the tombstone and drops this write, so that case re-reads the key, and
-/// the retention-index key just written for it is deleted again. The `hlcidx` member stays
-/// (grow-only; its candidate is re-checked when read).
+/// the index keys just written for it are deleted again.
 pub fn put_record(
     acct: &str,
     ns: &str,
@@ -201,7 +185,11 @@ pub fn put_record(
         let first = stored_ms(&tomb).map_or(now_ms, |t| t.min(now_ms));
         store::set(&tomb, first.to_string().as_bytes());
     }
-    store::set_add(&keys::hlcidx_set(acct, ns, &rec.hlc), rec.uuid.as_bytes());
+    let idx = keys::hlcidx_key(acct, ns, &rec.hlc, &rec.uuid);
+    let idx_fits = idx.len() <= keys::MAX_KEY;
+    if idx_fits {
+        store::set(&idx, keys::HLCIDX_VALUE);
+    }
     store::set_ordered(
         &keys::rec_key(acct, ns, &rec.uuid),
         &order_bytes(&rec.hlc),
@@ -211,15 +199,28 @@ pub fn put_record(
         let want = hlc_key(&rec.hlc);
         let stored =
             stored_hlc(&keys::rec_key(acct, ns, &rec.uuid)).is_some_and(|h| hlc_key(&h) == want);
-        if !stored && rec.deleted && tomb.len() <= keys::MAX_KEY {
-            store::delete(&tomb);
+        if !stored {
+            if rec.deleted && tomb.len() <= keys::MAX_KEY {
+                store::delete(&tomb);
+            }
+            if idx_fits {
+                store::delete(&idx);
+            }
         }
         return stored;
     }
-    if let Some(old) = old.filter(|o| o.deleted) {
-        let old_tomb = keys::tomb_key(acct, ns, &old.hlc, &rec.uuid);
-        if old_tomb.len() <= keys::MAX_KEY {
-            store::delete(&old_tomb);
+    if let Some(old) = old {
+        // `old.hlc` is strictly older than `rec.hlc` (the LWW pre-check), so these are never
+        // the keys just written.
+        let old_idx = keys::hlcidx_key(acct, ns, &old.hlc, &rec.uuid);
+        if old_idx.len() <= keys::MAX_KEY {
+            store::delete(&old_idx);
+        }
+        if old.deleted {
+            let old_tomb = keys::tomb_key(acct, ns, &old.hlc, &rec.uuid);
+            if old_tomb.len() <= keys::MAX_KEY {
+                store::delete(&old_tomb);
+            }
         }
     }
     true
@@ -233,23 +234,22 @@ pub fn stored_ms(key: &str) -> Option<i64> {
 /// The mesh tie rule: does another live record (tombstones included) of `(acct, ns)` with a
 /// LOWER uuid hold exactly `rec.hlc`? Then `rec` is served with `order::tie_ord`.
 ///
-/// The index set is a grow-only candidate list (a uuid stays listed after it moves to a newer
-/// hlc), so each candidate's CURRENT record is checked. Members are in byte order, which is
-/// uuid order, so the scan stops at `rec.uuid`.
+/// The tie index is a candidate list (a concurrent write on another node can leave a key
+/// behind after its uuid moved on), so each candidate's CURRENT record is checked. Keys under
+/// one hlc's prefix are in uuid order, so the scan stops at `rec.uuid`, which also leaves
+/// `rec` itself out.
 pub fn tied_below(acct: &str, ns: &str, rec: &WireRecord) -> bool {
-    let set = keys::hlcidx_set(acct, ns, &rec.hlc);
+    let prefix = keys::hlcidx_prefix(acct, ns, &rec.hlc);
     let want = hlc_key(&rec.hlc);
-    let mut after: Option<Vec<u8>> = None;
+    let mut after: Option<String> = None;
     loop {
-        let batch = store::set_members(&set, after.as_deref(), PAGE);
+        let batch = store::list_keys(&prefix, after.as_deref(), PAGE);
         let done = batch.len() < PAGE as usize;
-        for m in &batch {
-            if m.as_slice() >= rec.uuid.as_bytes() {
+        for key in &batch {
+            let uuid = &key[prefix.len()..];
+            if uuid >= rec.uuid.as_str() {
                 return false;
             }
-            let Ok(uuid) = std::str::from_utf8(m) else {
-                continue;
-            };
             let current = stored_hlc(&keys::rec_key(acct, ns, uuid));
             if current.is_some_and(|h| hlc_key(&h) == want) {
                 return true;

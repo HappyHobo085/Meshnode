@@ -5,9 +5,13 @@
 //! Replicated (`meshnode:kv/store`):
 //! - `rec/<acct>/<ns>/<uuid>`: one record, written with `set-ordered(order_bytes(hlc))`; the
 //!   value is the record's canonical `WireRecord` JSON (never an `ord`; see `records.rs`).
-//! - `hlcidx/<acct>/<ns>/<hex(order_bytes(hlc))>`: grow-only set of uuids that were ever
-//!   written with that exact `hlc`. A candidate list for tie detection only. Never compacted,
-//!   so the members an account adds are counted and capped (`idxcount/`, below).
+//! - `hlcidx/<acct>/<ns>/<hex(order_bytes(hlc))>/<uuid>`: the tie index, one plain key per
+//!   stored record at the hlc it is stored at (value [`HLCIDX_VALUE`]). Written before the
+//!   record; once the uuid's record is stored at a newer hlc, or pruned, the old key gets a plain
+//!   `delete`, whose mesh tombstone the GC removes after 90 days. So the index is bounded by the
+//!   live records plus 90 days of churn. A candidate list for tie detection only: a concurrent
+//!   write elsewhere can leave a stale key behind, so every candidate's current record is
+//!   re-checked (`store::tied_below`).
 //! - `devices/<acct>`: grow-only set of `devices::DeviceFacts` JSON.
 //! - `pending/<acct>`, `revoked/<acct>`: grow-only sets of device ids.
 //! - `approved/<acct>`: grow-only set of `devices::ApprovedFact` JSON (device id and the
@@ -22,9 +26,6 @@
 //!   anything is pruned.
 //! - `count/<node-id-hex>/<metric>`: this node's share of a server-wide count (decimal `i64`,
 //!   may go negative); the mesh-wide value is the sum over nodes (`caps.rs`).
-//! - `idxcount/<acct>/<node-id-hex>`: this node's count of the `hlcidx` members it added for
-//!   the account (decimal); the account's total is the sum over nodes, capped at
-//!   `caps::MAX_HLCIDX_PER_ACCOUNT` (`caps.rs`).
 //!
 //! Node-local (`meshnode:kv/local`):
 //! - `nonce/<device>/<nonce>`: a spent replay nonce.
@@ -73,10 +74,20 @@ pub fn account_prefix(acct: &str) -> String {
     format!("rec/{acct}/")
 }
 
-/// The tie-candidate set for `hlc` in `(acct, ns)`.
-pub fn hlcidx_set(acct: &str, ns: &str, hlc: &Value) -> String {
-    format!("hlcidx/{acct}/{}/{}", enc_ns(ns), hex(&order_bytes(hlc)))
+/// Every tie-index key of the records stored at `hlc` in `(acct, ns)` starts with this. The
+/// trailing `/` keeps one hlc's prefix from matching a longer hlc's keys.
+pub fn hlcidx_prefix(acct: &str, ns: &str, hlc: &Value) -> String {
+    format!("hlcidx/{acct}/{}/{}/", enc_ns(ns), hex(&order_bytes(hlc)))
 }
+
+/// The tie-index key of record `uuid` stored at `hlc` in `(acct, ns)`. Under one prefix the
+/// keys sort by uuid (raw, last component), as `store::tied_below` needs.
+pub fn hlcidx_key(acct: &str, ns: &str, hlc: &Value, uuid: &str) -> String {
+    format!("{}{uuid}", hlcidx_prefix(acct, ns, hlc))
+}
+
+/// A tie-index key's value: only the key matters.
+pub const HLCIDX_VALUE: &[u8] = b"1";
 
 pub fn devices_set(acct: &str) -> String {
     format!("devices/{acct}")
@@ -126,16 +137,6 @@ pub const COUNT_PREFIX: &str = "count/";
 /// `node_hex`'s share of the server-wide count `metric`.
 pub fn count_key(node_hex: &str, metric: &str) -> String {
     format!("{COUNT_PREFIX}{node_hex}/{metric}")
-}
-
-/// Every node's `hlcidx` member count for `acct` starts with this.
-pub fn hlcidx_count_prefix(acct: &str) -> String {
-    format!("idxcount/{acct}/")
-}
-
-/// `node_hex`'s count of the `hlcidx` members it added for `acct`.
-pub fn hlcidx_count_key(acct: &str, node_hex: &str) -> String {
-    format!("{}{node_hex}", hlcidx_count_prefix(acct))
 }
 
 /// The `kv/local` key recording a spent `(device, nonce)`.

@@ -193,14 +193,18 @@ mod mem {
             limit: u32,
         ) -> Result<Vec<String>, KvError> {
             self.check()?;
+            // Start at the prefix (or past `start_after`, whichever is later) and stop at the
+            // first key outside it, as the real store's range scan does, so a listing costs
+            // what it returns rather than the whole store.
             let lower = match start_after {
-                Some(after) => Bound::Excluded(after.to_string()),
-                None => Bound::Unbounded,
+                Some(after) if after >= prefix => Bound::Excluded(after.to_string()),
+                _ => Bound::Included(prefix.to_string()),
             };
             Ok(self.with(|i| {
                 i.registers
                     .range((lower, Bound::Unbounded))
-                    .filter(|(k, r)| k.starts_with(prefix) && r.value.is_some())
+                    .take_while(|(k, _)| k.starts_with(prefix))
+                    .filter(|(_, r)| r.value.is_some())
                     .map(|(k, _)| k.clone())
                     .take(limit as usize)
                     .collect()

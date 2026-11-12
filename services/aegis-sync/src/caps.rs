@@ -14,26 +14,14 @@
 //! on every node) both count it down. The drift is bounded by such races, which a personal mesh
 //! of a few devices rarely has, and only moves a soft cap.
 //!
-//! The per-account caps `MAX_PENDING_PER_ACCOUNT` and `MAX_RECORDS_PER_ACCOUNT` are not
-//! counters: the first is counted over the account's device facts (read anyway), the second
-//! over the account's keys (`records.rs`), both exact over the local view.
-//!
-//! [`MAX_HLCIDX_PER_ACCOUNT`] is a counter, kept the same way per node but per account
-//! (`idxcount/<acct>/<node-id-hex>`, outside `count/` so [`totals`] stays one key per node and
-//! metric). Every new `(uuid, hlc)` a record is stored with adds a permanent member to the
-//! grow-only tie index `hlcidx/<acct>/<ns>/<hlc>`; an update adds no key and need not grow the
-//! ciphertext, so the record and byte caps never see it. The counter only ever goes up: the
-//! index is never compacted. It is soft in the same ways as the others.
+//! The per-account caps are not counters: `MAX_PENDING_PER_ACCOUNT` is counted over the
+//! account's device facts (read anyway), and `MAX_RECORDS_PER_ACCOUNT` over the account's keys
+//! (`records.rs`), both exact over the local view.
 use crate::keys;
 use crate::meshnode::kv::store as kv;
 use crate::store::PAGE;
 
 pub use aegis_sync_core::wire::{MAX_PENDING_PER_ACCOUNT, MAX_RECORDS_PER_ACCOUNT};
-
-/// The `hlcidx` members an account may add, summed over every node: four writes per record the
-/// account may hold. Past it a push that would add a member is refused with 507.
-#[cfg(not(feature = "test-caps"))]
-pub const MAX_HLCIDX_PER_ACCOUNT: u64 = 4 * MAX_RECORDS_PER_ACCOUNT as u64;
 
 #[cfg(not(feature = "test-caps"))]
 pub use aegis_sync_core::{
@@ -51,8 +39,6 @@ pub const MAX_TOTAL_RECORDS: usize = 4;
 pub const MAX_TOTAL_CT_BYTES: u64 = 40;
 #[cfg(feature = "test-caps")]
 pub const MAX_SEEN_NONCES_PER_DEVICE: usize = 10;
-#[cfg(feature = "test-caps")]
-pub const MAX_HLCIDX_PER_ACCOUNT: u64 = 8;
 
 /// Accounts created (first registrations) on the node.
 pub const ACCOUNTS: &str = "accounts";
@@ -113,34 +99,6 @@ pub fn add(metric: &str, delta: i64) {
     }
     let key = keys::count_key(&node_hex(), metric);
     let value = read(&key).saturating_add(delta);
-    kv::set(&key, value.to_string().as_bytes());
-}
-
-/// The `hlcidx` members added for `acct`, summed over every node's count.
-pub fn hlcidx_members(acct: &str) -> i64 {
-    let prefix = keys::hlcidx_count_prefix(acct);
-    let mut total: i64 = 0;
-    let mut after: Option<String> = None;
-    loop {
-        let batch = kv::list_keys(&prefix, after.as_deref(), PAGE);
-        let done = batch.len() < PAGE as usize;
-        for key in &batch {
-            total = total.saturating_add(read(key));
-        }
-        if done {
-            return total;
-        }
-        after = batch.last().cloned();
-    }
-}
-
-/// Adds `added` to this node's count of the `hlcidx` members it added for `acct`.
-pub fn add_hlcidx(acct: &str, added: u64) {
-    if added == 0 {
-        return;
-    }
-    let key = keys::hlcidx_count_key(acct, &node_hex());
-    let value = read(&key).saturating_add(i64::try_from(added).unwrap_or(i64::MAX));
     kv::set(&key, value.to_string().as_bytes());
 }
 

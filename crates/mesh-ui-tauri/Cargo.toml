@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "The Tauri command wrappers over mesh-ui, shared by the desktop and Android apps"
 edition = "2024"
 rust-version = "1.90"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 publish = false
 
 # Not a member of the root workspace (its `exclude` lists this crate): the root build stays

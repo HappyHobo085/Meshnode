@@ -4,7 +4,11 @@ members = ["crates/*", "apps/meshd"]
 exclude = [
     "spikes",
     "crates/mesh-runtime/tests/fixtures",
+    # WASM services, each its own workspace built for wasm32-wasip2 (scripts/build-services.sh).
+    "services",
     "patches",
+    # Vendored third-party-style trees (see vendor/VENDORED.md); not part of this workspace.
+    "vendor",
     "apps/android",
     "apps/desktop",
     # The Tauri wrappers: built only by the app workspaces, so this one stays webview-free.
@@ -14,7 +18,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.90"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

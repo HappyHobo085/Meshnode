@@ -6,7 +6,9 @@ use crate::error::StoreError;
 use crate::keys::{self, OP_KEY_LEN};
 use crate::read::scan_reg_winners;
 use crate::sync::SyncItem;
-use crate::tables::{self, ALL, META, OPS, OpRow, REG, REMOVED, RegRow, SUPERSEDED, meta};
+use crate::tables::{
+    self, ALL, META, OPS, OpRow, REG, REMOVED, RegRow, SUPERSEDED, SVC_LOCAL, SVC_LOCAL_COUNT, meta,
+};
 use crate::{Store, merge, meta_u64};
 use mesh_hlc::{Hlc, WallClock};
 use mesh_proto::{NodeId, Payload, SignedOp};
@@ -32,6 +34,10 @@ pub struct Export {
     /// Own `Set` ops too old to re-apply (older than [`TOMBSTONE_TTL_MS`]).
     pub expired: Vec<SignedOp>,
 }
+
+/// Tables [`Store::reset_to_empty`] leaves alone: `svc_local*` hold node-local service
+/// entries (replay nonces and the like), which no catch-up would bring back.
+const KEEP_TABLES_ON_RESET: [tables::Def; 4] = [META, REMOVED, SVC_LOCAL, SVC_LOCAL_COUNT];
 
 /// `meta` rows kept by [`Store::reset_to_empty`].
 const KEEP_ON_RESET: [&str; 5] = [
@@ -390,7 +396,7 @@ impl<W: WallClock> Store<W> {
         let _clock = self.lock_clock();
         let tx = self.db.begin_write()?;
         for def in ALL {
-            if def.name() != META.name() && def.name() != REMOVED.name() {
+            if !KEEP_TABLES_ON_RESET.iter().any(|k| k.name() == def.name()) {
                 tx.open_table(def)?.retain(|_, _| false)?;
             }
         }

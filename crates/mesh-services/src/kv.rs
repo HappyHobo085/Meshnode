@@ -6,6 +6,11 @@ use mesh_runtime::{KvBackend, KvError};
 /// [`KvBackend`] over one namespace of the replicated store. The namespace is fixed at
 /// construction, so a service cannot reach another one. Writes go through the store's
 /// write gate, which refuses them on a removed or re-bootstrapping node.
+///
+/// `local_*` use the node-local `svc_local` entries of the same namespace. The namespace
+/// is generation-qualified, so after a purge the old generation's local entries are
+/// unreachable (and the GC pass deletes them). Local writes create no op and are not
+/// gated.
 #[derive(Clone)]
 pub struct ServiceKv {
     store: StoreHandle,
@@ -88,6 +93,29 @@ impl KvBackend for ServiceKv {
     ) -> Result<Vec<Vec<u8>>, KvError> {
         self.store
             .set_members(&self.ns, set, start_after.map(<[u8]>::to_vec), limit)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn local_get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+        self.store.local_get(&self.ns, key).await.map_err(map_err)
+    }
+
+    async fn local_set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> Result<Result<(), String>, KvError> {
+        self.store
+            .local_set(&self.ns, key, value, ttl_ms)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn local_delete(&self, key: &str) -> Result<(), KvError> {
+        self.store
+            .local_delete(&self.ns, key)
             .await
             .map_err(map_err)
     }

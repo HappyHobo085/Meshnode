@@ -5,6 +5,9 @@
 //!   `last_full_sync_ms`, `synced_self_seq` = u64 big-endian.
 //! - `reg`: [`RegRow`]; `set`: [`SetRow`]; `ops`: [`OpRow`]; `pending`: [`PendingRow`] (postcard).
 //! - `vv` (highest gap-free seq), `removed` (max cutoff seq), `superseded` (superseded-at ms): u64 big-endian.
+//! - `svc_local`: `ns \0 key` -> expiry ms (u64 big-endian, 0 = none) `++` value;
+//!   `svc_local_count`: `ns` -> row count `++` sweep-due ms (two u64 big-endian). Node-local,
+//!   never replicated.
 
 use crate::error::StoreError;
 use mesh_hlc::Hlc;
@@ -22,8 +25,22 @@ pub(crate) const VV: Def = TableDefinition::new("vv");
 pub(crate) const PENDING: Def = TableDefinition::new("pending");
 pub(crate) const REMOVED: Def = TableDefinition::new("removed");
 pub(crate) const SUPERSEDED: Def = TableDefinition::new("superseded");
+/// Node-local service entries (`meshnode:kv/local`); never replicated (see `svc_local.rs`).
+pub(crate) const SVC_LOCAL: Def = TableDefinition::new("svc_local");
+pub(crate) const SVC_LOCAL_COUNT: Def = TableDefinition::new("svc_local_count");
 
-pub(crate) const ALL: [Def; 8] = [META, REG, SET, OPS, VV, PENDING, REMOVED, SUPERSEDED];
+pub(crate) const ALL: [Def; 10] = [
+    META,
+    REG,
+    SET,
+    OPS,
+    VV,
+    PENDING,
+    REMOVED,
+    SUPERSEDED,
+    SVC_LOCAL,
+    SVC_LOCAL_COUNT,
+];
 
 /// `meta` row names.
 pub(crate) mod meta {

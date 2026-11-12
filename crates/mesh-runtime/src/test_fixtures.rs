@@ -1,9 +1,11 @@
 //! Test-only (`test-hooks`): builds the guest fixtures in `tests/fixtures` (a separate cargo workspace) for
-//! `wasm32-wasip2` and hands out their bytes.
+//! `wasm32-wasip2` and hands out their bytes; likewise the real services under `services/`
+//! (each its own workspace).
 //!
-//! The build runs once per test process into `<workspace target>/fixtures`, its own target
-//! dir, so it never waits on the outer cargo's target-dir lock. An exclusive file lock
-//! serializes concurrent test binaries; whoever comes second finds the build up to date.
+//! Each build runs once per test process into its own target dir under the workspace
+//! target (`fixtures`, `services`), so it never waits on the outer cargo's target-dir lock.
+//! An exclusive file lock serializes concurrent test binaries; whoever comes second finds
+//! the build up to date.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -23,21 +25,62 @@ fn fixtures_dir() -> &'static Path {
 
 fn build_fixtures() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Cargo.toml");
-    let target = workspace_target_dir().join("fixtures");
-    std::fs::create_dir_all(&target).expect("create fixtures target dir");
-    let lock = File::create(target.join("build.lock")).expect("create fixtures build lock");
-    lock.lock().expect("lock fixtures build");
+    build_wasm(&manifest, "fixtures", &[])
+}
+
+/// The path of `services/aegis-sync` built for `wasm32-wasip2` (release), the way
+/// `scripts/build-services.sh` builds it. Built once per test process, without the core's
+/// test-only `vectors` feature.
+pub fn aegis_sync_wasm() -> PathBuf {
+    static WASM: OnceLock<PathBuf> = OnceLock::new();
+    WASM.get_or_init(|| {
+        let manifest =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/aegis-sync/Cargo.toml");
+        build_wasm(&manifest, "services", &[]).join("aegis_sync.wasm")
+    })
+    .clone()
+}
+
+/// [`aegis_sync_wasm`] built with the service's test-only `test-caps` feature (its server-wide
+/// caps lowered so a test can reach them), into its own target directory so the two builds
+/// never overwrite each other's `aegis_sync.wasm`.
+pub fn aegis_sync_wasm_test_caps() -> PathBuf {
+    static WASM: OnceLock<PathBuf> = OnceLock::new();
+    WASM.get_or_init(|| {
+        let manifest =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/aegis-sync/Cargo.toml");
+        build_wasm(
+            &manifest,
+            "services-test-caps",
+            &["--features", "test-caps"],
+        )
+        .join("aegis_sync.wasm")
+    })
+    .clone()
+}
+
+/// Builds the workspace at `manifest` for `wasm32-wasip2` (release) into
+/// `<workspace target>/<subdir>`, with `extra` cargo arguments; returns the directory holding
+/// the `.wasm` files.
+fn build_wasm(manifest: &Path, subdir: &str, extra: &[&str]) -> PathBuf {
+    let target = workspace_target_dir().join(subdir);
+    std::fs::create_dir_all(&target).expect("create wasm target dir");
+    let lock = File::create(target.join("build.lock")).expect("create wasm build lock");
+    lock.lock().expect("lock wasm build");
 
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let out = Command::new(cargo)
         .args([
             "build",
+            // The committed lock file, never a re-resolve: a test run must not rewrite it.
+            "--locked",
             "--release",
             "--target",
             "wasm32-wasip2",
             "--manifest-path",
         ])
-        .arg(&manifest)
+        .arg(manifest)
+        .args(extra)
         .arg("--target-dir")
         .arg(&target)
         // Host-only settings from the outer build must not leak into the wasm build.
@@ -46,10 +89,11 @@ fn build_fixtures() -> PathBuf {
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env_remove("CARGO_BUILD_TARGET")
         .output()
-        .expect("run cargo to build fixtures");
+        .expect("run cargo to build wasm");
     assert!(
         out.status.success(),
-        "building fixtures failed (is the wasm32-wasip2 target installed?):\n{}",
+        "building {} failed (is the wasm32-wasip2 target installed?):\n{}",
+        manifest.display(),
         String::from_utf8_lossy(&out.stderr)
     );
     drop(lock);

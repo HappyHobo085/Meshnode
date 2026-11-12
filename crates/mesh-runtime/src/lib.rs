@@ -16,6 +16,7 @@ pub mod test_fixtures;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -136,6 +137,7 @@ impl Runtime {
             memory: Arc::new(Semaphore::new(max_memory_mb.max(1) as usize)),
             instantiations: Arc::default(),
             ticker: ticker.handle(),
+            fixed_wall_ms: Arc::new(AtomicI64::new(handle::REAL_WALL_CLOCK)),
         };
         Ok(Runtime {
             engine,
@@ -199,6 +201,15 @@ impl Runtime {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn epoch_ticks(&self) -> u64 {
         self.shared.ticker.ticks()
+    }
+
+    /// Makes every guest's `wasi:clocks/wall-clock` read `ms` (milliseconds since the UNIX
+    /// epoch) from the next request on; `None` restores the real clock. For contract tests
+    /// that sign tokens at a fixed instant.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_wall_clock_ms(&self, ms: Option<i64>) {
+        let ms = ms.unwrap_or(handle::REAL_WALL_CLOCK);
+        self.shared.fixed_wall_ms.store(ms, Ordering::Relaxed);
     }
 
     /// How many component instances this runtime has created.

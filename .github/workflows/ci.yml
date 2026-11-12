@@ -28,6 +28,29 @@ jobs:
       - run: cargo clippy -p mesh-runtime -p mesh-services --lib -- -D warnings
       - run: cargo test --workspace --all-features
 
+  # services/aegis-sync (its own workspace): the release build, the single-node harness and
+  # the two-node mesh tests, and the vendored aegis-sync-core check. No Aegis checkout here,
+  # so the check only validates the commit hash recorded in vendor/VENDORED.md.
+  aegis-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            services/aegis-sync
+      - run: cargo fmt --check --manifest-path services/aegis-sync/Cargo.toml
+      - run: cargo clippy --locked --release --target wasm32-wasip2 --all-targets --manifest-path services/aegis-sync/Cargo.toml -- -D warnings
+      - run: bash scripts/build-services.sh
+      - run: cargo test -p mesh-services --test aegis_sync --test aegis_sync_mesh -j 2
+      - run: bash scripts/sync-aegis-core.sh --check
+
   proptest-long:
     runs-on: ubuntu-latest
     timeout-minutes: 45

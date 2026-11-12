@@ -31,6 +31,7 @@ mod maint;
 pub mod merge;
 mod read;
 mod removal;
+mod svc_local;
 mod sync;
 mod tables;
 
@@ -42,6 +43,7 @@ pub use error::StoreError;
 pub use maint::{Export, SETTLE_MS, STALE_MS, TOMBSTONE_TTL_MS};
 pub use read::RegEntry;
 pub use removal::{CUTOFF_EXEMPT_SET, RemovalReport};
+pub use svc_local::{LOCAL_MAX_KEY, LOCAL_MAX_KEYS, LOCAL_MAX_VALUE};
 pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;
@@ -65,6 +67,12 @@ pub struct Store<W: WallClock = SystemClock> {
     clock: Mutex<Clock<W>>,
     /// Change events, sent after each commit.
     events: tokio::sync::broadcast::Sender<Change>,
+    /// A second handle to the wall clock, for readers that must not wait on `clock`
+    /// (node-local entry TTLs).
+    wall: W,
+    /// Rows read by local-entry sweeps (test-hooks only).
+    #[cfg(feature = "test-hooks")]
+    local_scanned: std::sync::atomic::AtomicU64,
 }
 
 /// Reads a u64 `meta` row.
@@ -92,7 +100,10 @@ impl<W: WallClock> Store<W> {
     /// Errors: `WrongMesh` if the file belongs to another mesh; `Corrupt { table: "meta" }`
     /// if it belongs to another node or its metadata is malformed; `Io` if the file is
     /// already open (by this or another process) or cannot be opened.
-    pub fn open(path: &Path, mesh: MeshId, key: SigningKey, wall: W) -> Result<Self, StoreError> {
+    pub fn open(path: &Path, mesh: MeshId, key: SigningKey, wall: W) -> Result<Self, StoreError>
+    where
+        W: Clone,
+    {
         let db = Database::create(path)?;
         let node = NodeId(key.verifying_key().to_bytes());
         let tx = db.begin_write()?;
@@ -149,8 +160,11 @@ impl<W: WallClock> Store<W> {
             mesh,
             node,
             key,
-            clock: Mutex::new(Clock::new(wall, Hlc::from_u64(last_hlc))),
+            clock: Mutex::new(Clock::new(wall.clone(), Hlc::from_u64(last_hlc))),
             events,
+            wall,
+            #[cfg(feature = "test-hooks")]
+            local_scanned: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

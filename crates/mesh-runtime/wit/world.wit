@@ -1,6 +1,7 @@
 package meshnode:service;
 
-/// A Meshnode service: a `wasi:http` handler that stores its data in `meshnode:kv`.
+/// A Meshnode service: a `wasi:http` handler that stores its data in `meshnode:kv`
+/// (`store`, replicated; `local`, this node only).
 /// No filesystem, no sockets, no environment variables, no arguments, no preopened
 /// directories. `wasi:io` and `wasi:http/types` come in as dependencies of the imports.
 world service {
@@ -26,6 +27,8 @@ world service {
   // Every destination outside the service's `outbound` allowlist is refused.
   import wasi:http/outgoing-handler@0.2.12;
   import meshnode:kv/store;
+  // Node-local, non-replicated entries with a TTL.
+  import meshnode:kv/local;
 
   export wasi:http/incoming-handler@0.2.12;
 }

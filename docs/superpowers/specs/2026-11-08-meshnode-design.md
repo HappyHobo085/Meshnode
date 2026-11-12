@@ -94,8 +94,11 @@ The in-process admin transport (`InProcessAdmin`, with the same request dispatch
 | `apps/ui` | The Svelte 5 + Vite + TypeScript frontend (one codebase for desktop and Android), built to `apps/ui/dist` and loaded by both shells under a strict CSP; the generated ts-rs types are checked in *(back-ported from sub-spec 6)* | `mesh-ui` types (generated) |
 | `apps/desktop` | The desktop Tauri 2 app. `apps/desktop/src-tauri` is its own Cargo workspace and `Cargo.lock`; finds or starts the daemon, dialogs, `open_url`, elevated service install *(back-ported from sub-spec 6)* | `mesh-ui-tauri`, `apps/ui` |
 | `apps/android` | The Android Tauri 2 project + Kotlin foreground service, receivers, workers, onboarding. `apps/android/src-tauri` is its own Cargo workspace (so desktop CI needs no webview system packages), builds the single `cdylib` `libmeshnode_app.so` that links `mesh-ffi`, and carries its own `Cargo.lock` *(back-ported from sub-spec 5)* | `mesh-ffi`, `mesh-ui-tauri`, `apps/ui` *(sub-spec 6 replaced the placeholder page)* |
-| `services/aegis-sync` | The Aegis sync-server as a Meshnode WASM component (§11) | `aegis-sync-core` (from the Aegis repo) |
+| `services/aegis-sync` | The Aegis sync-server as a Meshnode WASM component (§11). Its own Cargo workspace, built by `scripts/build-services.sh` to `wasm32-wasip2` *(back-ported from sub-spec 7)* | `aegis-sync-core` (vendored) |
+| `vendor/aegis-sync-core` | A byte-identical copy of the Aegis `sync-server/core` crate (pure protocol logic and the contract vectors), with the Aegis commit recorded in `vendor/VENDORED.md`. Refreshed only by `scripts/sync-aegis-core.sh <aegis-checkout>`, verified with `--check` *(back-ported from sub-spec 7)* | — |
 | `packaging/` | systemd unit, launchd plist, WiX fragments, deb/rpm metadata | — |
+
+**Licence** *(back-ported from sub-spec 7)*: Meshnode is **AGPL-3.0-only** (root `LICENSE`, `[workspace.package] license`, every manifest). The vendored Aegis core is AGPL-3.0-only too; other vendored third-party code (for example `patches/ndk-context`) keeps its own licence.
 
 Each crate is testable on its own. `mesh-hlc`, `mesh-store` and `mesh-proto` have no networking.
 
@@ -196,7 +199,7 @@ ServiceManifest {
 ### WASM runtime
 - **wasmtime, Component Model.** A service is a component targeting world `meshnode:service/service`:
   - **exports** `wasi:http/incoming-handler` (the standard WASI HTTP proxy interface, so any toolchain that supports `wasi:http` works)
-  - **imports** `wasi:clocks`, `wasi:random`, `wasi:cli` stdio (the guest's stdout and stderr go to the node log line by line, tagged with the service name; wasmtime-wasi has no `wasi:logging`) *(back-ported from sub-spec 3)*, `meshnode:kv/store`, and `wasi:http/outgoing-handler`, which is **always linked** but refuses every destination not in `outbound`.
+  - **imports** `wasi:clocks`, `wasi:random`, `wasi:cli` stdio (the guest's stdout and stderr go to the node log line by line, tagged with the service name; wasmtime-wasi has no `wasi:logging`) *(back-ported from sub-spec 3)*, `meshnode:kv/store`, `meshnode:kv/local` *(back-ported from sub-spec 7)*, and `wasi:http/outgoing-handler`, which is **always linked** but refuses every destination not in `outbound`.
 
 ```wit
 package meshnode:kv;
@@ -213,13 +216,22 @@ interface store {
   set-members: func(set: string, start-after: option<list<u8>>, limit: u32) -> list<list<u8>>;
   node-id: func() -> list<u8>;                    // for per-node bookkeeping (e.g. soft caps)
 }
+
+// Node-local, never replicated *(back-ported from sub-spec 7)*
+interface local {
+  get: func(key: string) -> option<list<u8>>;
+  set: func(key: string, value: list<u8>, ttl-ms: u64) -> result<_, string>;  // 0 = no expiry
+  delete: func(key: string);
+}
 ```
+
+- **`kv/local`** *(back-ported from sub-spec 7)*: entries live in a node-local redb table keyed `(service, generation, key)` and are not in the op log or catch-up. A TTL entry is invisible once expired and is swept in the GC tick. Caps per service: value at most 64 KiB, key at most 512 bytes, at most 100 000 live keys (a breach returns `err`, not a trap). A count table and a due time keep the cap check and the sweep from scanning. Local writes **bypass the write gate** (they are not ops and consume no sequence number) and **survive `reset_to_empty`**, so replay nonces outlive a re-bootstrap. A purge (new generation) makes the old generation unreachable and the GC drops its namespaces. Services that do not import it are unaffected.
 
 - **Isolation:** each service can reach only its own namespace. No filesystem access. Outgoing network only to the allowlist.
 - **One fresh instance per request** (the wasi:http proxy model), from a cached `InstancePre` keyed by module hash.
 - **Compiled-code cache:** on desktop, a file cache under `<data>/services/cache/` *(path amended in final review)*. **On Android, compiled code is cached as bytes and loaded with `Module::deserialize` into anonymous memory, never memory-mapped from an app-data file**, because Android blocks executing code mapped from files in app-writable storage. Verified in the Android spike (`spikes/android/RESULTS.md`). There is no interpreter fallback: Cranelift works in the app sandbox, so Pulley is left out *(back-ported from sub-spec 3)*.
 - **Limits:** memory cap through `ResourceLimiter`, time cap through epoch interruption (10 ms ticks), body cap enforced before the module runs. A trap or timeout returns `500`/`504` and is logged; the node never crashes because of a service.
-- Request and response bodies are buffered, not streamed, for WASM and static responses (bounded by the limits) *(back-ported from sub-spec 3)*.
+- Request and response bodies are buffered, not streamed, for WASM and static responses (bounded by the limits) *(back-ported from sub-spec 3)*. `max_body_bytes` (8 MiB by default) caps **responses** as well as requests, so a service must page its large responses *(back-ported from sub-spec 7)*.
 - Writes made through `meshnode:kv` apply locally right away (read-your-writes on that node) and become ops for replication.
 
 ### Static sites
@@ -311,7 +323,7 @@ One set of typed requests, used by the CLI and the UI:
   The policy is stored in `meshd.toml` (`[android] power = "balanced" | "always_on" | "saver"`, default `balanced`; the file is the single source of truth and Rust persists a change) and applied by a pure decision function `(policy, charging, screen_on, activity) -> Option<WakeLock>`; Kotlin only holds and releases the locks it is told to, and reports charging and screen state through `set_power_state`. The policy changes through `set_power_policy` *(back-ported from sub-spec 5)*.
 
   This matters less than it sounds: every host serves from its own local copy, so the phone being asleep only delays replication and forwarding through the phone. It never blocks another host's own users.
-- **Gateway on Android:** other apps on the phone (Aegis Android) reach `http://127.0.0.1:7801` / `:7777`. The client app must allow cleartext traffic to `127.0.0.1` through its network security config (an Aegis change, §11).
+- **Gateway on Android:** other apps on the phone (Aegis Android) reach `http://127.0.0.1:7801` / `:7777`. Aegis Android needs **no** cleartext waiver: Aegis sync uses Rust sockets rather than Android's HTTP stack, and its `sync::validated_base` already allows loopback `http` *(as built, sub-spec 7; the design had planned a network security config entry)*. A client that does use Android's HTTP stack must allow cleartext to `127.0.0.1` itself.
 - Wi-Fi ↔ mobile data handover is handled by iroh's network-change handling. The service passes Android `ConnectivityManager` callbacks to `Endpoint::network_change()`.
 - **Build** *(back-ported from sub-spec 5)*: Tauri 2 CLI (pinned in CI), NDK 27.2.12479018, compileSdk 36, build-tools 36.0.0, targetSdk 35, minSdk 29, arm64-v8a; the release `.so` is stripped with thin LTO, `codegen-units = 1`, `opt-level = "s"` and never `panic = "abort"` (`mesh-ffi` catches panics at the boundary). Debug signing for now; release signing is sub-spec 8. The size of the release APK is recorded in `docs/manual-checks/sub-spec-5.md`. CI builds the release APK, runs the Kotlin JVM tests and lint, and checks that the committed UniFFI Kotlin bindings are current.
 
@@ -323,27 +335,33 @@ Goal: the same HTTP contract (`/v1/records`, `/v1/devices*`, `/healthz`), unchan
 
 ### Code structure
 - In the **Aegis repo**, move the protocol logic out of `sync-server/src/main.rs` (auth `canonical()` + verification, request bounds, `canonicalize_body`, stamp-poisoning checks, pagination) into a new pure crate **`aegis-sync-core`**, which has no axum and no tokio. The native axum server keeps working on top of it, and its existing tests keep passing.
-- `services/aegis-sync` is a thin `wasi:http` handler over `aegis-sync-core`, with storage through `meshnode:kv`. Ed25519 verification and `getrandom` work under WASI (`getrandom` uses `wasi:random`).
+- `services/aegis-sync` is a thin `wasi:http` handler over `aegis-sync-core` (vendored under `vendor/aegis-sync-core`, §3), with storage through `meshnode:kv` *(as built, sub-spec 7)*. Ed25519 verification and `getrandom` work under WASI (`getrandom` uses `wasi:random`).
 
 ### State mapping (merge-safe)
 | sync-server state | Meshnode representation |
 |---|---|
 | records `(account, ns, uuid)` | `set-ordered("rec/<acct>/<ns>/<uuid>", order = encode(client hlc wall, counter, node), value)` — the client HLC decides, exactly as server-side LWW does today. Deletes are ordered writes whose value is the client's tombstone record. |
-| server tie-break `ord` | derived **deterministically** from `(hlc, uuid)` when served, instead of being stored. A counter assigned per node would differ between replicas. Aegis must accept the derived value (to verify against `src-tauri/src/sync_stores.rs` in the sub-spec). |
-| devices (registered) | grow-only set `devices/<acct>` of `{ device_id, label, registered_hlc }`; `last_seen` as a per-node LWW register (the latest across nodes is shown) |
-| owner | **computed**, not stored: the earliest-registered non-revoked device. That reproduces both "first device is owner" and D5's "owner sign-out hands off to the oldest remaining device". |
-| pending / approved | grow-only sets `pending/<acct>` and `approved/<acct>`; a device is pending if it's in `pending` and not in `approved` and not revoked |
+| server tie-break `ord` | derived **deterministically** from `(hlc, uuid)` when served, instead of being stored. A counter assigned per node would differ between replicas. *As built (sub-spec 7):* every record in a tie group except the lowest uuid gets a `tie_ord`, and tombstones count as tie partners. |
+| devices (registered) | grow-only set `devices/<acct>` of `{ device_id, registered_ms }`; labels are separate grow-only `LabelFact`s; `last_seen` as a per-node register (the latest across nodes is shown) *(as built, sub-spec 7)* |
+| owner | **computed**, not stored. *As built (sub-spec 7):* revoked devices are skipped; devices that never had to ask to join rank first, by `(registered_ms, id)`; approved joiners rank after them, by `(approved_ms, id)`. Approving a device therefore never takes the role from the current owner. On owner sign-out the mesh hands the role to the earliest-approved joiner, while the native server hands it to the earliest-registered device: a known divergence. |
+| pending / approved | grow-only sets `pending/<acct>` and `approved/<acct>`; a device is pending if it's in `pending` and not in `approved` and not revoked. `approved` members carry `{device_id, approved_ms}`, stamped `max(now, latest approval in the account + 1)` so that an approval always ranks after earlier ones even when the node clock is behind *(as built, sub-spec 7)* |
 | revoked | grow-only set `revoked/<acct>` (already grow-only today) |
-| registration secret | service config value (a `_mesh` register set through the admin UI), not an environment variable |
-| server-wide caps | **per-node soft caps**: each node enforces them over its local view. A global hard cap would need coordination, which this design avoids, so the mesh total can briefly go over by up to (nodes − 1) × the per-request allowance. |
-| replay nonce set | node-local and in memory, as today. Requests come from the local gateway, so a captured token would have to be replayed on another node's loopback, which is not reachable. |
-| tombstone retention (count + 90-day age) | kept as service logic over `list-keys`. The mesh's own 90-day tombstone GC (§5) matches the age floor. |
+| registration secret | none in v1: **open registration**. The gateway is reachable only from the owner's own devices, and a warning is logged once per node per day. A secret is deferred *(decided in sub-spec 7)* |
+| server-wide caps | **per-node soft caps**: each node enforces them over its local view. A global hard cap would need coordination, which this design avoids, so the mesh total can briefly go over by up to (nodes − 1) × the per-request allowance. *As built (sub-spec 7):* the sync service's tie index (`hlcidx`) is one plain key per stored record, and an update deletes the key of the hlc it moved off, so record churn leaves only delete tombstones, which the mesh GC removes after 90 days; no extra cap is needed. |
+| replay nonce set | `meshnode:kv/local` (node-local, not replicated, survives restarts and a re-bootstrap), key `nonce/<device>/<nonce>`, TTL `max(MAX_TTL_MS, expires_ms - now + 1)` so a token issued ahead of the node clock cannot be replayed before it expires. Replay protection is **per node**: a token captured on one node's loopback could be replayed once on another node. Accepted for v1 *(as built, sub-spec 7)*. |
+| tombstone retention (count + 90-day age) | service logic over `list-keys`, run only on the `(acct, ns)` being pushed. A prune is an **ordered delete**, so a stale copy of a pruned record is not resurrected (unlike native). Each pruned record leaves a permanent empty row of about 100 to 300 bytes that the mesh GC never removes. The 90-day age counts from when a node **first stored** the tombstone (kept in its index entry), not from the client's `hlc.wall_ms`, so a client cannot get past-dated tombstones pruned at once *(as built, sub-spec 7)*. |
+| response paging | `GET` pages are capped at **6 MiB** on the mesh (native: 32 MiB) because the runtime's 8 MiB `max_body_bytes` also caps responses; the client follows `next` *(as built, sub-spec 7)*. |
+| mesh-only refusals | `413` for a key over 512 bytes, an order over 64 bytes, `hlc.node` over 48 bytes, or `ns` + `uuid` over about 442 bytes; `400` for a NUL in `ns`, `uuid` or nonce. Keys percent-escape `ns` (`%`, `/`, NUL) so that `ns "a/b"` + `uuid "c"` differs from `ns "a"` + `uuid "b/c"` *(as built, sub-spec 7)*. |
 
 **Concurrency edge, stated:** two devices registering the first device of the **same new account** on different nodes during a network split both become "owner" until the split heals. Afterwards the earlier one is the owner, and the other stays an approved device.
 
+**Revocation on a mesh, stated** *(as built, sub-spec 7)*: revoking a device in Aegis stops only that device's Aegis client. A device that is itself a mesh member (every device that syncs through its own gateway) still has a node that receives the account's replicated records, which the device can read with the account's data key. As a mesh member it can also write the sync service's store directly. Natively, revocation stops the pulls. To cut off a lost or stolen device, the owner must **also remove it from the mesh** (`meshd remove <id>` or the UI).
+
+**Deploy limits** *(as built, sub-spec 7)*: the service is deployed with `meshd deploy wasm sync <file> --memory-mb 64 --timeout-ms 30000 --max-body 8388608`; the daemon's default request timeout is 10 s.
+
 ### Aegis client changes
 - Default sync URL suggestion `http://127.0.0.1:7801` when Meshnode is detected (desktop: an admin socket exists; Android: the Meshnode package is installed).
-- Android: a network-security-config entry allowing cleartext traffic to `127.0.0.1` only.
+- Android: **no** network-security-config waiver is needed (as built, sub-spec 7): Aegis sync uses Rust sockets and `sync::validated_base` already allows loopback `http`. The Meshnode detection (package `net.meshnode.app`, manifest `<queries>`) stays. If the manual check shows Aegis Android cannot reach `http://127.0.0.1:7801`, re-add the waiver.
 - Optional later: embed `mesh-client` so Aegis can sync on devices without Meshnode installed.
 
 ---
@@ -392,7 +410,7 @@ Each row is its own sub-spec → plan → implementation cycle, in this order. E
 | 4 | Gateway + admin API + `meshd` CLI + desktop OS services *(implemented, manual check pending; see `docs/manual-checks/sub-spec-4.md`)* | two desktop nodes serving a site, installed as system services |
 | 5 | Android shell *(implemented, manual check pending; see `docs/manual-checks/sub-spec-5.md`)* | `mesh-ffi`, the foreground service, boot/watchdog, power policy |
 | 6 | Tauri UI (desktop + Android) *(implemented, manual check pending; see `docs/manual-checks/sub-spec-6.md`)* | the full management UI, QR invite/join |
-| 7 | Aegis sync port | `aegis-sync-core` extraction in Aegis, `services/aegis-sync`, Aegis client changes |
+| 7 | Aegis sync port *(implemented, manual check pending; see `docs/manual-checks/sub-spec-7.md`)* | `aegis-sync-core` extraction in Aegis, `services/aegis-sync`, Aegis client changes |
 | 8 | `mesh-client` + packaging + E2E | installers (MSI, deb/rpm, dmg, APK), the full §1 success-criteria run |
 
 ---

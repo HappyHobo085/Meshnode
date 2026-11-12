@@ -72,7 +72,7 @@ core's `rust-version` too. `sync-server/AGENTS.md` and `README.md` describe the 
   "Use Meshnode on this device (`http://127.0.0.1:7801`)". Never applied automatically.
 - **Android:** the same suggestion when package `net.meshnode.app` is installed (manifest `<queries>` entry for
   package visibility). A `network_security_config.xml` allows cleartext **only** to `127.0.0.1`; everything else
-  stays HTTPS-only.
+  stays HTTPS-only. *(As built: dropped, see §11.)*
 - Tests in Aegis's vitest/cargo setups; `src-tauri/AGENTS.md` and `src/AGENTS.md` updated.
 
 ## 4. Meshnode: `meshnode:kv/local`
@@ -176,3 +176,21 @@ Meshnode: a job that installs `wasm32-wasip2`, builds the service, runs §8.2–
 ## 10. Out of scope
 Embedding `mesh-client` in Aegis; Aegis release builds/signing; a registration secret; migration from a native
 server; iOS; public access.
+
+## 11. As built (differences from this design)
+
+Where this section and the text above disagree, this section is what was built. Master spec §3, §7, §8 and §11 carry the same changes.
+
+- **Owner rule (§2.1, §5.1).** Revoked devices are skipped. Devices that never had to ask to join (never in `pending`) rank first by `(registered_ms, id)`; approved joiners rank after them by `(approved_ms, id)`, so a later approval never takes the role from the current owner. `approved/<acct>` members are `{device_id, approved_ms}`; an approval is stamped `max(now, latest approval in the account + 1)`. Device labels are grow-only `LabelFact`s, not a field of the device row. `devices::is_member` exists, and `may_remove` returns NotOwner for a non-member actor. On owner sign-out the mesh hands the role to the earliest-approved joiner; native hands it to the earliest-registered device (a known divergence).
+- **Tie `ord` (§5.1).** Every tied record except the lowest uuid gets `tie_ord`; tombstones count as tie partners. The check re-reads current records, because the `hlcidx` index is only a candidate list.
+- **Android (§3).** No cleartext waiver: Aegis sync uses Rust sockets, and `sync::validated_base` already allows loopback http, so the waiver only loosened the content WebView for no benefit. The Meshnode detection and the manifest `<queries>` entry stay. The manual check says what to do if it turns out to be needed.
+- **GET pages (§5.2).** Capped at 6 MiB on the mesh (native: 32 MiB) because the runtime's 8 MiB `max_body_bytes` also caps responses. The cap is a service constant; the vendored core is unchanged.
+- **Mesh-only refusals (§5.1).** 413 for a key over 512 bytes, an order over 64 bytes, `hlc.node` over 48 bytes, or ns + uuid over about 442 bytes. 400 for a NUL in ns, uuid or nonce. Record and index keys percent-escape ns (`%`, `/`, NUL).
+- **Nonces (§5.1).** TTL is `max(MAX_TTL_MS, expires_ms - now + 1)`, not the token TTL alone. Replay protection is per node, accepted for v1.
+- **`kv/local` (§4).** Writes bypass the write gate and survive `reset_to_empty`. A count table and a due time avoid scans. Keys are capped at 512 bytes. The GC drops namespaces of purged generations (it keeps one while the active instance has not switched generation).
+- **Retention (§5.1).** Runs only on the pushed `(acct, ns)`. A prune is an ordered delete, so stale copies are not resurrected. Each pruned record leaves a permanent empty row of about 100 to 300 bytes that the mesh GC never removes. Cap counters are soft and count only stored writes.
+- **Open-registration warning.** Logged once per node per day (a `kv/local` marker).
+- **Owner approvals across nodes.** Concurrent approvals on different nodes before sync are still ordered by node clocks; this only affects which new device is the heir.
+- **Licence (§7).** Meshnode is AGPL-3.0-only. `vendor/VENDORED.md` records the Aegis commit (`71e78da`) that `vendor/aegis-sync-core` copies.
+- **Build output (§5.3).** `scripts/build-services.sh` builds with `--locked`, strips host `RUSTFLAGS`, and prints the path of `aegis_sync.wasm` (under `CARGO_TARGET_DIR` if set).
+- **CI (§8.5).** The Meshnode `aegis-sync` job also runs the service's fmt and wasm clippy. None of the new CI jobs has run yet.

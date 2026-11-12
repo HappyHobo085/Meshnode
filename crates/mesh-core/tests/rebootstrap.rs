@@ -443,6 +443,9 @@ async fn stuck_on_c() -> StuckOnC {
             && vv_of(&a, ic).await > 0
     })
     .await;
+    // The status turns `Rebootstrapping` before the reset (and the condition above may
+    // already hold then): wait for the reset itself.
+    wait_until("A's store reset", T, || async { vv_of(&a, ia).await < s }).await;
     // C lacks A's synced ops, so the re-bootstrap cannot finish.
     assert!(vv_of(&a, ia).await < s);
     assert_eq!(

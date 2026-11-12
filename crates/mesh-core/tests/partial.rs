@@ -609,23 +609,44 @@ async fn stale_store_syncs_with_stale_host() {
     assert!(!join.is_finished());
 }
 
-/// Ruling C1c: a round with a Fresh client refreshes the last-full-sync time (a stale host
-/// turns Fresh through it) but not `synced_self_seq`.
+/// Rulings C1c/C1d: a round with a Fresh client refreshes the last-full-sync time of a
+/// store that is not stale (not `synced_self_seq`), but never rescues a stale one.
 #[tokio::test(flavor = "multi_thread")]
-async fn fresh_client_round_refreshes_time_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = stale_founder_store(dir.path());
-    let seq = a.inner().synced_self_seq().unwrap();
+async fn fresh_client_round_refreshes_time_only_if_not_stale() {
     let mut vv = VersionVector::default();
     vv.set(id(1), 100);
+    // Not stale (10 days since its last full sync): refreshed to now.
+    let dir = tempfile::tempdir().unwrap();
+    let (a, clock) = founder_store_with_clock(dir.path());
+    a.inner().mark_full_sync(0).unwrap();
+    clock.advance(10 * 86_400_000);
+    let now = mesh_hlc::WallClock::now_ms(&clock);
+    let seq = a.inner().synced_self_seq().unwrap();
+    let (join, mut h, mut raw) = run_against_raw(&a, id(3));
+    raw.send(&hello(vv.clone(), Scope::client())).await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), Some(now));
+    assert_eq!(a.inner().synced_self_seq().unwrap(), seq);
+    assert!(!join.is_finished());
+
+    // Stale: the same round refreshes nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let synced = a.inner().last_full_sync_ms().unwrap();
     let (join, mut h, mut raw) = run_against_raw(&a, id(3));
     raw.send(&hello(vv, Scope::client())).await;
     assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
     raw.until_done().await;
     raw.send(&SyncMsg::Done).await;
     next_round(&mut h.events).await;
-    assert!(!a.inner().is_stale().unwrap(), "refreshed by a Fresh peer");
-    assert_eq!(a.inner().synced_self_seq().unwrap(), seq);
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), synced);
+    assert!(
+        a.inner().is_stale().unwrap(),
+        "a client never rescues a stale store"
+    );
     assert!(!join.is_finished());
 }
 
@@ -881,5 +902,67 @@ async fn empty_store_inherits_staleness_from_stale_peer() {
     assert_eq!(a.inner().last_full_sync_ms().unwrap(), Some(1_000_000));
     assert!(a.inner().is_stale().unwrap());
     assert_eq!(a.inner().synced_self_seq().unwrap(), None);
+    assert!(!join.is_finished());
+}
+
+/// A marker from a peer that last heard a `Hello` of ours from before a reset of this store
+/// (re-bootstrap) covers only what it believes we still hold: applying it would raise our
+/// vector over ops the reset deleted. The session ends instead, and the next one starts
+/// with a fresh `Hello`.
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_after_reset_ends_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    let x = id(4);
+    let (join, h, mut raw) = run_against_raw(&a, id(2));
+    let mut adv = VersionVector::default();
+    adv.set(x, 5);
+    raw.send(&hello(adv, Scope::Full)).await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    // The store is reset (a re-bootstrap) after our Hello went out.
+    h.pulls.begin_epoch();
+    raw.send(&SyncMsg::Covered { origin: x, upto: 3 }).await;
+    let end = timeout(Duration::from_secs(5), join)
+        .await
+        .expect("session ends")
+        .unwrap();
+    assert!(matches!(end, SessionEnd::Closed), "{end:?}");
+    assert_eq!(a.inner().version_vector().unwrap().get(&x), 0);
+}
+
+/// While re-bootstrapping (serving paused) a store rebuilds only from Fresh Full peers: a
+/// Stale or Empty Full peer's session ends before anything of it is applied, and its Done
+/// earns no pull credit. A client's `_mesh` is still taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_takes_data_only_from_fresh_full_peers() {
+    for peer in [STALE, Freshness::Empty] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = founder_store(dir.path());
+        let (join, h, mut raw) = run_against_raw(&a, id(2));
+        h.serve_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        raw.send(&hello_with(VersionVector::default(), Scope::Full, peer))
+            .await;
+        let end = timeout(Duration::from_secs(5), join)
+            .await
+            .expect("session ends")
+            .unwrap();
+        assert!(matches!(end, SessionEnd::Closed), "{peer:?}: {end:?}");
+        assert!(!h.pulls.reached(1), "{peer:?}");
+    }
+    // A client is fine.
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    let (join, h, mut raw) = run_against_raw(&a, id(3));
+    h.serve_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::client(),
+        STALE,
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
     assert!(!join.is_finished());
 }

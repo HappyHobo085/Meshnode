@@ -435,6 +435,17 @@ async fn stale_host_and_two_new_hosts_joining_in_parallel() {
     for ev in [&mut ea, &mut ee, &mut ee2] {
         wait_rebootstrap_done(ev).await;
     }
+    // A host that re-bootstrapped is Empty until a round with a Fresh peer; a round with a
+    // still-stale peer first (the client C, or a host not yet reset) makes it inherit
+    // staleness and re-bootstrap again. That settles once every stale node has reset.
+    wait_until("everyone fresh and running", T, || async {
+        let mut ok = true;
+        for n in [&a, &c, &e, &e2] {
+            ok &= n.status() == NodeStatus::Running && !is_stale(n).await;
+        }
+        ok
+    })
+    .await;
     converged(&[&a, &b, &d, &e, &e2], T).await;
     for n in [&a, &b, &e, &e2] {
         for k in ["a-synced", "b-data", "e-data", "e2-data", "a-late"] {
@@ -640,6 +651,52 @@ async fn stale_client_and_stale_host_keep_syncing() {
     more_rounds(&c, ia, 2).await;
     assert!(!saw_rebootstrap(&mut ea) && !saw_rebootstrap(&mut ec));
     for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1d: a stale host is not refreshed by a client that is Fresh only through
+/// another host (whose GC'd deletions the stale data could bring back); it stays Stale
+/// until it resets from that Fresh host, and then has all the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_not_refreshed_by_client_fresh_via_other_host() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad { a, b, c, d, .. } = t;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    let mut ea = a.subscribe();
+
+    // C reaches the Fresh hosts (they keep shutting A out) and turns Fresh through them.
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    wait_until("C fresh through B", T, || async { !is_stale(&c).await }).await;
+    // A keeps syncing with that Fresh client, and stays stale.
+    more_rounds(&a, ic, 3).await;
+    assert!(is_stale(&a).await, "a client cannot rescue a stale host");
+    assert!(!saw_rebootstrap(&mut ea));
+    assert_eq!(val(&a, "b-data").await, Some(b"2".to_vec()));
+    a.store().set(NS, "a-late", b"3".to_vec()).await.unwrap();
+
+    // A meets B: it resets from it and ends with all the data.
+    b.heal();
+    d.heal();
+    wait_rebootstrap_done(&mut ea).await;
+    converged(&[&a, &b, &d], T).await;
+    for k in ["a-synced", "b-data", "a-late"] {
+        assert!(val(&a, k).await.is_some(), "{k} on A");
+        assert!(val(&b, k).await.is_some(), "{k} on B");
+    }
+    assert!(!is_stale(&a).await);
+    for n in [a, b, c, d] {
         timeout(T, n.shutdown()).await.unwrap();
     }
 }

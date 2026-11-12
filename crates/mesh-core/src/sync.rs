@@ -127,6 +127,8 @@ pub struct TestHandles {
     pub wake: Arc<Notify>,
     pub metrics: Arc<PeerMetrics>,
     pub serve_paused: Arc<AtomicBool>,
+    /// The session's re-bootstrap epochs (`begin_epoch` simulates a reset).
+    pub pulls: Arc<FullPulls>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -142,6 +144,7 @@ impl SessionCtx {
         let wake = Arc::new(Notify::new());
         let metrics = Arc::new(PeerMetrics::default());
         let serve_paused = Arc::new(AtomicBool::new(false));
+        let pulls = Arc::new(FullPulls::default());
         let ctx = SessionCtx {
             mesh: store.raw().mesh(),
             me: store.raw().node_id(),
@@ -156,7 +159,7 @@ impl SessionCtx {
             serve_paused: serve_paused.clone(),
             signout: Arc::default(),
             incoming: None,
-            pulls: Arc::default(),
+            pulls: pulls.clone(),
         };
         let handles = TestHandles {
             cmds: cmd_tx,
@@ -164,6 +167,7 @@ impl SessionCtx {
             wake,
             metrics,
             serve_paused,
+            pulls,
         };
         (ctx, handles)
     }
@@ -216,6 +220,9 @@ struct State {
     /// What we last announced we hold (our `Hello`, then our `Advertise`s): the bound the
     /// peer checks our `Covered` markers against.
     told: VersionVector,
+    /// The [`FullPulls`] epoch when our latest `Hello` went out: the peer's picture of us
+    /// (its `known`) dates from it.
+    told_epoch: u64,
     /// What we believe the peer holds.
     known: VersionVector,
     /// Bumped on every `Hello` received (it resets `known`).
@@ -273,7 +280,11 @@ fn raise(vv: &mut VersionVector, origin: NodeId, seq: u64) {
 /// peer announced in its `Hello`:
 /// - **Fresh:** refreshes this node's last-full-sync time. With a Full peer that is
 ///   `mark_full_sync` (it also advances `synced_self_seq` to the peer's `vv[me]`); with a
-///   Partial peer the time only (its vector moves past what it filtered out).
+///   Partial peer the time only (its vector moves past what it filtered out), and only
+///   while this node is not stale yet (ruling C1d): a client keeps a fresh host fresh but
+///   never rescues a stale one, whose data could bring back deletions that the host the
+///   client is fresh through has already GC'd. A stale node turns Fresh only by resetting
+///   from a Fresh Full peer.
 /// - **Stale:** refreshes nothing; a store that never synced inherits the peer's
 ///   staleness ([`mesh_store::Store::inherit_full_sync`], clamped).
 /// - **Empty** (or unknown): nothing. Two Empty stores stay Empty.
@@ -284,7 +295,13 @@ fn record_round(
     peer: Option<Freshness>,
 ) -> Result<(), StoreError> {
     match peer {
-        Some(Freshness::Fresh) if peer_partial => s.refresh_full_sync_time(),
+        Some(Freshness::Fresh) if peer_partial => {
+            if s.is_stale()? {
+                Ok(())
+            } else {
+                s.refresh_full_sync_time()
+            }
+        }
         Some(Freshness::Fresh) => s.mark_full_sync(synced),
         Some(Freshness::Stale { since_ms }) => s.inherit_full_sync(since_ms),
         Some(Freshness::Empty) | None => Ok(()),
@@ -498,6 +515,7 @@ impl Session {
                 }
                 self.check_scope(&scope).await?;
                 self.check_stale(&scope, freshness).await?;
+                self.check_rebuild_source(Some(&scope), Some(freshness))?;
                 self.on_hello(vv, scope, freshness);
                 Ok(())
             }
@@ -514,12 +532,29 @@ impl Session {
                 }
                 Ok(())
             }
-            SyncMsg::Ops { ops } => self.on_ops(ops).await,
+            SyncMsg::Ops { ops } => {
+                let (scope, fresh) = self.peer_view();
+                self.check_rebuild_source(scope.as_ref(), fresh)?;
+                self.on_ops(ops).await
+            }
             SyncMsg::Covered { origin, upto } => {
-                let (advertised, partial) = {
+                let (advertised, partial, told_epoch) = {
                     let st = self.lock();
-                    (st.advertised.get(&origin), st.peer_partial())
+                    (st.advertised.get(&origin), st.peer_partial(), st.told_epoch)
                 };
+                if told_epoch != self.ctx.pulls.current() {
+                    // This store was reset (re-bootstrap) after our latest Hello: the peer
+                    // diffs against what we held before, so its marker may cover only the
+                    // top of a range the reset deleted. Applying it would skip those ops for
+                    // good; end the session so the next one starts with a fresh Hello.
+                    debug!(
+                        peer = %self.ctx.peer.short(),
+                        "marker against a Hello from before a reset; restarting the session"
+                    );
+                    return Err(SessionEnd::Closed);
+                }
+                let (scope, fresh) = self.peer_view();
+                self.check_rebuild_source(scope.as_ref(), fresh)?;
                 if partial {
                     // Sub-spec 8a §3: from a Partial peer a marker may mean "filtered", not
                     // "compacted"; the gap waits in `pending` for a Full peer. `known` is
@@ -549,7 +584,11 @@ impl Session {
                     }
                     st.round.done_received = true;
                     // A Full peer sent all it holds beyond our Hello of this round.
-                    if st.round.hello_sent && !st.peer_partial() {
+                    // Only a Fresh one counts: a stale peer's data must not rebuild a store.
+                    if st.round.hello_sent
+                        && !st.peer_partial()
+                        && st.peer_freshness == Some(Freshness::Fresh)
+                    {
                         self.ctx.pulls.note(st.round.hello_epoch);
                     }
                 }
@@ -571,6 +610,34 @@ impl Session {
             return Err(SessionEnd::Stale);
         }
         Ok(())
+    }
+
+    /// The peer's scope and freshness from its latest `Hello`.
+    fn peer_view(&self) -> (Option<Scope>, Option<Freshness>) {
+        let st = self.lock();
+        (st.peer_scope.clone(), st.peer_freshness)
+    }
+
+    /// While this node re-bootstraps (serving paused) it rebuilds only from Fresh Full peers
+    /// (and `_mesh` from clients): a session with any other Full peer ends before anything
+    /// of it is applied, and is redialed later. So a rebuilt store holds no data from a
+    /// stale source, and comes back Fresh (sub-spec 8a C1c/C1d).
+    fn check_rebuild_source(
+        &self,
+        peer_scope: Option<&Scope>,
+        peer: Option<Freshness>,
+    ) -> Result<(), SessionEnd> {
+        if !self.paused()
+            || matches!(peer_scope, Some(Scope::Partial(_)))
+            || peer == Some(Freshness::Fresh)
+        {
+            return Ok(());
+        }
+        debug!(
+            peer = %self.ctx.peer.short(),
+            "re-bootstrapping: not taking data from a peer that is not Fresh"
+        );
+        Err(SessionEnd::Closed)
     }
 
     /// Refuses a peer whose announced scope contradicts its role in `_mesh` (host ⇔
@@ -734,13 +801,17 @@ impl Session {
         if send_hello {
             // Spec §7 / ruling C1: a stale (or re-bootstrapping) node says so; whether it
             // syncs is decided on the peer's `Hello` (`check_stale`).
+            // The epoch is read before the vector: a reset in between leaves this Hello
+            // with an older epoch (conservative), never a pre-reset vector with a new one.
+            let epoch = self.ctx.pulls.current();
             let paused = self.paused();
             let (vv, scope, freshness) = self
                 .call(move |s| Ok((s.version_vector()?, s.scope(), own_freshness(s, paused)?)))
                 .await?;
             {
                 let mut st = self.lock();
-                st.round.hello_epoch = self.ctx.pulls.current();
+                st.round.hello_epoch = epoch;
+                st.told_epoch = epoch;
                 st.told = vv.clone();
             }
             let mesh = self.ctx.mesh;

@@ -235,7 +235,13 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
             .send(NodeEvent::ExpiredOfflineEdits { count, keys });
     }
 
-    // 7.
+    // 7. The store was rebuilt from a Fresh Full peer only (`check_rebuild_source`): it is a
+    // fresh copy now (sub-spec 8a C1c), so it cannot inherit staleness and re-bootstrap
+    // again.
+    inner
+        .store
+        .call_raw(|st| st.refresh_full_sync_time())
+        .await?;
     blocking(move || remove_rebootstrap(&dir)).await?;
     inner.store.refuse_writes_rebootstrapping(false);
     inner.status.send_if_modified(|st| {

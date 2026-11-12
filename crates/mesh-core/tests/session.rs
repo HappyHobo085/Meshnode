@@ -517,6 +517,9 @@ async fn stale_store_ends_session() {
 async fn paused_serves_nothing_but_applies() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = pair_nodes(dir.path(), 5, 5);
+    // A re-bootstrapping store rebuilds only from a Fresh Full peer (sub-spec 8a C1c).
+    b.store.inner().mark_full_sync(0).unwrap();
+    let b_synced = b.store.inner().last_full_sync_ms().unwrap();
     let mut p = {
         let (a_w, b_r) = tokio::io::duplex(PIPE);
         let (b_w, a_r) = tokio::io::duplex(PIPE);
@@ -542,7 +545,7 @@ async fn paused_serves_nothing_but_applies() {
     p.a.h.wake.notify_one();
     assert!(p.b.h.events.try_recv().is_err());
     assert!(!has(&b, "a4"));
-    assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), None);
+    assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), b_synced);
 
     p.a.h.serve_paused.store(false, Ordering::SeqCst);
     p.a.h.wake.notify_one();

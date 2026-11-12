@@ -4,7 +4,7 @@
 
 **Goal:** Client-role members replicate only `_mesh`, and an embeddable `mesh-client` SDK (Rust + Kotlin via UniFFI) joins a mesh as a client and sends HTTP to services over `httpfwd`.
 
-**Architecture:** Sync sessions learn the peer's scope from a new `Hello2` message; hosts serve client peers a scoped diff (out-of-scope runs become `Covered`), and every node ignores `Covered` from partial peers. Remote forwarding and placement move out of `mesh-gateway`/`mesh-services` into a new wasmtime-free crate `mesh-forward`, which both the gateway and `mesh-client` use. `mesh-client-ffi` wraps the SDK for Kotlin.
+**Architecture:** Sync sessions learn the peer's scope from a `scope` field in `Hello`; hosts serve client peers a scoped diff (out-of-scope runs become `Covered`), and every node ignores `Covered` from partial peers. Remote forwarding and placement move out of `mesh-gateway`/`mesh-services` into a new wasmtime-free crate `mesh-forward`, which both the gateway and `mesh-client` use. `mesh-client-ffi` wraps the SDK for Kotlin.
 
 **Tech Stack:** Rust 2024, iroh, redb, postcard, UniFFI 0.29 (tokio), Kotlin/JNA, cargo-ndk.
 
@@ -17,7 +17,7 @@
 - Safety: never install/start/stop OS services, never elevate, never touch real data dirs, never run `#[ignore]` tests, never `adb`/touch a device. Never run `tauri android init --force`.
 - Licence `AGPL-3.0-only` for new crates (`license.workspace = true`).
 - Scope v1 is exactly `Partial(["_mesh"])` for client-role nodes and `Full` for host-role nodes.
-- **Wire compatibility (pins spec §3 "missing scope = Full"):** postcard cannot add a field to `SyncMsg::Hello` compatibly, so a new variant `SyncMsg::Hello2 { mesh: MeshId, vv: VersionVector, scope: Scope }` is **appended last** to `SyncMsg`; new nodes send `Hello2`; a received legacy `Hello` means the peer is `Full`.
+- **No wire compatibility (owner: nothing from this project is in use, no data to keep):** `SyncMsg::Hello` gains a field: `Hello { mesh: MeshId, vv: VersionVector, scope: Scope }`. There is no `Hello2` and no legacy-`Hello` handling; old and new nodes need not interoperate.
 - `mesh-client` must not depend (transitively) on `wasmtime`, `mesh-runtime`, `mesh-services`, `hyper`, or `mesh-gateway`. CI checks `cargo tree -p mesh-client -e normal` for `wasmtime`, `mesh-runtime`, `mesh-services`, `hyper`.
 - Request limits (from the gateway): body ≤ 16 MiB; up to 3 host attempts; default request timeout 30 s; hop-by-hop headers dropped.
 - UniFFI Kotlin package `net.meshnode.client`, cdylib name `mesh_client_ffi`; Android ABIs arm64-v8a and x86_64.
@@ -33,18 +33,18 @@
 
 ---
 
-### Task 1: Proto — `Scope` and `SyncMsg::Hello2`
+### Task 1: Proto — `Scope` in `SyncMsg::Hello`
 
 **Files:** Modify `crates/mesh-proto/src/sync.rs`, `crates/mesh-proto/src/lib.rs` (re-export); Test: in-file `#[cfg(test)]`.
 
 **Interfaces:**
-- Produces: `pub enum Scope { Full, Partial(Vec<String>) }` (serde, Clone, Eq, Debug), `impl Scope { pub fn client() -> Scope /* Partial(vec!["_mesh"]) */; pub fn admits(&self, ns: &str) -> bool }`; `SyncMsg::Hello2 { mesh, vv, scope }` appended as the LAST variant.
+- Produces: `pub enum Scope { Full, Partial(Vec<String>) }` (serde, Clone, Eq, Debug), `impl Scope { pub fn client() -> Scope /* Partial(vec!["_mesh"]) */; pub fn admits(&self, ns: &str) -> bool }`; `SyncMsg::Hello { mesh, vv, scope }` (field added; variant order unchanged).
 
-- [ ] **Step 1: Failing tests:** `hello2_roundtrips`; `legacy_hello_bytes_still_decode` (encode a `Hello` value, decode as `SyncMsg`, still `Hello`); `variant_order_unchanged` (the encoded tags of `Hello`, `Ops`, `Covered`, `Done` are 0..=3, `Hello2` is 4); `scope_admits` (`Full` admits anything, `client()` admits only `"_mesh"`).
+- [ ] **Step 1: Failing tests:** `hello_with_scope_roundtrips` (both `Full` and `Scope::client()`); `scope_admits` (`Full` admits anything, `client()` admits only `"_mesh"`).
 - [ ] **Step 2: Run** `cargo test -p mesh-proto -j 2` — FAIL.
-- [ ] **Step 3: Implement.** Fix every exhaustive `match` on `SyncMsg` in the workspace so it compiles (sessions treat `Hello2` like `Hello` for now — Task 3 adds the scope logic).
+- [ ] **Step 3: Implement.** Fix every exhaustive `match` on `SyncMsg` in the workspace so it compiles (sessions send their own scope as `Full` for now and ignore the peer's — Task 3 adds the scope logic).
 - [ ] **Step 4: Run** `cargo test --workspace --all-features -j 2` — PASS; fmt, clippy.
-- [ ] **Step 5: Commit** `feat(proto): sync scope and Hello2`.
+- [ ] **Step 5: Commit** `feat(proto): sync scope in Hello`.
 
 ### Task 2: Store — scoped diffs and out-of-scope writes
 
@@ -69,7 +69,7 @@
 - Consumes: Tasks 1–2.
 - Produces: `NodeHandle::scope(&self) -> Scope` / `Node::scope`; a node sets its store scope from its own effective role (`Role::Client` ⇒ `Scope::client()`, else `Full`) at open/join and whenever its role changes (Task 4 handles upgrade).
 - Session rules:
-  - send `Hello2 { mesh, vv, scope: own }`; record the peer's scope from `Hello2` (legacy `Hello` ⇒ `Full`);
+  - send `Hello { mesh, vv, scope: own }`; record the peer's scope from its `Hello`;
   - refuse (end the session with a protocol error and the existing backoff) a peer whose scope does not match its effective role in `_mesh` (`Host` ⇔ `Full`, `Client` ⇔ `Partial(["_mesh"])`); a peer with no known role yet (provisional during join) is treated by role as today;
   - serve a `Partial` peer with `diff_since_scoped(.., peer_scope)`;
   - ignore (do not apply, do not raise `known`) every `SyncMsg::Covered` received from a `Partial` peer; log at debug;
@@ -81,7 +81,6 @@
   - `host_syncing_only_from_client_gets_data_later` — hosts A,B + client C; A writes `svc` data; partition so new host D syncs only with C; D must not have `svc` data AND `D.vv[A]` must not cover A's `svc` ops; heal D↔A; D gets the data.
   - `covered_from_partial_peer_ignored` — unit-level: feed a session a `Covered` from a partial peer; `vv` unchanged.
   - `scope_role_mismatch_refused` — a client node forced (test hook) to announce `Full` is refused by a host.
-  - `legacy_hello_counts_as_full` — a peer sending `Hello` is treated as `Full`.
   - `client_write_outside_mesh_refused` — `client.store().set("svc", ..)` → `NodeError::Store(StoreError::OutOfScope{..})`.
 - [ ] **Step 2: Run** `cargo test -p mesh-core --test partial -j 2` — FAIL.
 - [ ] **Step 3: Implement.**
@@ -164,6 +163,6 @@
 
 - [ ] **Step 1:** CI jobs: `mesh-client` (tests of mesh-forward, mesh-client, mesh-client-ffi; the no-runtime-deps tests), `mesh-client-ffi-android` (bindings `--check`, `cargo ndk` build for both ABIs, the JVM test if Task 7 used it). Validate YAML with python yaml.
 - [ ] **Step 2:** Manual check (spec §7): exact commands with `examples/fetch.rs`, pass criteria, results table; how to inspect the client's store size; removal step.
-- [ ] **Step 3:** Back-ports and as-built notes (including `Hello2`, `mesh-forward`, the local `413`).
+- [ ] **Step 3:** Back-ports and as-built notes (including the `Hello` scope field, `mesh-forward`, the local `413`).
 - [ ] **Step 4:** Full verification: fmt, root clippy, `cargo test --workspace --all-features -j 2`, bindings `--check`.
 - [ ] **Step 5: Commit** `docs: sub-spec 8a manual check and back-ports; ci: mesh-client jobs`.

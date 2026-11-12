@@ -165,7 +165,11 @@ impl Raw {
     }
 
     fn hello(vv: VersionVector) -> SyncMsg {
-        SyncMsg::Hello { mesh: mesh(), vv }
+        SyncMsg::Hello {
+            mesh: mesh(),
+            vv,
+            scope: mesh_proto::Scope::Full,
+        }
     }
 
     /// Reads frames up to and including the session's next `Done`; returns how many
@@ -355,6 +359,7 @@ async fn covered_above_advertised_ignored() {
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: hello_vv,
+        scope: mesh_proto::Scope::Full,
     })
     .await;
     raw.send(&SyncMsg::Covered { origin: x, upto: 7 }).await;
@@ -386,6 +391,7 @@ async fn oversized_batch_is_protocol_error() {
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
     })
     .await;
     raw.send(&SyncMsg::Ops { ops }).await;
@@ -416,6 +422,7 @@ async fn hello_from_other_mesh_is_protocol_error() {
     raw.send(&SyncMsg::Hello {
         mesh: MeshId([0xEE; 32]),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
     })
     .await;
     assert!(matches!(end_of(side).await, SessionEnd::Protocol(_)));
@@ -447,6 +454,7 @@ async fn drop_mid_round_does_not_mark_sync() {
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
     })
     .await;
     raw.send(&SyncMsg::Done).await;

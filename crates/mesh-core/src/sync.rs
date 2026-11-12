@@ -385,7 +385,7 @@ impl Session {
 
     async fn on_message(&self, msg: SyncMsg) -> Result<(), SessionEnd> {
         match msg {
-            SyncMsg::Hello { mesh, vv } => {
+            SyncMsg::Hello { mesh, vv, .. } => {
                 if mesh != self.ctx.mesh {
                     return Err(SessionEnd::Protocol("Hello for another mesh".into()));
                 }
@@ -565,7 +565,15 @@ impl Session {
             }
             let vv = self.call(|s| s.version_vector()).await?;
             let mesh = self.ctx.mesh;
-            self.send(w, &SyncMsg::Hello { mesh, vv }).await?;
+            self.send(
+                w,
+                &SyncMsg::Hello {
+                    mesh,
+                    vv,
+                    scope: mesh_proto::Scope::Full,
+                },
+            )
+            .await?;
         }
 
         if self.paused() || !self.lock().live {

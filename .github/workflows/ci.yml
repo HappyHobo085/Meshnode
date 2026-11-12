@@ -37,12 +37,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: rustup target add wasm32-wasip2
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             services/aegis-sync
+      - run: cargo fmt --check --manifest-path services/aegis-sync/Cargo.toml
+      - run: cargo clippy --locked --release --target wasm32-wasip2 --all-targets --manifest-path services/aegis-sync/Cargo.toml -- -D warnings
       - run: bash scripts/build-services.sh
       - run: cargo test -p mesh-services --test aegis_sync --test aegis_sync_mesh -j 2
       - run: bash scripts/sync-aegis-core.sh --check

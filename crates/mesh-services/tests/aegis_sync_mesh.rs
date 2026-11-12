@@ -20,9 +20,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aegis_sync_core::order::tie_ord;
+use aegis_sync_core::order::{order_bytes, tie_ord};
 use aegis_sync_core::vector::{self, NOW_MS, Req, Tamper};
-use aegis_sync_core::wire::{MAX_RECORDS_PER_REQUEST, MAX_RESPONSE_RECORDS, WireRecord, hlc_key};
+use aegis_sync_core::wire::{MAX_RESPONSE_RECORDS, WireRecord, hlc_key};
 use bytes::Bytes;
 use common::{T, test_cfg, wait_until};
 use mesh_core::Node;
@@ -339,6 +339,27 @@ fn by_greater_id(x: &'static str, y: &'static str) -> (&'static str, &'static st
     } else {
         (y, x)
     }
+}
+
+/// Writes `rec` into `(acct, ns)` exactly as the service stores a pushed record: its uuid in
+/// the hlc candidate index, then the record under its key, ordered by its hlc, with no `ord`
+/// (the same layout as `seed_record` in `aegis_sync.rs`). Live records only: a tombstone
+/// would also need the retention index.
+async fn seed_record(kv: &Arc<dyn KvBackend>, acct: &str, ns: &str, rec: &WireRecord) {
+    assert!(!rec.deleted, "live records only");
+    let set = keys::hlcidx_set(acct, ns, &rec.hlc);
+    kv.set_add(&set, rec.uuid.as_bytes().to_vec())
+        .await
+        .unwrap();
+    let mut stored = rec.clone();
+    stored.ord = None;
+    kv.set_ordered(
+        &keys::rec_key(acct, ns, &rec.uuid),
+        order_bytes(&rec.hlc),
+        Some(serde_json::to_vec(&stored).unwrap()),
+    )
+    .await
+    .unwrap();
 }
 
 // ------------------------------------------------------------------------- records
@@ -696,7 +717,10 @@ async fn local_store_not_replicated_across_nodes() {
 
 /// A full 5 000-record page served from a real node's replicated store (not `MemKv`), well
 /// inside the service's 30 s request limit. One node: replicating 5 000 records to a second
-/// node is not what is timed, and under a parallel test run it is slow enough to flake.
+/// node is not what is timed. The records are seeded straight into the node's store in the
+/// service's layout (as [`seed_record`] does), so only the GET is a timed service request;
+/// pushing them through the service would take 5 POSTs of several seconds each in a debug
+/// build. The page is checked record for record, so a seed that missed the layout fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_full_page_on_real_store_within_limits() {
     const BUDGET: Duration = Duration::from_secs(10);
@@ -705,6 +729,7 @@ async fn get_full_page_on_real_store_within_limits() {
     let node = Node::create_mesh(test_cfg(dir.path(), "a")).await.unwrap();
     let side = Side::new(node, dir, &wasm).await;
     assert_eq!(side.call(register("A", "D1", "phone")).await.0, 200);
+    let acct = vector::account_id("A");
     let ct = "c".repeat(200);
     let records: Vec<WireRecord> = (0..MAX_RESPONSE_RECORDS)
         .map(|i| {
@@ -718,11 +743,11 @@ async fn get_full_page_on_real_store_within_limits() {
         })
         .collect();
     let started = Instant::now();
-    for chunk in records.chunks(MAX_RECORDS_PER_REQUEST) {
-        assert_eq!(side.push("A", "D1", "big", chunk).await, 200);
+    for r in &records {
+        seed_record(&side.kv, &acct, "big", r).await;
     }
     eprintln!(
-        "pushed {} records in {:?}",
+        "seeded {} records in {:?}",
         records.len(),
         started.elapsed()
     );

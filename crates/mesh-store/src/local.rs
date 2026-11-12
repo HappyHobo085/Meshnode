@@ -53,7 +53,12 @@ impl<W: WallClock> Store<W> {
     /// (Ruling R18): some of this node's own seqs are not held contiguously (after
     /// `reset_to_empty`, or with an echoed own op waiting in `pending`), and writing now
     /// would set `vv[self]` past them, so peers would skip them as covered.
+    ///
+    /// Refused with [`StoreError::OutOfScope`] when the store's scope does not admit the
+    /// payload's namespace (sub-spec 8a §3): a partial node never creates ops that only
+    /// full nodes would hold.
     fn local_write(&self, payload: Payload) -> Result<SignedOp, StoreError> {
+        self.check_scope(payload.ns())?;
         let mut body = OpBody {
             mesh: self.mesh,
             origin: self.node,

@@ -1034,3 +1034,57 @@ async fn fresh_store_applying_stale_ops_turns_stale() {
     assert_eq!(a.inner().last_full_sync_ms().unwrap(), Some(1_000_000));
     assert!(!join.is_finished());
 }
+
+/// Re-review 4: a stale store sends its (Stale) Hello before pausing; the reset runs; the
+/// peer's reply arrives after it. The session survived the rebuild, so serving under that
+/// Hello would make the peer take the rebuilt data as stale (taint, then a reset). The
+/// session restarts instead, without sending any op.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_serving_under_a_hello_from_before_a_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    let (n_w, raw_r) = tokio::io::duplex(64 * 1024);
+    let (raw_w, n_r) = tokio::io::duplex(64 * 1024);
+    let (ctx, h) = SessionCtx::for_test(
+        a.clone(),
+        Arc::new(MeshAcceptor::new(genesis())),
+        id(2),
+        quiet(),
+    );
+    // A dials, so its Hello goes out first, while it is stale (and not paused).
+    let join = tokio::spawn(run_session(ctx, n_r, n_w, true));
+    let mut raw = Raw { r: raw_r, w: raw_w };
+    match raw.recv().await {
+        Some(SyncMsg::Hello { freshness, .. }) => {
+            assert!(matches!(freshness, Freshness::Stale { .. }))
+        }
+        other => panic!("{other:?}"),
+    }
+    // The re-bootstrap runs to completion before the peer's reply arrives: a new epoch,
+    // and the rebuilt store is fresh.
+    h.pulls.begin_epoch();
+    a.inner().mark_full_sync(0).unwrap();
+    assert!(!a.inner().is_stale().unwrap());
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    let end = timeout(Duration::from_secs(5), join)
+        .await
+        .expect("session ends")
+        .unwrap();
+    assert!(matches!(end, SessionEnd::Closed), "{end:?}");
+    // Nothing was served under the old Hello.
+    loop {
+        match timeout(
+            Duration::from_secs(1),
+            read_frame::<_, SyncMsg>(&mut raw.r, SYNC_MAX_FRAME),
+        )
+        .await
+        {
+            Ok(Ok(Some(SyncMsg::Ops { ops }))) => {
+                panic!("served {} ops under a pre-reset Hello", ops.len())
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => break,
+        }
+    }
+}

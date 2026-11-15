@@ -849,10 +849,15 @@ impl Session {
         if self.paused() || !self.lock().live {
             return Ok(());
         }
-        // Serving resumed (a re-bootstrap is done) under a Hello that announced `Stale`:
-        // the peer would take what we send as stale data (C1e taint). Restart the session,
-        // so the next Hello announces what this store is now.
-        if self.lock().told_paused {
+        // Serving resumed (a re-bootstrap is done) under a Hello that announced `Stale`,
+        // sent while paused or before the reset (an older epoch): the peer would take what
+        // we send as stale data (C1e taint). Restart the session, so the next Hello
+        // announces what this store is now.
+        let stale_hello = {
+            let st = self.lock();
+            st.told_paused || st.told_epoch != self.ctx.pulls.current()
+        };
+        if stale_hello {
             debug!(
                 peer = %self.ctx.peer.short(),
                 "serving resumed; restarting the session to announce the new freshness"

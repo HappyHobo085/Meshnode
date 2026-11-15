@@ -2795,6 +2795,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hex",
+ "http",
+ "jni 0.21.1",
+ "mesh-client",
+ "mesh-client-ffi",
+ "mesh-core",
+ "mesh-gateway",
+ "mesh-proto",
+ "mesh-services",
+ "ndk-context",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uniffi",
+]
+
+[[package]]
 name = "mesh-core"
 version = "0.1.0"
 dependencies = [

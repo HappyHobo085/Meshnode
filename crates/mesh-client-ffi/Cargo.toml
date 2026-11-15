@@ -1,0 +1,48 @@
+[package]
+name = "mesh-client-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Kotlin face of `mesh-client` (sub-spec 8a §5): UniFFI exports, built as
+# `libmesh_client_ffi.so` (Android, `scripts/build-client-aar.sh`) or the host library
+# (`scripts/gen-client-bindings.sh`, the JVM test in `jvm-test/`).
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+mesh-client = { path = "../mesh-client" }
+bytes.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex.workspace = true
+http.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniffi = "0.29"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[features]
+# The `uniffi-bindgen` binary (Kotlin bindings from the built library).
+bindgen = ["uniffi/cli"]
+# Test-only (Rust, not exported): loopback-only constructors with fast timings.
+test-hooks = ["mesh-client/test-hooks"]
+
+# In-process hosts for the tests, as in mesh-client's own tests.
+[dev-dependencies]
+mesh-client-ffi = { path = ".", features = ["test-hooks"] }
+mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
+mesh-gateway = { path = "../mesh-gateway", features = ["test-hooks"] }
+mesh-proto = { path = "../mesh-proto" }
+mesh-services = { path = "../mesh-services", features = ["test-hooks"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

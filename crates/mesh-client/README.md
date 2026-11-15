@@ -77,8 +77,9 @@ async fn run(dir: &Path, ticket: Option<&str>) -> Result<(), ClientError> {
   data directory included). A client re-invited as a host while running (role upgrade)
   is out of scope for now.
 - **Stopping.** `shutdown()` releases the directory before it returns. Dropping a client
-  stops it in the background; until it has let go of the directory, reopening it is
-  refused with `AlreadyOpen`.
+  stops it in the background, on the Tokio runtime it was started on (also when it is
+  dropped on a thread without one); until it has let go of the directory, reopening it
+  is refused with `AlreadyOpen`.
 - **`request(service, req)`** forwards the method, path and query, headers (hop-by-hop
   ones dropped) and body to the nearest online host that runs the service, trying the
   next one on failure, up to three hosts. The host's response is returned **as it is**,
@@ -101,4 +102,75 @@ cargo run -p mesh-client --example fetch -- open ./client-data blog /about.html
 
 ## Kotlin
 
-See Task 7 (`mesh-client-ffi`).
+`crates/mesh-client-ffi` exposes the same client to Kotlin through UniFFI: package
+`net.meshnode.client`, native library `mesh_client_ffi`. The bindings are committed in
+`crates/mesh-client-ffi/kotlin/` (regenerate with `scripts/gen-client-bindings.sh`;
+`--check` fails when they are out of date).
+
+### Android
+
+`scripts/build-client-aar.sh` builds `dist/mesh-client.aar` locally (not committed):
+`libmesh_client_ffi.so` for `arm64-v8a` and `x86_64`, the compiled bindings and a minimal
+manifest (`INTERNET`, `ACCESS_NETWORK_STATE`, minSdk 29). It needs `cargo-ndk`,
+`ANDROID_NDK_HOME`, both Rust Android targets and a JDK 17. The app adds the runtime
+dependencies itself:
+
+```kotlin
+dependencies {
+    implementation(files("libs/mesh-client.aar"))
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+}
+```
+
+On Android, call `MeshClientAndroid.init(context)` once (e.g. in `Application.onCreate`)
+before the first `join`/`open`: the networking code needs the application context.
+Without it they fail with `MeshClientException.NotInitialised`. The desktop JVM needs
+no set-up; it loads the host library through JNA (`jna.library.path`).
+
+```kotlin
+import net.meshnode.client.*
+
+suspend fun run(dir: String, ticket: String?) {
+    val opts = MeshClientOptions(name = "my-app") // platform = this OS, requestTimeoutMs = 30000
+    val client = if (ticket != null) MeshClient.join(dir, ticket, opts) else MeshClient.open(dir, opts)
+    try {
+        client.setListener(object : MeshClientListener {
+            override fun onEvent(event: MeshEvent) {
+                // MembersChanged, ServicesChanged, Removed, Online, Offline.
+                // Called on a library thread: return quickly.
+            }
+        })
+        val resp = client.request(
+            "blog",
+            MeshRequest(method = "GET", path = "/", headers = listOf(), body = byteArrayOf()),
+        )
+        println("${resp.status} ${resp.body.decodeToString()}")
+        println(client.status())   // mesh, id, onlineHosts, firstSyncDone, removed
+        println(client.members())  // id (hex), name, role, platform, online, rttMs
+        println(client.services()) // name, kind, hosts
+        val invite = client.invite(MeshRole.CLIENT, 600uL)
+    } catch (e: MeshClientException.NoHost) {
+        // no host could serve it: try again later
+    } finally {
+        client.shutdown()
+    }
+}
+```
+
+- `join`, `open`, `request`, `invite`, `remove` and `shutdown` are `suspend` functions;
+  they run on the library's own threads, so they can be called from any dispatcher.
+  `status()`, `members()`, `services()` and `setListener` return at once.
+- Errors are the sealed `MeshClientException`: the `ClientError` variants above
+  (`InvalidTicket`, `AlreadyJoined`, `NotJoined`, `AlreadyOpen`, `Removed`, `NoHost`,
+  `Timeout`, `Io`, `Internal`), plus `InvalidArgument` (a node id for `remove` that is
+  not 64 hex digits), `Closed` (any call after or during `shutdown`) and
+  `NotInitialised` (Android, see above). A request that cannot be built (bad method,
+  header or path) gets a local `400` response instead.
+- **Call `shutdown()`.** It ends calls in flight with `Closed`, stops delivering events
+  and releases the directory before it returns. An object that is only closed
+  (`close()`/`destroy()`) or garbage-collected stops in the background, and its
+  directory stays locked until then (`AlreadyOpen` meanwhile).
+- `crates/mesh-client-ffi/jvm-test` is the JVM test of the bindings
+  (`crates/mesh-client-ffi/jvm-test/run.sh`): it loads the host library and checks that
+  errors arrive as the right `MeshClientException`.

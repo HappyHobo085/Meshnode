@@ -11,6 +11,7 @@ use mesh_core::local::{read_genesis, read_own_role};
 use mesh_core::{Node, NodeConfig};
 use mesh_forward::{ForwardError, RemoteForwarder, placed_hosts};
 use mesh_proto::{InviteTicket, NodeId, Role, ServiceKind};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::error::ClientError;
@@ -90,10 +91,11 @@ pub struct ServiceInfo {
 
 /// A client-role member of a mesh. See the crate docs.
 ///
-/// Call [`MeshClient::shutdown`] to stop it. Dropping it stops it too, in the background
-/// (on the Tokio runtime it is dropped in): the directory stays locked until the node has
-/// let go of it, so reopening it meanwhile is refused with [`ClientError::AlreadyOpen`].
-/// Only `shutdown` guarantees an immediate reopen.
+/// Call [`MeshClient::shutdown`] to stop it. Dropping it stops it too, in the background,
+/// on the Tokio runtime it was started on (from any thread, one without a runtime
+/// included): the directory stays locked until the node has let go of it, so reopening it
+/// meanwhile is refused with [`ClientError::AlreadyOpen`]. Only `shutdown` guarantees an
+/// immediate reopen.
 pub struct MeshClient {
     /// `None` only once shut down or dropped.
     owned: Option<Owned>,
@@ -108,6 +110,9 @@ struct Owned {
     task: JoinHandle<()>,
     /// Released last, once the node has let go of the directory.
     lock: File,
+    /// The runtime the client started on (its node's I/O lives there): a drop tears down
+    /// on it, whatever thread the drop happens on (ruling R16).
+    rt: Handle,
 }
 
 impl Owned {
@@ -117,6 +122,7 @@ impl Owned {
             fwd,
             task,
             lock,
+            rt: _,
         } = self;
         task.abort();
         let _ = task.await;
@@ -132,14 +138,11 @@ impl Drop for MeshClient {
         let Some(owned) = self.owned.take() else {
             return;
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(owned.teardown());
-            }
-            // No runtime to finish on: the node only cancels its tasks, and the lock is
-            // released at once.
-            Err(_) => owned.task.abort(),
-        }
+        // On the client's own runtime, also from a thread without one (an FFI finalizer).
+        // A runtime that has shut down drops the teardown unpolled: the node then only
+        // cancels its tasks, and the lock is released at once.
+        let rt = owned.rt.clone();
+        rt.spawn(owned.teardown());
     }
 }
 
@@ -245,6 +248,7 @@ impl MeshClient {
         Ok(Self::start(node, &opts, lock).await)
     }
 
+    /// Runs inside a Tokio runtime (an async fn), whose handle it keeps for the teardown.
     async fn start(node: Node, opts: &ClientOptions, lock: File) -> MeshClient {
         let handle = node.handle();
         let shared = Arc::new(Shared::new());
@@ -257,6 +261,7 @@ impl MeshClient {
                 node,
                 task,
                 lock,
+                rt: Handle::current(),
             }),
             shared,
             request_timeout: opts.request_timeout,

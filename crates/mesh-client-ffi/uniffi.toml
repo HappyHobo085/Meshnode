@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "net.meshnode.client"
+cdylib_name = "mesh_client_ffi"
+# One set of bindings for the JVM and Android: always JNA's cleaner (java.lang.ref.Cleaner
+# needs Android API 33, and the Android-mode cleaner needs android.jar to compile).
+disable_java_cleaner = true

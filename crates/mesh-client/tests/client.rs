@@ -995,3 +995,39 @@ async fn drop_without_shutdown_then_open() {
         h.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_off_runtime_tears_down_on_the_clients_runtime() {
+    // Ruling R16: a client dropped on a thread without a Tokio runtime (an FFI object
+    // collected on a finalizer thread) still tears down on the runtime it started on, so
+    // its directory stays locked until its node has let go of it, then reopens.
+    let hs = hosts(&[Serve::Attached]).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = client_dir(&root);
+    let c = join(&dir, &hs[0].invite(Role::Client).await, opts()).await;
+    wait_until("first sync", || c.status().first_sync_done).await;
+    std::thread::spawn(move || drop(c)).join().unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("client.lock"))
+        .unwrap();
+    assert!(
+        lock.try_lock().is_err(),
+        "the lock was released before the node's teardown"
+    );
+    drop(lock);
+    let deadline = Instant::now() + T;
+    let c = loop {
+        match MeshClient::open_for_test(&dir, opts()).await {
+            Ok(c) => break c,
+            Err(ClientError::AlreadyOpen) => {}
+            Err(e) => panic!("reopen after drop: {e:?}"),
+        }
+        assert!(Instant::now() < deadline, "never reopened");
+        sleep(Duration::from_millis(20)).await;
+    };
+    c.shutdown().await;
+    for h in hs {
+        h.shutdown().await;
+    }
+}

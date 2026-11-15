@@ -29,7 +29,7 @@ use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, SYNC_MAX_FRAME, read_frame, write_frame};
-use crate::membership::{MEMBERS, MESH_NS, MeshAcceptor, member_bytes, scope_of_role};
+use crate::membership::{MEMBERS, MESH_NS, MeshAcceptor, is_removed, member_bytes, scope_of_role};
 
 /// Items per `diff_since` page.
 const PAGE: usize = 256;
@@ -85,9 +85,17 @@ pub struct FullPulls {
     epoch: AtomicU64,
     pulled: AtomicU64,
     rebuild_full: AtomicBool,
+    /// A re-bootstrap reset the store (`begin_epoch`) and has not finished yet.
+    rebuilding: AtomicBool,
     /// Held (inside a store call) while a session decides on a reset and pauses serving,
     /// and while the owner declares the store fresh, so the two never interleave.
     decide: Mutex<()>,
+    /// Test hook: while set, a completed round waits right before its `record_round` store
+    /// call (`held` counts the rounds that reached that point).
+    #[cfg(any(test, feature = "test-hooks"))]
+    hold_record: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    held: AtomicU64,
 }
 
 impl FullPulls {
@@ -107,12 +115,41 @@ impl FullPulls {
         self.rebuild_full.load(Ordering::SeqCst)
     }
 
+    /// Test hook: while `on`, completed rounds wait right before recording themselves.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hold_record_round(&self, on: bool) {
+        self.hold_record.store(on, Ordering::SeqCst);
+    }
+
+    /// Test hook: rounds that reached the [`FullPulls::hold_record_round`] point.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn record_rounds_held(&self) -> u64 {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    async fn wait_record_hold(&self) {
+        if !self.hold_record.load(Ordering::SeqCst) {
+            return;
+        }
+        self.held.fetch_add(1, Ordering::SeqCst);
+        while self.hold_record.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// Starts a new epoch (the store was just reset) and returns it.
     pub fn begin_epoch(&self) -> u64 {
+        self.rebuilding.store(true, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    fn current(&self) -> u64 {
+    /// The re-bootstrap that began the current epoch is done (or abandoned).
+    pub(crate) fn end_rebuild(&self) {
+        self.rebuilding.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn current(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
 
@@ -483,14 +520,12 @@ impl Session {
     /// Completes the round if both `Done`s have crossed: `mark_full_sync` with the peer's
     /// confirmed `vv[me]` (not with a Partial peer), count it and emit `RoundComplete`.
     async fn maybe_complete(&self) -> Result<(), SessionEnd> {
-        let (synced, partial, peer_fresh, stale_applied, same_epoch) = {
+        let (synced, partial, peer_fresh, stale_applied, hello_epoch) = {
             let mut st = self.lock();
             if !st.round.complete() {
                 return Ok(());
             }
-            // A round whose Hello went out before a reset (re-bootstrap) describes the store
-            // that was reset: record nothing from it, and drop its stale-op taint.
-            let same_epoch = st.round.hello_epoch == self.ctx.pulls.current();
+            let hello_epoch = st.round.hello_epoch;
             st.round = Round::default();
             // The round changed the peer's freshness (an Empty peer is empty no more): until
             // its next Hello say, it is unknown, so a stale store does not serve it live.
@@ -501,13 +536,24 @@ impl Session {
                 st.peer_partial(),
                 peer_fresh,
                 stale_applied,
-                same_epoch,
+                hello_epoch,
             )
         };
-        if same_epoch {
-            self.call(move |s| record_round(s, synced, partial, peer_fresh, stale_applied))
-                .await?;
-        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.ctx.pulls.wait_record_hold().await;
+        let pulls = self.ctx.pulls.clone();
+        self.call(move |s| {
+            // A round whose Hello went out before a reset (re-bootstrap) describes the store
+            // that was reset: record nothing from it, and drop its stale-op taint. Checked
+            // under `decide`, which the reset holds together with `begin_epoch`, so a reset
+            // cannot slip in between this check and the write (ruling R9).
+            let _decide = pulls.decide();
+            if hello_epoch != pulls.current() {
+                return Ok(());
+            }
+            record_round(s, synced, partial, peer_fresh, stale_applied)
+        })
+        .await?;
         self.ctx
             .metrics
             .rounds_completed
@@ -658,6 +704,12 @@ impl Session {
     /// node is listed as a host resets only once a Fresh Full peer is there to rebuild from
     /// (not while a re-bootstrap already runs). Until then it stays a working client.
     ///
+    /// Nothing is decided while the store is being rebuilt (reset done, run not finished;
+    /// ruling R9): its rebuild needs exactly these Fresh Full peers, so even a stale time in
+    /// the store being rebuilt never turns them away. Before the reset (serving paused, the
+    /// reset decided but not done) a Fresh Full peer still ends the session as before, so
+    /// it restarts with a fresh `Hello` once the store is reset.
+    ///
     /// The decision and the pause it implies are taken under [`FullPulls::decide`], so an
     /// owner's `declare_fresh` either comes first (the store is fresh: no reset) or sees
     /// serving paused and is refused.
@@ -670,11 +722,18 @@ impl Session {
         let reset = self
             .call(move |s| {
                 let _decide = pulls.decide();
-                // A client re-invited as a host: listed as both (as in `check_scope`).
-                let upgrade = !paused.load(Ordering::SeqCst)
+                let is_paused = paused.load(Ordering::SeqCst);
+                if is_paused && pulls.rebuilding.load(Ordering::SeqCst) {
+                    // The store is being rebuilt: these peers are its sources.
+                    return Ok(false);
+                }
+                // A client re-invited as a host: listed as both (as in `check_scope`), and
+                // an effective member (as in the driver's `upgrade_due`).
+                let upgrade = !is_paused
                     && s.scope() != Scope::Full
                     && acc.role_of(s, &me)? == Some(Role::Host)
-                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&me, Role::Client))?;
+                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&me, Role::Client))?
+                    && !is_removed(s, &me)?;
                 let reset = upgrade || s.is_stale()?;
                 if reset {
                     // A reset must not serve (spec §7); the re-bootstrap clears this.

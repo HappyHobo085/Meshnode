@@ -1426,3 +1426,113 @@ async fn upgrading_peer_may_announce_either_scope() {
         assert!(!join.is_finished());
     }
 }
+
+// ---------------------------------------------------------------- Task 4 fix round 2 (R9)
+
+/// Ruling R9 (a): while the store is being rebuilt (reset done: a new epoch, serving
+/// paused), a stale store never ends a Fresh Full peer's session: the rebuild needs exactly
+/// those peers, so a stale time in the store being rebuilt cannot turn them all away.
+/// Before the reset (paused, no new epoch yet) such a peer still ends the session, so it
+/// restarts with a fresh `Hello` once the store is reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuilding_stale_store_keeps_a_fresh_full_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = stale_founder_store(dir.path());
+    // Paused, reset not done yet: as before.
+    let (join, h, mut raw) = run_against_raw(&a, id(2));
+    h.serve_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(matches!(end_of(join).await, SessionEnd::Stale));
+    // Rebuilding (a new epoch began), and the store is stale: the session goes on.
+    let (join, h, mut raw) = run_against_raw(&a, id(2));
+    h.serve_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.pulls.begin_epoch();
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(
+        matches!(raw.recv().await, Some(SyncMsg::Hello { .. })),
+        "the session goes on"
+    );
+    assert!(!join.is_finished());
+}
+
+/// Ruling R9 (b): a round whose epoch check passed before a reset, but whose record lands
+/// after it, records nothing in the reset store: the epoch is checked inside the store call
+/// that writes, atomically with the reset. Here the Stale peer's round would otherwise make
+/// the emptied store inherit staleness (`inherit_full_sync`).
+#[tokio::test(flavor = "multi_thread")]
+async fn round_recorded_after_a_reset_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
+    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    h.pulls.hold_record_round(true);
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Stale {
+            since_ms: 1_000_000,
+        },
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    timeout(T, async {
+        while h.pulls.record_rounds_held() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the round reached its record");
+    // The re-bootstrap resets the store and begins its epoch meanwhile.
+    a.inner().reset_to_empty().unwrap();
+    h.pulls.begin_epoch();
+    h.pulls.hold_record_round(false);
+    next_round(&mut h.events).await;
+    assert_eq!(
+        a.inner().last_full_sync_ms().unwrap(),
+        None,
+        "nothing recorded in the reset store"
+    );
+}
+
+/// Review m1: the session-side "upgrade due" check needs an effective member, as the
+/// driver's does: a node listed as host and client but removed is not upgrading.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_node_is_not_upgrading() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    // This node (the founder, always a host) is also listed as a client, and Partial.
+    a.inner()
+        .set_add(MESH_NS, MEMBERS, &member_bytes(&id(1), Role::Client))
+        .unwrap();
+    a.inner().set_scope(Scope::client());
+    // Control: an upgrade is due, so a Fresh Full peer's Hello ends the session.
+    let (join, _h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(matches!(end_of(join).await, SessionEnd::Stale));
+    // Removed: no upgrade.
+    a.inner()
+        .set_add(
+            MESH_NS,
+            mesh_core::membership::REMOVED,
+            &mesh_core::membership::encode_removal(&mesh_proto::RemovalRecord {
+                node_id: id(1),
+                cutoff_seq: 1000,
+            }),
+        )
+        .unwrap();
+    let (join, _h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(
+        matches!(raw.recv().await, Some(SyncMsg::Hello { .. })),
+        "a removed node does not upgrade"
+    );
+    assert!(!join.is_finished());
+}

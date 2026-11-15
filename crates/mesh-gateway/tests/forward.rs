@@ -704,3 +704,34 @@ async fn partial_store_forwards_although_listed_as_host() {
     assert_eq!(mesh.served(0), 1);
     mesh.shutdown().await;
 }
+
+/// Ruling R9: a host whose store is not a full replica (here Partial, as for a client
+/// re-invited as a host before its rebuild) answers forwarded requests with the retryable
+/// `503 Node re-bootstrapping`, not from its store, and the forwarder fails over to the
+/// next host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarder_fails_over_from_a_host_that_is_not_full() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+        (Role::Client, Serve::Attached),
+    ])
+    .await;
+    deploy_counter(&mesh, Placement::AllHosts).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
+    wait_active(&mesh, 1).await;
+    wait_manifest(&mesh, 2).await;
+    // Test hook: B's store is Partial.
+    mesh.m[1]
+        .node
+        .store()
+        .inner()
+        .set_scope(mesh_proto::Scope::client());
+    mesh.fwd(2).try_first(vec![mesh.id(1), mesh.id(0)]);
+    assert_eq!(dispatch(mesh.fwd(2), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.served(1), 1, "B answered (with the retryable 503)");
+    assert_eq!(mesh.served(0), 1, "A served it");
+    assert_eq!(mesh.fwd(2).attempts(), 2);
+    wait_kv(&mesh.m[0].node, COUNTER, "n", "1").await;
+    mesh.shutdown().await;
+}

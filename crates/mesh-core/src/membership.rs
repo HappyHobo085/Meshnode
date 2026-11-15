@@ -85,6 +85,14 @@ impl MeshAcceptor {
     }
 }
 
+/// Whether the `removed` set holds a removal record of `id` (any cutoff). Blocking; reads
+/// the whole set, so callers use it only on rare paths.
+pub fn is_removed(store: &CoreStore, id: &NodeId) -> Result<bool, StoreError> {
+    Ok(all_members(store, REMOVED)?
+        .iter()
+        .any(|raw| postcard::from_bytes::<RemovalRecord>(raw).is_ok_and(|rec| rec.node_id == *id)))
+}
+
 /// The replication scope of a member with `role` (sub-spec 8a §3): a client replicates
 /// only `_mesh`, a host everything.
 pub fn scope_of_role(role: Role) -> Scope {

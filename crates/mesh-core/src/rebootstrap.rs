@@ -205,19 +205,25 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
             _ = hold.wait_for(|on| !*on) => {}
         }
     }
-    let next = inner
-        .store
-        .call_raw(|st| {
-            st.reset_to_empty()?;
-            st.next_seq()
-        })
-        .await?;
+    // The reset and the new epoch are one step under `decide` (ruling R9): a round that
+    // records itself (`maybe_complete`) checks its epoch under the same lock, so it either
+    // writes into the old store (which the reset then clears) or sees the new epoch and
+    // records nothing.
     // A role upgrade asks for everything from here on: every Hello of the new epoch
     // announces `Full` (with the emptied vector), so the pull credit below is a full one.
-    inner.pulls.set_rebuild_full(file.full);
     // Only a pull answering a `Hello` sent from now on counts (ruling I2); new rounds send
     // one with the emptied vector (a round in progress counts once the next one starts).
-    let epoch = inner.pulls.begin_epoch();
+    let (pulls, full) = (inner.pulls.clone(), file.full);
+    let (next, epoch) = inner
+        .store
+        .call_raw(move |st| {
+            let _decide = pulls.decide();
+            st.reset_to_empty()?;
+            pulls.set_rebuild_full(full);
+            let epoch = pulls.begin_epoch();
+            Ok((st.next_seq()?, epoch))
+        })
+        .await?;
     inner.peers.start_round_all();
     if next.saturating_sub(1) != file.last_seq {
         // An own op was written after the export: it is gone, and the store would refuse
@@ -251,6 +257,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
                 // Nothing left to rebuild: the node is stopped for good (spec §3.3 step 6).
                 warn!("this node was removed during its re-bootstrap; abandoning it");
                 blocking(move || remove_rebootstrap(&dir)).await?;
+                inner.pulls.end_rebuild();
                 inner.store.refuse_writes_rebootstrapping(false);
                 inner.serve_paused.store(false, Ordering::SeqCst);
                 return Ok(());
@@ -309,6 +316,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
         info!("role upgrade done: this node is a full replica now");
     }
     blocking(move || remove_rebootstrap(&dir)).await?;
+    inner.pulls.end_rebuild();
     inner.store.refuse_writes_rebootstrapping(false);
     inner.status.send_if_modified(|st| {
         let was = matches!(st, NodeStatus::Rebootstrapping { .. });

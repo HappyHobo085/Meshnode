@@ -1088,3 +1088,91 @@ async fn no_serving_under_a_hello_from_before_a_reset() {
         }
     }
 }
+
+/// Re-review 5: a round begun before a reset (re-bootstrap) and completed after it records
+/// nothing in the reset store: here a Stale peer's round would otherwise make the empty
+/// store inherit staleness (`inherit_full_sync`), and a stale store under re-bootstrap
+/// turns every Fresh peer away (a stall).
+#[tokio::test(flavor = "multi_thread")]
+async fn round_spanning_a_reset_records_no_inheritance() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
+    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Stale {
+            since_ms: 1_000_000,
+        },
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    // The store is reset (a new epoch) before the peer's Done completes the round.
+    h.pulls.begin_epoch();
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(
+        a.inner().last_full_sync_ms().unwrap(),
+        None,
+        "nothing recorded"
+    );
+}
+
+/// Re-review 5: as above, with ops from the Stale peer applied before the reset: their
+/// taint (`taint_full_sync`) belongs to the store that was reset and is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn round_spanning_a_reset_records_no_taint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, clock) = founder_store_with_clock(dir.path());
+    clock.advance(200 * 86_400_000);
+    a.inner().mark_full_sync(0).unwrap();
+    let synced = a.inner().last_full_sync_ms().unwrap();
+    let b = CoreStore::open(
+        &dir.path().join("b.redb"),
+        mesh(),
+        key(2),
+        DynClock(Arc::new(ManualClock::new(1_000_000))),
+    )
+    .unwrap();
+    b.set("app", "old", b"x").unwrap();
+    let ops: Vec<_> = b
+        .diff_since(&VersionVector::default(), 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|i| match i {
+            mesh_store::SyncItem::Op(op) => Some(op),
+            mesh_store::SyncItem::Covered { .. } => None,
+        })
+        .collect();
+    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Stale {
+            since_ms: 1_000_000,
+        },
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.send(&SyncMsg::Ops { ops }).await;
+    raw.until_done().await;
+    // The op is applied, then the store is reset (a new epoch), then the round completes.
+    timeout(T, async {
+        while a.inner().get("app", "old").unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("op applied");
+    h.pulls.begin_epoch();
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(
+        a.inner().last_full_sync_ms().unwrap(),
+        synced,
+        "no taint recorded"
+    );
+    assert!(!a.inner().is_stale().unwrap());
+}

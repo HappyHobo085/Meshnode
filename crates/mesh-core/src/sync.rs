@@ -458,11 +458,14 @@ impl Session {
     /// Completes the round if both `Done`s have crossed: `mark_full_sync` with the peer's
     /// confirmed `vv[me]` (not with a Partial peer), count it and emit `RoundComplete`.
     async fn maybe_complete(&self) -> Result<(), SessionEnd> {
-        let (synced, partial, peer_fresh, stale_applied) = {
+        let (synced, partial, peer_fresh, stale_applied, same_epoch) = {
             let mut st = self.lock();
             if !st.round.complete() {
                 return Ok(());
             }
+            // A round whose Hello went out before a reset (re-bootstrap) describes the store
+            // that was reset: record nothing from it, and drop its stale-op taint.
+            let same_epoch = st.round.hello_epoch == self.ctx.pulls.current();
             st.round = Round::default();
             // The round changed the peer's freshness (an Empty peer is empty no more): until
             // its next Hello say, it is unknown, so a stale store does not serve it live.
@@ -473,10 +476,13 @@ impl Session {
                 st.peer_partial(),
                 peer_fresh,
                 stale_applied,
+                same_epoch,
             )
         };
-        self.call(move |s| record_round(s, synced, partial, peer_fresh, stale_applied))
-            .await?;
+        if same_epoch {
+            self.call(move |s| record_round(s, synced, partial, peer_fresh, stale_applied))
+                .await?;
+        }
         self.ctx
             .metrics
             .rounds_completed

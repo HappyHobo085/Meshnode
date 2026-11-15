@@ -15,7 +15,7 @@ use mesh_proto::{Limits, NodeId, Placement, Role, ServiceKind, ServiceManifest};
 use mesh_runtime::{CodeCache, Runtime, RuntimeConfig};
 use mesh_services::{
     DeployOpts, DeployerTimings, LocalState, LocalStatus, ServiceStatus, Services, ServicesConfig,
-    data_ns, manifest_key, placed, placed_hosts,
+    ServicesError, current_generation, data_ns, manifest_key, placed, placed_hosts,
 };
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
@@ -579,6 +579,35 @@ async fn client_role_never_runs() {
     assert_eq!(placed_hosts(&m, &n.nodes[1].handle()), vec![n.id(0)]);
     assert_eq!(call(c, "web", "/").await, (503, NOT_PLACED.into()));
     assert!(!n.nodes[1].blobs().has(module_of(&m).into()).await.unwrap());
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_role_purge_refused_before_any_write() {
+    // Sub-spec 8a final review I1: a client's store holds only `_mesh`, so it cannot
+    // tombstone the old namespace; bumping the generation anyway would leak the old data on
+    // every host for good.
+    let n = net(&[], &[(Role::Client, &[])]).await;
+    let (a, c) = (&n.svcs[0], &n.svcs[1]);
+    a.deploy_wasm("counter", wasm("counter"), DeployOpts::default())
+        .await
+        .unwrap();
+    wait_ready(a, "counter", 1).await;
+    assert_eq!(call(a, "counter", "/").await, (200, "1".into()));
+    let r = c.purge("counter").await;
+    assert!(
+        matches!(r, Err(ServicesError::NotFullReplica("purge"))),
+        "{r:?}"
+    );
+    let gen_of = |i: usize| {
+        let store = n.nodes[i].store().clone();
+        async move { current_generation(&store, "counter").await.unwrap() }
+    };
+    assert_eq!(gen_of(1).await, 0);
+    // Nothing reached the host either: its data and generation are unchanged.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(gen_of(0).await, 0);
+    assert_eq!(call(a, "counter", "/").await, (200, "2".into()));
     n.shutdown().await;
 }
 

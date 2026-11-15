@@ -13,6 +13,12 @@ pub enum ServicesError {
     InvalidComponent(String),
     #[error("no such service")]
     NotFound,
+    /// The operation needs a full replica of the mesh's data, which this node (a client, or
+    /// a client re-invited as a host before its rebuild) does not hold.
+    #[error(
+        "{0} must run on a host: this device does not hold the services' data (run it on a host device)"
+    )]
+    NotFullReplica(&'static str),
     #[error(transparent)]
     Node(#[from] NodeError),
     #[error(transparent)]

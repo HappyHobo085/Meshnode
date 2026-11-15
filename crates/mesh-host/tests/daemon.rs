@@ -957,6 +957,13 @@ async fn meshd_client_role_does_not_store_service_data() {
         "the client stores {sizes:?}"
     );
     assert_eq!(hb.store().get("svc", "k").await.unwrap(), None);
+    // Final review I1: purge needs a full replica; refused as a state error, nothing written.
+    let r = b
+        .req(AdminRequest::Purge {
+            name: "site".into(),
+        })
+        .await;
+    assert_error(&r, ErrorCode::WrongState);
     b.stop().await;
     a.stop().await;
 }

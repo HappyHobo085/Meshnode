@@ -649,6 +649,7 @@ fn services_error(e: ServicesError) -> Fail {
         | ServicesError::InvalidManifest(_)
         | ServicesError::InvalidComponent(_) => Fail(ErrorCode::InvalidArgument, e.to_string()),
         ServicesError::NotFound => Fail(ErrorCode::NotFound, e.to_string()),
+        ServicesError::NotFullReplica(_) => Fail(ErrorCode::WrongState, e.to_string()),
         e => Fail(ErrorCode::Internal, e.to_string()),
     }
 }

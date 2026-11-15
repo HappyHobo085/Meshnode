@@ -222,6 +222,15 @@ I2; Task 3 fix rounds 1–7, Task 4 fix rounds 1–3):
   its incomplete store.
 - **No product path promotes a client yet.** `join` refuses a data dir already in a mesh, and there is no
   promote request. The tests write the host record directly.
+- **Purge needs a full replica** (final review I1, ruling R24). `Services::purge` on a node whose store is
+  not Full (a client-role `meshd`, or a client re-invited as a host before its rebuild) is refused with
+  `ServicesError::NotFullReplica` before anything is written; the admin API answers `WrongState` with that
+  message, which `meshd purge` and the UI show. Otherwise the generation bump would replicate while the
+  old namespace's tombstones could not be written (`OutOfScope`), leaving the old data on every host for
+  good. No other admin operation writes outside `_mesh` after a `_mesh` write: deploy adds blobs to the
+  local blob store (not the replicated store) and writes the manifest in `_mesh`; placement, limits,
+  outbound and undeploy are `_mesh` only; service KV writes run only in services, which a non-Full node
+  never serves.
 
 ### 10.4 `mesh-forward` (§2)
 - **The crate.** The gateway's forwarding moved into a new crate, `crates/mesh-forward`. It holds
@@ -258,8 +267,10 @@ I2; Task 3 fix rounds 1–7, Task 4 fix rounds 1–3):
 ### 10.6 `mesh-client-ffi` (§5, §6.4)
 - **`MeshClientAndroid.init(context)`** is a hand-written Kotlin object over a raw JNI export,
   `Java_net_meshnode_client_MeshClientAndroid_initAndroid`. iroh's networking reads the Android context,
-  so on Android `join` and `open` fail with `NotInitialised` until `init` has run. `init` never throws; if it
-  fails, the reason is in `NotInitialised`'s message.
+  so on Android `join` and `open` fail with `NotInitialised` until `init` has run. Once the library is
+  loaded, `init` never throws; if it fails, the reason is in `NotInitialised`'s message. Loading the library
+  happens in the object's initializer, so a missing or wrong-ABI `.so` surfaces from the first `init` as
+  `UnsatisfiedLinkError` (or `ExceptionInInitializerError`).
 - **Extra error variants.**
   - `InvalidArgument`: a bad hex node id, or `requestTimeoutMs` = 0.
   - `Closed`: any call during or after `shutdown`. `status()`, `members()`, `services()` and
@@ -321,6 +332,16 @@ I2; Task 3 fix rounds 1–7, Task 4 fix rounds 1–3):
   key for another mesh.
 - **F3** (Task 6). The 5 s connect cap may abandon a slow cold connect (relay plus hole-punching on a poor
   mobile link). Make it a timing setting if field reports show `NoHost` on poor links.
+- **M1: no stale indicator** (final review). Neither `meshd status` nor the UI shows that a host is stale,
+  so an owner whose lone host stays stale (tombstone GC skipped) has no cue to run `declare-fresh`.
+  Follow-up: a freshness field in the admin `Status` view, shown in `meshd status` and next to
+  **Declare up to date…**.
+- **M2: an SDK client unused for over 80 days resets** on the next Fresh host's `Hello`. Until its `_mesh`
+  is rebuilt (seconds), `request` gives `NoHost`, `services()` is empty, and `invite`/`remove` give
+  `Internal("…re-bootstrapping")`. It heals by itself.
+- **M5: node-state errors surface as `Internal`** in the SDK. `Rebootstrapping`, `NotEffective` and
+  `NeverSynced` all map to `ClientError::Internal(String)`, so an app cannot tell "try again shortly" from
+  a bug. Follow-up together with M2: a dedicated, retryable variant.
 - **Android untested on a device.** The AAR, `MeshClientAndroid.init` and JNA on Android have never run on
   a device; the manual check covers this. A listener that blocks holds one of the library's two worker
   threads.

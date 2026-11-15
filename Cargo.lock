@@ -2823,6 +2823,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-forward"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "iroh",
+ "mesh-core",
+ "mesh-proto",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mesh-gateway"
 version = "0.1.0"
 dependencies = [
@@ -2836,6 +2850,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "mesh-core",
+ "mesh-forward",
  "mesh-gateway",
  "mesh-hlc",
  "mesh-proto",
@@ -2937,6 +2952,7 @@ dependencies = [
  "hex",
  "http",
  "mesh-core",
+ "mesh-forward",
  "mesh-hlc",
  "mesh-proto",
  "mesh-runtime",

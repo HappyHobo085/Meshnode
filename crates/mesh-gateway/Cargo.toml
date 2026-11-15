@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 mesh-core = { path = "../mesh-core" }
+mesh-forward = { path = "../mesh-forward" }
 mesh-proto = { path = "../mesh-proto" }
 mesh-services = { path = "../mesh-services" }
 bytes.workspace = true
@@ -25,7 +26,7 @@ hex.workspace = true
 
 [features]
 # Test-only helpers: forward and serve counters.
-test-hooks = []
+test-hooks = ["mesh-forward/test-hooks"]
 
 [dev-dependencies]
 mesh-gateway = { path = ".", features = ["test-hooks"] }

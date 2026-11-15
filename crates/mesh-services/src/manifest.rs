@@ -22,10 +22,7 @@ pub(crate) fn module_too_large(len: u64) -> Option<String> {
     })
 }
 
-/// `_mesh` register holding the manifest of `name`.
-pub fn manifest_key(name: &str) -> String {
-    format!("service/{name}")
-}
+pub use mesh_forward::manifest_key;
 
 /// `_mesh` grow-only set of `name`'s data generations (`u64`, 8 bytes big-endian).
 pub fn gen_key(name: &str) -> String {

@@ -46,6 +46,14 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Declare this node up to date although it has not synced with a host for over 80
+    /// days (for a host left on its own). Deletions that other hosts already cleaned up
+    /// may come back.
+    DeclareFresh {
+        /// Confirm the risk (required).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the daemon's state.
     Status {
         #[arg(long)]

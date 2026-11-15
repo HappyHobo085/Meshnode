@@ -194,6 +194,7 @@ struct RoleFile {
 /// Records the role this node entered the mesh with (`role.json`): the founder a host, a
 /// joiner its ticket's role. Written before `mesh.json`, so a node always knows whether its
 /// store is partial (sub-spec 8a §3), even before its own `members` record has arrived.
+/// A role upgrade (client to host) rewrites it as `host` once its Full rebuild is done.
 pub fn write_own_role(dir: &Path, role: Role) -> Result<(), NodeError> {
     let f = RoleFile {
         joined_as: match role {
@@ -343,6 +344,10 @@ pub struct RebootstrapFile {
     pub expired: Vec<SignedOp>,
     /// Effective members (but this node) with their last known address.
     pub peers: Vec<(NodeId, NodeAddrBytes)>,
+    /// A role upgrade (sub-spec 8a §3): the store was Partial and is rebuilt as Full. The
+    /// rebuild announces `Full`, and on completion the scope flips to Full and `role.json`
+    /// says `host`.
+    pub full: bool,
 }
 
 /// Writes `rebootstrap.bin` atomically (temp file, fsync, rename).

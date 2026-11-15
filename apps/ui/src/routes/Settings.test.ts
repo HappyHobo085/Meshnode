@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   configGet: vi.fn(),
   configSet: vi.fn(),
   resetIdentity: vi.fn(),
+  declareFresh: vi.fn(),
   probe: vi.fn(),
   desktop: { connection: vi.fn() },
   android: { powerPolicyGet: vi.fn(), powerPolicySet: vi.fn() },
@@ -55,6 +56,7 @@ beforeEach(() => {
   ]);
   api.configSet.mockResolvedValue({ restartRequired: true });
   api.resetIdentity.mockResolvedValue(running({ state: "uninitialised" }));
+  api.declareFresh.mockResolvedValue(undefined);
   api.desktop.connection.mockResolvedValue({ kind: "system", otherRunning: false });
   api.android.powerPolicyGet.mockResolvedValue("balanced");
   api.android.powerPolicySet.mockResolvedValue(undefined);
@@ -356,4 +358,46 @@ it("reset_identity_without_a_name_asks_for_the_word_reset", async () => {
   await fireEvent.click(action);
   await tick();
   expect(api.resetIdentity).toHaveBeenCalledTimes(1);
+});
+
+it("declare_fresh_confirm_states_the_risk_and_needs_the_name", async () => {
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Declare up to date…" }));
+  const dialog = screen.getByRole("dialog");
+  expect(dialog).toHaveTextContent(/deletions that other hosts already cleaned up may come back/i);
+  const action = within(dialog).getByRole("button", { name: "Declare up to date" });
+  expect(action).toBeDisabled();
+  await fireEvent.input(within(dialog).getByRole("textbox"), { target: { value: "Desk" } });
+  expect(action).toBeEnabled();
+  await fireEvent.click(action);
+  await tick();
+  expect(api.declareFresh).toHaveBeenCalledTimes(1);
+  for (let i = 0; i < 4; i++) await tick();
+  expect(get(toasts).map((t) => t.message)).toContain("Declared up to date");
+});
+
+it("declare_fresh_shows_the_daemon_refusal_inline", async () => {
+  api.declareFresh.mockRejectedValue({
+    code: "wrongState",
+    message: "node is rebootstrapping; local writes are refused",
+    hint: null,
+    reason: null,
+  });
+  await mount();
+  await fireEvent.click(screen.getByRole("button", { name: "Declare up to date…" }));
+  const dialog = screen.getByRole("dialog");
+  await fireEvent.input(within(dialog).getByRole("textbox"), { target: { value: "Desk" } });
+  await fireEvent.click(within(dialog).getByRole("button", { name: "Declare up to date" }));
+  await tick();
+  await tick();
+  expect(within(screen.getByRole("dialog")).getByRole("alert")).toHaveTextContent(
+    "node is rebootstrapping",
+  );
+});
+
+it("declare_fresh_is_offered_only_while_running", async () => {
+  status.set(running({ state: "removed", tags: ["desktop"] }));
+  members.set([]);
+  await mount();
+  expect(screen.getByRole("button", { name: "Declare up to date…" })).toBeDisabled();
 });

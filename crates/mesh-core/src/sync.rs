@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mesh_proto::{
-    Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Scope, SignedOp, SyncMsg,
+    Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Role, Scope, SignedOp, SyncMsg,
     VersionVector, batch_ops,
 };
 use mesh_store::{StoreError, SyncItem};
@@ -29,7 +29,7 @@ use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, SYNC_MAX_FRAME, read_frame, write_frame};
-use crate::membership::{MeshAcceptor, scope_of_role};
+use crate::membership::{MEMBERS, MESH_NS, MeshAcceptor, member_bytes, scope_of_role};
 
 /// Items per `diff_since` page.
 const PAGE: usize = 256;
@@ -75,13 +75,29 @@ pub enum SessionEnd {
 /// answers that `Hello` with `Done` (it sent everything it holds beyond our vector) the
 /// session reports that epoch. A re-bootstrap completes only once a pull of its own epoch
 /// was reported: everything a Full peer had, against a `Hello` sent after the reset.
+///
+/// It also carries the scope the current re-bootstrap rebuilds with: a role upgrade
+/// (sub-spec 8a §3) rebuilds a Partial store as Full, so from its reset on every `Hello`
+/// announces `Full` while the store's own scope flips only once the rebuild is done.
 #[derive(Debug, Default)]
 pub struct FullPulls {
     epoch: AtomicU64,
     pulled: AtomicU64,
+    rebuild_full: AtomicBool,
 }
 
 impl FullPulls {
+    /// Sets whether the re-bootstrap in progress rebuilds the store as Full (a role
+    /// upgrade); `Hello`s announce `Full` while it is set.
+    pub fn set_rebuild_full(&self, on: bool) {
+        self.rebuild_full.store(on, Ordering::SeqCst);
+    }
+
+    /// See [`FullPulls::set_rebuild_full`].
+    pub fn rebuild_full(&self) -> bool {
+        self.rebuild_full.load(Ordering::SeqCst)
+    }
+
     /// Starts a new epoch (the store was just reset) and returns it.
     pub fn begin_epoch(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
@@ -671,10 +687,23 @@ impl Session {
     /// `Full`, client ⇔ `Scope::client()`), like an unknown member. A peer with no role
     /// yet (a provisional peer during a join) is taken at its word: serving it scoped and
     /// ignoring its markers is always safe, and `Full` is today's treatment.
+    ///
+    /// A peer listed both as a client and as a host is a client re-invited as a host
+    /// (sub-spec 8a §3 role upgrade): until it learns that and rebuilds as Full it still
+    /// announces Partial, and it must be served (scoped) to learn it at all; so for it
+    /// either scope is accepted. A node listed only as a host must announce Full.
     async fn check_scope(&self, scope: &Scope) -> Result<(), SessionEnd> {
         let (acc, peer) = (self.ctx.acc.clone(), self.ctx.peer);
-        let role = self.call(move |s| acc.role_of(s, &peer)).await?;
+        let (role, upgrading) = self
+            .call(move |s| {
+                let role = acc.role_of(s, &peer)?;
+                let upgrading = role == Some(Role::Host)
+                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&peer, Role::Client))?;
+                Ok((role, upgrading))
+            })
+            .await?;
         match role {
+            Some(_) if upgrading && *scope == scope_of_role(Role::Client) => Ok(()),
             Some(role) if scope_of_role(role) != *scope => Err(SessionEnd::Protocol(format!(
                 "Hello scope {scope:?} contradicts the peer's role {role:?}"
             ))),
@@ -832,8 +861,15 @@ impl Session {
             // with an older epoch (conservative), never a pre-reset vector with a new one.
             let epoch = self.ctx.pulls.current();
             let paused = self.paused();
+            // A role upgrade's rebuild asks for everything (sub-spec 8a §3). Read after the
+            // epoch: the flag is set before the reset's `begin_epoch`, so a Hello that can
+            // earn the new epoch's pull credit always announced `Full`.
+            let full = self.ctx.pulls.rebuild_full();
             let (vv, scope, freshness) = self
-                .call(move |s| Ok((s.version_vector()?, s.scope(), own_freshness(s, paused)?)))
+                .call(move |s| {
+                    let scope = if full { Scope::Full } else { s.scope() };
+                    Ok((s.version_vector()?, scope, own_freshness(s, paused)?))
+                })
                 .await?;
             {
                 let mut st = self.lock();

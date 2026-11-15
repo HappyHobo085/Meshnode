@@ -264,6 +264,7 @@ fn every_request() -> Vec<AdminRequest> {
             key: "gateway.listen".into(),
             value: "127.0.0.1:7778".into(),
         },
+        AdminRequest::DeclareFresh,
     ]
 }
 

@@ -10,6 +10,7 @@
   import { theme, type Theme } from "../lib/theme";
   import PowerPolicy from "./PowerPolicy.svelte";
   import ProbeChart from "./ProbeChart.svelte";
+  import DeclareFresh from "./DeclareFresh.svelte";
   import ResetIdentity from "./ResetIdentity.svelte";
 
   /** The daemon's limits on this device's info (mesh-proto `join.rs`). */
@@ -532,6 +533,17 @@
     <div class="panel">
       <div class="danger-row">
         <div class="danger-text">
+          <h3>Declare up to date</h3>
+          <p>
+            For a host that was off for over 80 days with no other host to sync with: it counts as
+            out of date and stops cleaning up deleted data. Declaring it up to date lets it clean up
+            again, but deletions that other hosts already cleaned up may come back.
+          </p>
+        </div>
+        <DeclareFresh disabled={$status?.state !== "running"} />
+      </div>
+      <div class="danger-row">
+        <div class="danger-text">
           <h3>Reset identity</h3>
           {#if removed}
             <p>
@@ -809,6 +821,11 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--s-4);
+  }
+  .danger-row + .danger-row {
+    margin-top: var(--s-5);
+    padding-top: var(--s-5);
+    border-top: 1px solid var(--line);
   }
   .danger-text {
     display: grid;

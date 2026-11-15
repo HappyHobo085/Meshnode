@@ -182,6 +182,8 @@ export const api = {
   configGet: () => call<ConfigEntry[]>("config_get"),
   configSet: (key: string, value: string) => call<ConfigSetDto>("config_set", { key, value }),
   resetIdentity: () => call<StatusDto>("reset_identity"),
+  /** The owner declares this node up to date (deletions other hosts cleaned up may return). */
+  declareFresh: () => call<void>("declare_fresh"),
   platform: () => call<Platform>("platform"),
 
   /** Follow the daemon log: the last `lines` lines, then new ones as they arrive. */

@@ -213,6 +213,7 @@ pub fn run() {
             mesh_ui_tauri::commands::config_get,
             mesh_ui_tauri::commands::config_set,
             mesh_ui_tauri::commands::reset_identity,
+            mesh_ui_tauri::commands::declare_fresh,
             mesh_ui_tauri::commands::platform,
             mesh_ui_tauri::commands::logs_follow,
             mesh_ui_tauri::commands::probe,

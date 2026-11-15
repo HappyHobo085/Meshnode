@@ -39,6 +39,8 @@ describe("api", () => {
     expect(core.invoke).toHaveBeenCalledWith("set_tags_of", { idHex: "ab12", tags: ["home"] });
     await api.setInfo({ name: "desk" });
     expect(core.invoke).toHaveBeenCalledWith("set_info", { name: "desk", tags: null });
+    await api.declareFresh();
+    expect(core.invoke).toHaveBeenCalledWith("declare_fresh", undefined);
   });
 
   it("rejects_with_ui_error", async () => {

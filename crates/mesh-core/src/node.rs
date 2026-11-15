@@ -478,6 +478,8 @@ pub(crate) async fn start(
         remove_rebootstrap(&cfg.data_dir)?;
     }
     let rebootstrap_due = !removed_self && pending.is_some();
+    // A resumed role upgrade (sub-spec 8a §3) announces `Full` from the first `Hello` on.
+    let resume_full = rebootstrap_due && pending.as_ref().is_some_and(|f| f.full);
     // The remembered peers of a resumed run: the emptied store holds no addresses.
     let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
         .filter(|_| rebootstrap_due)
@@ -495,6 +497,7 @@ pub(crate) async fn start(
     let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
     let pulls = Arc::new(crate::sync::FullPulls::default());
+    pulls.set_rebuild_full(resume_full);
 
     if let Some(ms) = store.call_raw(|s| Ok(s.clock_floor_ahead_ms())).await? {
         warn!(ms, "HLC floor is ahead of the wall clock");
@@ -759,6 +762,52 @@ impl Node {
         let genesis = read_genesis(&cfg.data_dir)?.ok_or(NodeError::NotInitialised)?;
         let key = load_or_create_key(&cfg.data_dir)?;
         start(cfg, key, genesis, Vec::new()).await
+    }
+
+    /// The owner declares this node up to date (sub-spec 8a ruling R6): records a full sync
+    /// now, for the staleness clock only (`synced_self_seq` is not advanced: nothing proves
+    /// that a peer holds this node's own ops). For a host that stayed stale (off for more
+    /// than 80 days with no other host), which would otherwise skip tombstone GC for ever.
+    ///
+    /// The risk is the owner's: this node becomes a Fresh source again, so deletions that
+    /// other hosts already cleaned up (tombstone GC) may come back through it.
+    ///
+    /// Refused with [`NodeError::Rebootstrapping`] while a re-bootstrap runs or is about to
+    /// (its rebuilt store is fresh anyway), with [`NodeError::Removed`] once removed, and
+    /// with [`NodeError::NeverSynced`] for a store that never completed a full sync (it
+    /// holds nothing a stale host could safely rebuild from).
+    pub async fn declare_fresh(&self) -> Result<(), NodeError> {
+        let inner = &self.inner;
+        let busy = || {
+            matches!(*inner.status.borrow(), NodeStatus::Rebootstrapping { .. })
+                || inner.serve_paused.load(Ordering::SeqCst)
+        };
+        if busy() {
+            return Err(NodeError::Rebootstrapping);
+        }
+        // No re-bootstrap can start its reset meanwhile.
+        let _one_at_a_time = inner.rebootstrap.lock().await;
+        if busy() {
+            return Err(NodeError::Rebootstrapping);
+        }
+        if matches!(*inner.status.borrow(), NodeStatus::Removed { .. }) {
+            return Err(NodeError::Removed);
+        }
+        let declared = inner
+            .store
+            .call_raw(|s| {
+                if s.last_full_sync_ms()?.is_none() {
+                    return Ok(false);
+                }
+                s.refresh_full_sync_time()?;
+                Ok(true)
+            })
+            .await?;
+        if !declared {
+            return Err(NodeError::NeverSynced);
+        }
+        warn!("declared up to date by the owner; staleness cleared");
+        Ok(())
     }
 
     /// Whether a sync round has completed since this node started (sticky; no race with

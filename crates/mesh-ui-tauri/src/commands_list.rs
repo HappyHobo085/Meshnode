@@ -22,6 +22,7 @@ pub const COMMANDS: &[&str] = &[
     "config_get",
     "config_set",
     "reset_identity",
+    "declare_fresh",
     "platform",
     "logs_follow",
     "probe",

@@ -1176,3 +1176,215 @@ async fn round_spanning_a_reset_records_no_taint() {
     );
     assert!(!a.inner().is_stale().unwrap());
 }
+
+// ---------------------------------------------------------------- role upgrade (Task 4)
+
+/// A re-invites client C as a host: `_mesh` lists C as a host too (host outranks client).
+async fn list_as_host(by: &Node, c: NodeId) {
+    by.store()
+        .set_add(MESH_NS, MEMBERS, member_bytes(&c, Role::Host).to_vec())
+        .await
+        .unwrap();
+}
+
+async fn wait_event(rx: &mut broadcast::Receiver<NodeEvent>, want: fn(&NodeEvent) -> bool) {
+    timeout(T, async {
+        loop {
+            match rx.recv().await {
+                Ok(ev) if want(&ev) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("event in time");
+}
+
+async fn svc_writes(a: &Node, n: usize) {
+    for i in 0..n {
+        a.store()
+            .set("svc", &format!("k{i}"), b"v".to_vec())
+            .await
+            .unwrap();
+    }
+}
+
+async fn has_svc(n: &Node, count: usize) -> bool {
+    for i in 0..count {
+        if get(n, "svc", &format!("k{i}")).await.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sub-spec 8a §3 role upgrade: a client whose effective role becomes Host re-bootstraps as
+/// Full (reset, full catch-up, own ops re-applied). Its scope and `role.json` flip only when
+/// that is done; then it holds the hosts' service data and writes outside `_mesh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_upgraded_to_host_rebootstraps_full() {
+    let d = dirs(3);
+    let (a, b, c) = mesh_abc(&d).await;
+    svc_writes(&a, 5).await;
+    // An own `_mesh` write of the client, re-applied after the reset.
+    c.set_info(Some("c-before".into()), None).await.unwrap();
+    caught_up_with(&c, &a).await;
+    assert_no_svc(&c).await;
+    let mut ec = c.subscribe();
+    c.hold_rebootstrap_before_reset(true);
+    list_as_host(&a, c.node_id()).await;
+
+    wait_event(&mut ec, |e| matches!(e, NodeEvent::RebootstrapStarting)).await;
+    wait_until("C rebuilding", T, || async {
+        matches!(c.status(), mesh_core::NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    assert_eq!(
+        c.scope(),
+        Scope::client(),
+        "not Full before the rebuild is done"
+    );
+    assert_eq!(
+        mesh_core::local::read_own_role(d[2].path()).unwrap(),
+        Some(Role::Client)
+    );
+    c.hold_rebootstrap_before_reset(false);
+    wait_event(&mut ec, |e| matches!(e, NodeEvent::RebootstrapDone)).await;
+
+    assert_eq!(c.status(), mesh_core::NodeStatus::Running);
+    assert_eq!(c.scope(), Scope::Full);
+    assert_eq!(
+        mesh_core::local::read_own_role(d[2].path()).unwrap(),
+        Some(Role::Host)
+    );
+    assert!(has_svc(&c, 5).await, "C holds A's service data");
+    caught_up_with(&c, &a).await;
+    assert!(
+        c.members()
+            .iter()
+            .any(|m| m.id == c.node_id() && m.info.as_ref().is_some_and(|i| i.name == "c-before")),
+        "own `_mesh` write kept"
+    );
+    // A host now: it writes outside `_mesh`, and the hosts take it.
+    c.store().set("svc", "from-c", b"c".to_vec()).await.unwrap();
+    wait_until("A and B get C's svc write", T, || async {
+        get(&a, "svc", "from-c").await.is_some() && get(&b, "svc", "from-c").await.is_some()
+    })
+    .await;
+    // Reopened, it stays Full.
+    timeout(T, c.shutdown()).await.unwrap();
+    let c = Node::open(test_cfg(d[2].path(), "c").0).await.unwrap();
+    assert_eq!(c.scope(), Scope::Full);
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// The upgrade must not depend on a live push: a client that was offline while it was
+/// re-invited as a host learns it from peers that already list it as a host (they serve
+/// it, scoped, while it still announces Partial) and then upgrades.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_upgraded_while_offline_learns_it_and_upgrades() {
+    let d = dirs(3);
+    let (a, b, c) = mesh_abc(&d).await;
+    svc_writes(&a, 3).await;
+    caught_up_with(&c, &a).await;
+    let (ia, ib, ic) = (a.node_id(), b.node_id(), c.node_id());
+    c.partition(&[ia, ib]);
+    a.partition(&[ic]);
+    b.partition(&[ic]);
+    wait_until("C offline", T, || async {
+        !c.members().iter().any(|m| m.id != ic && m.online)
+    })
+    .await;
+    list_as_host(&a, ic).await;
+    let host_c = member_bytes(&ic, Role::Host).to_vec();
+    let bs = b.store().clone();
+    wait_until("B lists C as a host", T, || {
+        let (h, bs) = (host_c.clone(), bs.clone());
+        async move {
+            bs.call(move |s| s.set_contains(MESH_NS, MEMBERS, &h))
+                .await
+                .unwrap()
+        }
+    })
+    .await;
+    let mut ec = c.subscribe();
+    a.heal();
+    b.heal();
+    c.heal();
+    wait_event(&mut ec, |e| matches!(e, NodeEvent::RebootstrapDone)).await;
+    assert_eq!(c.scope(), Scope::Full);
+    assert!(has_svc(&c, 3).await);
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// An upgrade interrupted right after its reset resumes as Full after a restart: it
+/// announces Full (else the hosts would serve it scoped and its rebuild would lack every
+/// other namespace) and ends with the hosts' data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_resumes_as_full_after_a_crash() {
+    let d = dirs(3);
+    let (a, b, c) = mesh_abc(&d).await;
+    svc_writes(&a, 3).await;
+    caught_up_with(&c, &a).await;
+    c.crash_after_reset();
+    list_as_host(&a, c.node_id()).await;
+    wait_until("C crashed after the reset", T, || async { c.is_stopped() }).await;
+    timeout(T, c.shutdown()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + T;
+    let c = loop {
+        match Node::open(test_cfg(d[2].path(), "c").0).await {
+            Ok(n) => break n,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!("reopen failed, retrying: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    };
+    wait_until("the resumed upgrade completes", T, || async {
+        c.status() == mesh_core::NodeStatus::Running && c.scope() == Scope::Full
+    })
+    .await;
+    assert!(has_svc(&c, 3).await, "rebuilt with the hosts' data");
+    assert_eq!(
+        mesh_core::local::read_own_role(d[2].path()).unwrap(),
+        Some(Role::Host)
+    );
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// A node listed both as a client and as a host is upgrading: it may still announce
+/// Partial (it is served scoped) or already Full. A node listed only as a host must
+/// announce Full, and one listed only as a client must announce Partial.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrading_peer_may_announce_either_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    a.inner()
+        .set_add(MESH_NS, MEMBERS, &member_bytes(&id(3), Role::Host))
+        .unwrap();
+    for scope in [Scope::client(), Scope::Full] {
+        let (join, _h, mut raw) = run_against_raw(&a, id(3));
+        raw.send(&hello(VersionVector::default(), scope.clone()))
+            .await;
+        assert!(
+            matches!(raw.recv().await, Some(SyncMsg::Hello { .. })),
+            "{scope:?}"
+        );
+        if scope == Scope::client() {
+            for m in raw.until_done().await {
+                if let SyncMsg::Ops { ops } = m {
+                    assert!(ops.iter().all(|o| o.body.payload.ns() == MESH_NS));
+                }
+            }
+        }
+        assert!(!join.is_finished());
+    }
+}

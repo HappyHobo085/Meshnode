@@ -356,6 +356,10 @@ impl Daemon {
                 }
                 AdminResponse::Ok
             }
+            R::DeclareFresh => {
+                node.declare_fresh().await.map_err(node_error)?;
+                AdminResponse::Ok
+            }
             R::DeployWasm { name, wasm, opts } => manifest(
                 svcs.deploy_wasm(&name, Bytes::from(wasm), services_opts(opts))
                     .await,
@@ -627,6 +631,7 @@ fn node_error(e: NodeError) -> Fail {
         NodeError::NotEffective
         | NodeError::Removed
         | NodeError::Rebootstrapping
+        | NodeError::NeverSynced
         | NodeError::AlreadyInMesh
         | NodeError::NotInitialised
         | NodeError::WrongMesh => ErrorCode::WrongState,

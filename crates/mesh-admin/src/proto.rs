@@ -106,6 +106,10 @@ pub enum AdminRequest {
         id: NodeId,
         tags: Vec<String>,
     },
+    /// The owner declares this node up to date (sub-spec 8a ruling R6): a full sync is
+    /// recorded now for the staleness clock only. Deletions that other hosts already
+    /// cleaned up may come back through this node. Refused while it re-bootstraps.
+    DeclareFresh,
     DeployWasm {
         name: String,
         wasm: Vec<u8>,

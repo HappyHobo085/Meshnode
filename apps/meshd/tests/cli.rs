@@ -450,3 +450,28 @@ fn service_status_json_shape() {
         assert!(data_dir.is_null(), "{out}");
     }
 }
+
+/// Ruling R6: `declare-fresh` refuses without `--yes` (printing the risk, the daemon is not
+/// asked), and with it the daemon declares the node up to date.
+#[test]
+fn declare_fresh_needs_yes() {
+    let dir = TempDir::new().unwrap();
+    let o = meshd(dir.path(), &["declare-fresh"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("deletions that other hosts already cleaned up may come back"),
+        "{err}"
+    );
+    assert!(err.contains("--yes"), "{err}");
+    // With --yes it goes to the daemon.
+    let o = meshd(dir.path(), &["declare-fresh", "--yes"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert_eq!(stderr(&o).trim(), NOT_RUNNING);
+
+    let dir = offline_dir();
+    let _daemon = start_daemon(dir.path());
+    let o = meshd(dir.path(), &["declare-fresh", "--yes"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).contains("up to date"), "{}", stdout(&o));
+}

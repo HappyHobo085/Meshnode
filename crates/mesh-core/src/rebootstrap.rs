@@ -17,12 +17,17 @@
 //! paused (`serve_paused`) from the reset decision until step 7; sessions still receive
 //! and apply. The run completes only after a completed pull from a Full peer since the
 //! reset (ruling I2), besides getting its own ops and `members` record back.
+//!
+//! Role upgrade (sub-spec 8a §3): a client whose effective role becomes host (re-invited
+//! as host) re-bootstraps through the same steps as Full: its Partial store is reset and
+//! caught up in full, and only then does its scope flip to Full and `role.json` say
+//! `host` (see [`run_rebootstrap`]).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use mesh_proto::{NodeId, Payload, Role};
+use mesh_proto::{NodeId, Payload, Role, Scope};
 use mesh_store::SyncItem;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{MissedTickBehavior, sleep};
@@ -31,7 +36,8 @@ use tracing::{debug, error, info, warn};
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::local::{
-    RebootstrapFile, append_expired_edits, read_rebootstrap, remove_rebootstrap, write_rebootstrap,
+    RebootstrapFile, append_expired_edits, read_rebootstrap, remove_rebootstrap, write_own_role,
+    write_rebootstrap,
 };
 use crate::membership::{MEMBERS, MESH_NS, member_bytes};
 use crate::node::{Inner, NodeStatus, publish_addr};
@@ -39,43 +45,74 @@ use crate::node::{Inner, NodeStatus, publish_addr};
 /// How often step 4 re-checks `vv[self]` besides each `RoundComplete` (events are lossy).
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
-/// Runs the re-bootstrap at start (if `due`: an interrupted run) and whenever a session
-/// reports a stale store next to a fresh Full peer. A failed run is retried after
-/// `backoff_max`.
+/// Runs the re-bootstrap at start (if `due`: an interrupted run), whenever a session
+/// reports a stale store next to a fresh Full peer, and whenever this node's role became
+/// host while its store is still Partial (a role upgrade, checked at start and on every
+/// membership change). A failed run is retried after `backoff_max`.
 pub(crate) async fn driver(
     inner: Arc<Inner>,
     stale: Arc<Mutex<mpsc::Receiver<NodeId>>>,
     due: bool,
 ) {
     let mut stale = stale.lock().await;
+    let mut members = inner.membership.subscribe();
     let cancel = inner.cancel.clone();
     let mut due = due;
     // A stale store is reset only right after a session met a fresh Full peer.
     let mut fresh_peer = false;
     loop {
-        if due && let Err(e) = run_rebootstrap(&inner, fresh_peer).await {
-            error!(error = %e, "re-bootstrap failed; retrying");
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = sleep(inner.cfg.timings.backoff_max) => continue,
+        if due || upgrade_due(&inner) {
+            match run_rebootstrap(&inner, fresh_peer).await {
+                Ok(()) => (due, fresh_peer) = (false, false),
+                Err(e) => {
+                    error!(error = %e, "re-bootstrap failed; retrying");
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = sleep(inner.cfg.timings.backoff_max) => continue,
+                    }
+                }
             }
         }
         tokio::select! {
             _ = cancel.cancelled() => return,
             r = stale.recv() => match r {
-                Some(peer) => debug!(peer = %peer.short(), "a session found the store stale"),
+                Some(peer) => {
+                    debug!(peer = %peer.short(), "a session found the store stale");
+                    (due, fresh_peer) = (true, true);
+                }
                 None => return,
             },
+            r = members.changed() => if r.is_err() {
+                return;
+            },
         }
-        due = true;
-        fresh_peer = true;
     }
 }
 
+/// Whether this node must re-bootstrap as Full (sub-spec 8a §3 role upgrade): it is an
+/// effective host in `_mesh` (re-invited as host; host outranks client) but its store is
+/// still Partial, so it holds only `_mesh` and its vector moved past everything else.
+fn upgrade_due(inner: &Inner) -> bool {
+    let host = {
+        let snap = inner.membership.borrow();
+        snap.is_effective(&inner.me) && snap.role(&inner.me) == Some(Role::Host)
+    };
+    host && inner.store.raw().scope() != Scope::Full
+}
+
 /// Spec §7 steps 1–7. Does nothing (and lets sessions serve again) if no re-bootstrap is
-/// pending and the store is not stale, or is stale but `fresh_peer` is false (no Full,
-/// non-stale peer was just met to restore from; ruling C1). Returns early, leaving
-/// `rebootstrap.bin` for the next start, when the node is shut down meanwhile.
+/// pending, no role upgrade is due ([`upgrade_due`]) and the store is not stale, or is
+/// stale but `fresh_peer` is false (no Full, non-stale peer was just met to restore from;
+/// ruling C1). Returns early, leaving `rebootstrap.bin` for the next start, when the node
+/// is shut down meanwhile.
+///
+/// A role upgrade does not wait for a Fresh Full peer: the Partial store holds only
+/// `_mesh`, which the hosts hold too, and its unsynced own ops are exported first; and the
+/// store is no use as it is (its vector moved past every other namespace). Its rebuild
+/// announces `Full` from the reset on ([`crate::sync::FullPulls::set_rebuild_full`]), takes
+/// data only from Fresh Full peers (and `_mesh` from clients) like any rebuild, and only
+/// once done flips the store's scope to Full and rewrites `role.json` as `host`. A Partial
+/// node's re-bootstrap for any other reason stays Partial (a scoped catch-up).
 pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(), NodeError> {
     let _one_at_a_time = inner.rebootstrap.lock().await;
     let dir = inner.cfg.data_dir.clone();
@@ -92,14 +129,19 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
             file
         }
         None => {
-            if !fresh_peer || !inner.store.call_raw(|s| s.is_stale()).await? {
+            let upgrade = upgrade_due(inner);
+            if !upgrade && (!fresh_peer || !inner.store.call_raw(|s| s.is_stale()).await?) {
                 resume_serving(inner);
                 return Ok(());
             }
             // From here no own op can be written until step 7.
             pause(inner).await;
             // 1.
-            warn!("store is stale (no full sync for 80 days); re-bootstrapping");
+            if upgrade {
+                warn!("this client is a host now; re-bootstrapping as a full replica");
+            } else {
+                warn!("store is stale (no full sync for 80 days); re-bootstrapping");
+            }
             let _ = inner.events.send(NodeEvent::RebootstrapStarting);
             // 2. `synced_self_seq` before the reset, which deletes it.
             let (s, last_seq, export) = inner
@@ -124,6 +166,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
                 items: export.items,
                 expired: export.expired,
                 peers,
+                full: upgrade,
             };
             let (d, f) = (dir.clone(), file.clone());
             blocking(move || write_rebootstrap(&d, &f)).await?;
@@ -159,6 +202,9 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
             st.next_seq()
         })
         .await?;
+    // A role upgrade asks for everything from here on: every Hello of the new epoch
+    // announces `Full` (with the emptied vector), so the pull credit below is a full one.
+    inner.pulls.set_rebuild_full(file.full);
     // Only a pull answering a `Hello` sent from now on counts (ruling I2); new rounds send
     // one with the emptied vector (a round in progress counts once the next one starts).
     let epoch = inner.pulls.begin_epoch();
@@ -242,6 +288,16 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
         .store
         .call_raw(|st| st.refresh_full_sync_time())
         .await?;
+    // A role upgrade is done: the store is a full replica now (sub-spec 8a §3). The scope
+    // flips before serving resumes, and `role.json` is rewritten before `rebootstrap.bin`
+    // goes, so a restart in between still resumes as Full.
+    if file.full {
+        inner.store.raw().set_scope(Scope::Full);
+        let d = dir.clone();
+        blocking(move || write_own_role(&d, Role::Host)).await?;
+        inner.pulls.set_rebuild_full(false);
+        info!("role upgrade done: this node is a full replica now");
+    }
     blocking(move || remove_rebootstrap(&dir)).await?;
     inner.store.refuse_writes_rebootstrapping(false);
     inner.status.send_if_modified(|st| {

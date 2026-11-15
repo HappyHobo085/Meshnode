@@ -767,3 +767,160 @@ async fn stale_host_and_new_host_that_meets_fresh_client_first() {
         timeout(T, n.shutdown()).await.unwrap();
     }
 }
+
+/// Sub-spec 8a §3: a client's re-bootstrap for any other reason than a role upgrade (here:
+/// stale, meeting a Fresh host) asks for a scoped catch-up and leaves it a client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_rebootstrap_stays_partial() {
+    let t = quad().await;
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad {
+        a, b, c, d, dirs, ..
+    } = t;
+    let ia = a.node_id();
+    let mut ec = c.subscribe();
+    // C reaches the Fresh hosts (they keep shutting A out): it resets and rebuilds.
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    wait_rebootstrap_done(&mut ec).await;
+    wait_until("C fresh", T, || async {
+        c.status() == NodeStatus::Running && !is_stale(&c).await
+    })
+    .await;
+    assert_eq!(c.scope(), mesh_proto::Scope::client());
+    assert_eq!(
+        mesh_core::local::read_own_role(dirs[2].path()).unwrap(),
+        Some(Role::Client)
+    );
+    let sizes = c.store().call(|s| s.namespace_sizes()).await.unwrap();
+    assert!(
+        sizes.keys().all(|ns| ns == "_mesh"),
+        "client holds {sizes:?}"
+    );
+    assert_eq!(val(&c, "b-data").await, None);
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------- declare fresh (R6)
+
+/// Ops of `key` in `NS` this node holds (any origin).
+async fn ops_of(n: &Node) -> usize {
+    n.store()
+        .call(|s| s.diff_since(&VersionVector::default(), 100_000))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|i| matches!(i, mesh_store::SyncItem::Op(op) if op.body.payload.ns() == NS))
+        .count()
+}
+
+/// Ruling R6: a host that stayed stale (off for more than 80 days with no other host)
+/// skips tombstone GC for ever; the owner's `declare_fresh` records a full sync now (the
+/// time only), and the next GC tick collects old tombstones again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_clears_staleness_and_gc_runs() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (mut cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    cfg_a.timings.gc = Duration::from_millis(100);
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    a.store().set(NS, "gone", b"v".to_vec()).await.unwrap();
+    a.store().delete(NS, "gone").await.unwrap();
+    let (b, _cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    // A's own ops reached B (a full round): they are below `synced_self_seq`.
+    let own = vv_of(&a).await.get(&a.node_id());
+    wait_until("A's ops synced", T, || async {
+        a.store()
+            .call(|s| s.synced_self_seq())
+            .await
+            .unwrap()
+            .is_some_and(|s| s >= own)
+    })
+    .await;
+    timeout(T, b.shutdown()).await.unwrap();
+    let synced_seq = a.store().call(|s| s.synced_self_seq()).await.unwrap();
+    assert_eq!(ops_of(&a).await, 2);
+
+    // 91 days alone: stale, and the tombstone is past its TTL, but GC skips a stale store.
+    ca.set(day0 + 91 * DAY);
+    assert!(is_stale(&a).await);
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(ops_of(&a).await, 2, "no GC while stale");
+
+    a.declare_fresh().await.unwrap();
+    assert!(!is_stale(&a).await);
+    assert!(last_full_sync(&a).await.unwrap() >= day0 + 91 * DAY);
+    assert_eq!(
+        a.store().call(|s| s.synced_self_seq()).await.unwrap(),
+        synced_seq,
+        "the time only"
+    );
+    wait_until("GC on the next tick", T, || async { ops_of(&a).await == 0 }).await;
+    timeout(T, a.shutdown()).await.unwrap();
+}
+
+/// Ruling R6: `declare_fresh` is refused while the node re-bootstraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_refused_while_rebootstrapping() {
+    let t = quad().await;
+    t.age_a().await;
+    let Quad { a, b, c, d, .. } = t;
+    let mut ea = a.subscribe();
+    a.hold_rebootstrap_before_reset(true);
+    b.heal();
+    d.heal();
+    wait_until("A rebuilding", T, || async {
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    let r = a.declare_fresh().await;
+    assert!(
+        matches!(r, Err(mesh_core::NodeError::Rebootstrapping)),
+        "{r:?}"
+    );
+    a.hold_rebootstrap_before_reset(false);
+    wait_rebootstrap_done(&mut ea).await;
+    a.declare_fresh().await.unwrap();
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// `declare_fresh` on a store that never completed a full sync is refused: it holds
+/// nothing a stale host could safely rebuild from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_refused_on_a_never_synced_store() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let ib = id_of(&dirs[1]);
+    a.partition(&[ib]);
+    let ticket = a.invite(Role::Host, TTL).await.unwrap();
+    let (cfg_b, cb) = test_cfg(dirs[1].path(), "b");
+    cb.set(day0);
+    let b = timeout(T, Node::join(cfg_b, ticket))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_full_sync(&b).await, None);
+    let r = b.declare_fresh().await;
+    assert!(matches!(r, Err(mesh_core::NodeError::NeverSynced)), "{r:?}");
+    assert_eq!(last_full_sync(&b).await, None);
+    for n in [a, b] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}

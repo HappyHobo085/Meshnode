@@ -319,6 +319,13 @@ impl Ui {
         }
     }
 
+    /// The owner declares this node up to date (sub-spec 8a ruling R6): deletions that
+    /// other hosts already cleaned up may come back. Refused while it re-bootstraps.
+    pub async fn declare_fresh(&self) -> Result<(), UiError> {
+        self.call_ok("declare_fresh", AdminRequest::DeclareFresh)
+            .await
+    }
+
     pub async fn reset_identity(&self) -> Result<StatusDto, UiError> {
         self.call_ok(
             "reset_identity",

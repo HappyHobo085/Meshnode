@@ -162,3 +162,14 @@ fn accent_hue_stable() {
     assert_eq!(accent_hue(&NodeId(a)), 300);
     assert_eq!(accent_hue(&NodeId([0xff; 32])), 15);
 }
+
+/// Ruling R6: the owner's "declare up to date" reaches the node (a founder has a full sync);
+/// without a mesh it is a wrong-state error.
+#[tokio::test(flavor = "multi_thread")]
+async fn declare_fresh_round_trip() {
+    let (_d, _dir, ui) = start().await;
+    let e = ui.declare_fresh().await.unwrap_err();
+    assert_eq!(e.code, UiErrorCode::WrongState);
+    ui.init("desk".into()).await.unwrap();
+    ui.declare_fresh().await.unwrap();
+}

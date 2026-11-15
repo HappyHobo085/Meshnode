@@ -63,8 +63,9 @@ pub enum SessionEnd {
     /// The peer broke the protocol; close with `PROTOCOL`.
     Protocol(String),
     Store(StoreError),
-    /// The store is stale and a Fresh Full peer announced itself: the node re-bootstraps
-    /// from it (spec §7, sub-spec 8a ruling C1c). Nothing was served to that peer.
+    /// The store is stale, or a role upgrade is due (sub-spec 8a §3), and a Fresh Full peer
+    /// announced itself: the node re-bootstraps from it (spec §7, sub-spec 8a rulings C1c
+    /// and R8). Nothing was served to that peer, and serving is already paused.
     Stale,
 }
 
@@ -84,9 +85,17 @@ pub struct FullPulls {
     epoch: AtomicU64,
     pulled: AtomicU64,
     rebuild_full: AtomicBool,
+    /// Held (inside a store call) while a session decides on a reset and pauses serving,
+    /// and while the owner declares the store fresh, so the two never interleave.
+    decide: Mutex<()>,
 }
 
 impl FullPulls {
+    /// See the `decide` field. Blocking; held only inside a store call.
+    pub(crate) fn decide(&self) -> MutexGuard<'_, ()> {
+        self.decide.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Sets whether the re-bootstrap in progress rebuilds the store as Full (a role
     /// upgrade); `Hello`s announce `Full` while it is set.
     pub fn set_rebuild_full(&self, on: bool) {
@@ -642,14 +651,39 @@ impl Session {
 
     /// Spec §7 with sub-spec 8a ruling C1c, on each `Hello`: if this store is stale and the
     /// peer is a **Fresh Full** peer, the session ends with [`SessionEnd::Stale`] before
-    /// anything is served to it, and the node re-bootstraps from it. That is the only
-    /// reset trigger. Staleness never blocks syncing otherwise: stale, Empty and Partial
-    /// peers are synced with as usual.
+    /// anything is served to it, and the node re-bootstraps from it. Staleness never blocks
+    /// syncing otherwise: stale, Empty and Partial peers are synced with as usual.
+    ///
+    /// The same holds for a role upgrade (sub-spec 8a §3, ruling R8): a Partial store whose
+    /// node is listed as a host resets only once a Fresh Full peer is there to rebuild from
+    /// (not while a re-bootstrap already runs). Until then it stays a working client.
+    ///
+    /// The decision and the pause it implies are taken under [`FullPulls::decide`], so an
+    /// owner's `declare_fresh` either comes first (the store is fresh: no reset) or sees
+    /// serving paused and is refused.
     async fn check_stale(&self, peer_scope: &Scope, peer: Freshness) -> Result<(), SessionEnd> {
         if matches!(peer_scope, Scope::Partial(_)) || peer != Freshness::Fresh {
             return Ok(());
         }
-        if self.call(|s| s.is_stale()).await? {
+        let (acc, me) = (self.ctx.acc.clone(), self.ctx.me);
+        let (paused, pulls) = (self.ctx.serve_paused.clone(), self.ctx.pulls.clone());
+        let reset = self
+            .call(move |s| {
+                let _decide = pulls.decide();
+                // A client re-invited as a host: listed as both (as in `check_scope`).
+                let upgrade = !paused.load(Ordering::SeqCst)
+                    && s.scope() != Scope::Full
+                    && acc.role_of(s, &me)? == Some(Role::Host)
+                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&me, Role::Client))?;
+                let reset = upgrade || s.is_stale()?;
+                if reset {
+                    // A reset must not serve (spec §7); the re-bootstrap clears this.
+                    paused.store(true, Ordering::SeqCst);
+                }
+                Ok(reset)
+            })
+            .await?;
+        if reset {
             return Err(SessionEnd::Stale);
         }
         Ok(())

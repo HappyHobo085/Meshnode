@@ -971,12 +971,34 @@ async fn declare_fresh_through_daemon() {
         ErrorCode::WrongState,
     );
     u.stop().await;
-    let d = initialised("a").await;
+    // A founder on a manual clock, 81 days later: stale (no other host to sync with).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let clock = mesh_hlc::ManualClock::new(now);
+    let mut opts = TestOptions::fast();
+    opts.wall = Some(mesh_core::DynClock(std::sync::Arc::new(clock.clone())));
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = timeout(
+        T,
+        Daemon::start_with(dir.path().to_path_buf(), test_config(), opts),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let d = D { daemon, dir };
+    assert_eq!(
+        d.req(AdminRequest::Init { name: "a".into() }).await,
+        AdminResponse::Ok
+    );
     let h = d.daemon.node_handle_for_test().unwrap();
-    let before = h.store().call(|s| s.last_full_sync_ms()).await.unwrap();
-    assert!(before.is_some());
+    clock.advance(81 * 86_400_000);
+    assert!(h.store().call(|s| s.is_stale()).await.unwrap());
     assert_eq!(d.req(AdminRequest::DeclareFresh).await, AdminResponse::Ok);
-    let after = h.store().call(|s| s.last_full_sync_ms()).await.unwrap();
-    assert!(after >= before);
+    assert!(
+        !h.store().call(|s| s.is_stale()).await.unwrap(),
+        "declared fresh"
+    );
     d.stop().await;
 }

@@ -679,3 +679,28 @@ async fn activity_start_end_balanced_on_success_error_and_timeout() {
     wait_for("five balanced streams", || async { counts() == (5, 5) }).await;
     mesh.shutdown().await;
 }
+
+/// Sub-spec 8a §3 / ruling R8 (M3): a host whose store is not a full replica yet (a client
+/// upgrading to host, still Partial or re-bootstrapping) forwards instead of serving from
+/// it, although it is placed and active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_store_forwards_although_listed_as_host() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    deploy_counter(&mesh, Placement::AllHosts).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
+    wait_active(&mesh, 1).await;
+    // Test hook: B's store is Partial (as while an upgrade has not rebuilt it).
+    mesh.m[1]
+        .node
+        .store()
+        .inner()
+        .set_scope(mesh_proto::Scope::client());
+    assert_eq!(dispatch(mesh.fwd(1), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.fwd(1).attempts(), 1, "forwarded, not served from B");
+    assert_eq!(mesh.served(0), 1);
+    mesh.shutdown().await;
+}

@@ -478,8 +478,6 @@ pub(crate) async fn start(
         remove_rebootstrap(&cfg.data_dir)?;
     }
     let rebootstrap_due = !removed_self && pending.is_some();
-    // A resumed role upgrade (sub-spec 8a §3) announces `Full` from the first `Hello` on.
-    let resume_full = rebootstrap_due && pending.as_ref().is_some_and(|f| f.full);
     // The remembered peers of a resumed run: the emptied store holds no addresses.
     let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
         .filter(|_| rebootstrap_due)
@@ -496,8 +494,10 @@ pub(crate) async fn start(
     let lose_events = Arc::new(AtomicBool::new(false));
     let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
+    // A resumed role upgrade announces what the store is (Partial) until the resumed run's
+    // reset sets `rebuild_full`; `Hello`s before that belong to the old epoch and never
+    // earn the rebuild's pull credit.
     let pulls = Arc::new(crate::sync::FullPulls::default());
-    pulls.set_rebuild_full(resume_full);
 
     if let Some(ms) = store.call_raw(|s| Ok(s.clock_floor_ahead_ms())).await? {
         warn!(ms, "HLC floor is ahead of the wall clock");
@@ -772,10 +772,12 @@ impl Node {
     /// The risk is the owner's: this node becomes a Fresh source again, so deletions that
     /// other hosts already cleaned up (tombstone GC) may come back through it.
     ///
-    /// Refused with [`NodeError::Rebootstrapping`] while a re-bootstrap runs or is about to
-    /// (its rebuilt store is fresh anyway), with [`NodeError::Removed`] once removed, and
-    /// with [`NodeError::NeverSynced`] for a store that never completed a full sync (it
-    /// holds nothing a stale host could safely rebuild from).
+    /// Refused with [`NodeError::Rebootstrapping`] while a re-bootstrap runs or a session
+    /// has decided on one (serving paused; its rebuilt store is fresh anyway), with
+    /// [`NodeError::Removed`] once removed, and with [`NodeError::NeverSynced`] for a store
+    /// that never completed a full sync (it holds nothing a stale host could safely rebuild
+    /// from). The final check and the refresh run under the same lock as a session's reset
+    /// decision ([`crate::sync::FullPulls`]), so a reset decided meanwhile is never undone.
     pub async fn declare_fresh(&self) -> Result<(), NodeError> {
         let inner = &self.inner;
         let busy = || {
@@ -793,19 +795,23 @@ impl Node {
         if matches!(*inner.status.borrow(), NodeStatus::Removed { .. }) {
             return Err(NodeError::Removed);
         }
+        let (pulls, paused) = (inner.pulls.clone(), inner.serve_paused.clone());
         let declared = inner
             .store
-            .call_raw(|s| {
+            .call_raw(move |s| {
+                // A session decides on a reset (and pauses serving) under the same lock.
+                let _decide = pulls.decide();
+                if paused.load(Ordering::SeqCst) {
+                    return Ok(Err(NodeError::Rebootstrapping));
+                }
                 if s.last_full_sync_ms()?.is_none() {
-                    return Ok(false);
+                    return Ok(Err(NodeError::NeverSynced));
                 }
                 s.refresh_full_sync_time()?;
-                Ok(true)
+                Ok(Ok(()))
             })
             .await?;
-        if !declared {
-            return Err(NodeError::NeverSynced);
-        }
+        declared?;
         warn!("declared up to date by the owner; staleness cleared");
         Ok(())
     }

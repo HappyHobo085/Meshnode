@@ -2977,6 +2977,8 @@ dependencies = [
  "futures-util",
  "hex",
  "mesh-admin",
+ "mesh-core",
+ "mesh-hlc",
  "mesh-host",
  "mesh-proto",
  "qrcode",

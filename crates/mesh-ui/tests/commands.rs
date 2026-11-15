@@ -167,9 +167,29 @@ fn accent_hue_stable() {
 /// without a mesh it is a wrong-state error.
 #[tokio::test(flavor = "multi_thread")]
 async fn declare_fresh_round_trip() {
-    let (_d, _dir, ui) = start().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let clock = mesh_hlc::ManualClock::new(now);
+    let dir = TempDir::new().unwrap();
+    let mut opts = TestOptions::fast();
+    opts.wall = Some(mesh_core::DynClock(Arc::new(clock.clone())));
+    let daemon = Daemon::start_with(dir.path().to_path_buf(), test_config(), opts)
+        .await
+        .expect("daemon");
+    let t: Arc<dyn AdminTransport> = Arc::new(InProcessTransport(daemon.in_process_admin()));
+    let ui = Ui::new(Arc::new(move || t.clone()), Platform::DesktopWindows);
     let e = ui.declare_fresh().await.unwrap_err();
     assert_eq!(e.code, UiErrorCode::WrongState);
     ui.init("desk".into()).await.unwrap();
+    // 81 days alone: stale; declaring it up to date clears that.
+    clock.advance(81 * 86_400_000);
+    let h = daemon.node_handle_for_test().unwrap();
+    assert!(h.store().call(|s| s.is_stale()).await.unwrap());
     ui.declare_fresh().await.unwrap();
+    assert!(
+        !h.store().call(|s| s.is_stale()).await.unwrap(),
+        "declared fresh"
+    );
 }

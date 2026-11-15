@@ -11,10 +11,10 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use iroh::endpoint::VarInt;
 use mesh_core::frame::read_frame;
 use mesh_core::membership::MESH_NS;
-use mesh_core::{Connection, NodeHandle};
+use mesh_core::{Connection, NodeHandle, NodeStatus};
 use mesh_proto::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
-    MAX_HEADERS, MAX_PATH, NodeId, PING_SERVICE, Role, ServiceManifest, decode_raw,
+    MAX_HEADERS, MAX_PATH, NodeId, PING_SERVICE, Role, Scope, ServiceManifest, decode_raw,
 };
 use mesh_services::{LocalState, Services, manifest_key, placed_hosts};
 use tokio::sync::Semaphore;
@@ -113,7 +113,16 @@ impl Forwarder {
 }
 
 impl Inner {
+    /// Whether this node must forward rather than serve from its own store: it is a client,
+    /// or its store is not a full replica (yet). A client re-invited as a host is listed as
+    /// a host while its store is still Partial, and then while it re-bootstraps as Full
+    /// (sub-spec 8a §3); any re-bootstrapping store lacks data until it is done.
     fn is_client(&self) -> bool {
+        if self.node.scope() != Scope::Full
+            || matches!(self.node.status(), NodeStatus::Rebootstrapping { .. })
+        {
+            return true;
+        }
         let me = self.node.node_id();
         self.node
             .members()

@@ -1201,6 +1201,15 @@ async fn wait_event(rx: &mut broadcast::Receiver<NodeEvent>, want: fn(&NodeEvent
     .expect("event in time");
 }
 
+/// Whether `rx` holds a `RebootstrapStarting` (drains what is queued).
+fn saw_starting(rx: &mut broadcast::Receiver<NodeEvent>) -> bool {
+    let mut seen = false;
+    while let Ok(ev) = rx.try_recv() {
+        seen |= matches!(ev, NodeEvent::RebootstrapStarting);
+    }
+    seen
+}
+
 async fn svc_writes(a: &Node, n: usize) {
     for i in 0..n {
         a.store()
@@ -1272,10 +1281,29 @@ async fn client_upgraded_to_host_rebootstraps_full() {
         get(&a, "svc", "from-c").await.is_some() && get(&b, "svc", "from-c").await.is_some()
     })
     .await;
-    // Reopened, it stays Full.
+    // No second run: an upgraded store never triggers again.
+    let r0 = c.handle().rounds_with_for_test(a.node_id());
+    wait_until("more rounds with A", T, || async {
+        c.sync_now();
+        c.handle().rounds_with_for_test(a.node_id()) >= r0 + 2
+    })
+    .await;
+    assert!(
+        !saw_starting(&mut ec),
+        "no second re-bootstrap after the upgrade"
+    );
+    // Reopened, it stays Full, and does not re-bootstrap either.
     timeout(T, c.shutdown()).await.unwrap();
     let c = Node::open(test_cfg(d[2].path(), "c").0).await.unwrap();
+    let mut ec = c.subscribe();
     assert_eq!(c.scope(), Scope::Full);
+    wait_until("rounds after the reopen", T, || async {
+        c.sync_now();
+        c.handle().rounds_with_for_test(a.node_id()) >= 2
+    })
+    .await;
+    assert!(!saw_starting(&mut ec), "no re-bootstrap after the reopen");
+    assert_eq!(c.status(), mesh_core::NodeStatus::Running);
     for n in [a, b, c] {
         timeout(T, n.shutdown()).await.unwrap();
     }
@@ -1334,6 +1362,16 @@ async fn upgrade_resumes_as_full_after_a_crash() {
     c.crash_after_reset();
     list_as_host(&a, c.node_id()).await;
     wait_until("C crashed after the reset", T, || async { c.is_stopped() }).await;
+    // The store was reset and is being rebuilt as Full: its own scope is still Partial.
+    assert!(matches!(
+        c.status(),
+        mesh_core::NodeStatus::Rebootstrapping { .. }
+    ));
+    assert_eq!(
+        c.scope(),
+        Scope::client(),
+        "still Partial during the rebuild"
+    );
     timeout(T, c.shutdown()).await.unwrap();
     let deadline = tokio::time::Instant::now() + T;
     let c = loop {

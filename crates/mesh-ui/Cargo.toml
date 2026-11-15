@@ -18,6 +18,8 @@ ts-rs = { version = "12", features = ["serde-compat"] }
 qrcode = { workspace = true, default-features = false }
 
 [dev-dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-hlc = { path = "../mesh-hlc" }
 mesh-host = { path = "../mesh-host", features = ["test-hooks"] }
 resvg = "0.49.0"
 rqrr = "0.11.0"

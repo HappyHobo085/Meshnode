@@ -35,10 +35,14 @@ const RETRYABLE: [&str; 3] = [
 
 /// Why [`RemoteForwarder::forward`] gave no answer, or why one attempt to one host failed
 /// (the attempt errors are logged, and the next host is tried).
+///
+/// `forward` itself returns only [`NoHost`](Self::NoHost), [`Timeout`](Self::Timeout),
+/// [`NotDeployed`](Self::NotDeployed) and [`Unframeable`](Self::Unframeable).
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
     /// No host could serve the service: none is placed and online, the manifest is
-    /// unreadable, or every attempt failed.
+    /// unreadable, or no attempt timed out after reaching its host (each failed to
+    /// connect, failed on the stream, or got a retryable `503`).
     #[error("no host could serve the service")]
     NoHost,
     /// The service has no manifest (undeployed).
@@ -49,6 +53,10 @@ pub enum ForwardError {
     Unframeable(#[from] Unframeable),
     #[error("connect failed: {0}")]
     Connect(#[from] NodeError),
+    /// Connecting took the whole attempt's limit (milliseconds): counted as a failure to
+    /// connect, not as a timeout.
+    #[error("connect timed out after {0} ms")]
+    ConnectTimeout(u64),
     #[error("stream failed: {0}")]
     Stream(String),
     #[error("bad response frame: {0}")]
@@ -57,6 +65,9 @@ pub enum ForwardError {
     NoResponse,
     #[error("bad response: {0}")]
     Convert(#[from] FrameConvError),
+    /// An attempt reached its host and got no answer within its limit (milliseconds).
+    /// From `forward`: every host was tried, and at least one of them timed out so
+    /// (ruling R11; the others failed in any way).
     #[error("timed out after {0} ms")]
     Timeout(u64),
 }
@@ -100,7 +111,9 @@ impl RemoteForwarder {
     /// node excluded), nearest first, trying up to three. Each attempt gets the manifest's
     /// `request_timeout_ms` plus `slack`, and a host that fails, or answers one of the
     /// retryable `503`s (not placed there, not yet replicated, re-bootstrapping), is
-    /// followed by the next. Returns the first other answer, whatever its status.
+    /// followed by the next. Returns the first other answer, whatever its status. When no
+    /// host answered: [`ForwardError::Timeout`] if some attempt reached its host and timed
+    /// out, else [`ForwardError::NoHost`].
     pub async fn forward(
         &self,
         service: &str,
@@ -154,6 +167,7 @@ impl Inner {
             return Err(ForwardError::NoHost);
         };
         let per_attempt = Duration::from_millis(manifest.limits.request_timeout_ms) + slack;
+        let mut timed_out = None;
         for peer in candidates.into_iter().take(MAX_ATTEMPTS) {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             match self.attempt(peer, &frame, per_attempt).await {
@@ -164,15 +178,20 @@ impl Inner {
                     "host cannot serve the service"
                 ),
                 Ok(resp) => return Ok(resp),
-                Err(e) => warn!(
-                    service = name,
-                    host = %peer.short(),
-                    error = %e,
-                    "forward to host failed"
-                ),
+                Err(e) => {
+                    warn!(
+                        service = name,
+                        host = %peer.short(),
+                        error = %e,
+                        "forward to host failed"
+                    );
+                    if let ForwardError::Timeout(ms) = e {
+                        timed_out = Some(ms);
+                    }
+                }
             }
         }
-        Err(ForwardError::NoHost)
+        Err(timed_out.map_or(ForwardError::NoHost, ForwardError::Timeout))
     }
 
     /// Online effective hosts the placement selects, except this node, by recent RTT
@@ -201,13 +220,13 @@ impl Inner {
         limit: Duration,
     ) -> Result<Response<Bytes>, ForwardError> {
         let deadline = Instant::now() + limit;
-        let timeout_ms = || ForwardError::Timeout(limit.as_millis() as u64);
+        let ms = limit.as_millis() as u64;
         let conn = timeout_at(deadline, self.conn(peer))
             .await
-            .map_err(|_| timeout_ms())??;
+            .map_err(|_| ForwardError::ConnectTimeout(ms))??;
         let result = match timeout_at(deadline, exchange(&conn, frame)).await {
             Ok(r) => r.and_then(to_response),
-            Err(_) => Err(timeout_ms()),
+            Err(_) => Err(ForwardError::Timeout(ms)),
         };
         if result.is_err() {
             self.discard(peer, &conn);

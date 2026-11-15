@@ -2774,6 +2774,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-client"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "hex",
+ "http",
+ "mesh-client",
+ "mesh-core",
+ "mesh-forward",
+ "mesh-gateway",
+ "mesh-proto",
+ "mesh-runtime",
+ "mesh-services",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mesh-core"
 version = "0.1.0"
 dependencies = [

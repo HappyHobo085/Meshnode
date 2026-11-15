@@ -1,0 +1,36 @@
+[package]
+name = "mesh-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Meshnode SDK for apps (sub-spec 8a §4): a client-role node that replicates `_mesh`
+# only and forwards requests to the mesh's hosts. No WASM runtime, services, gateway or
+# blob fetching: `tests/no_runtime_deps.rs` keeps it that way.
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-forward = { path = "../mesh-forward" }
+mesh-proto = { path = "../mesh-proto" }
+bytes.workspace = true
+hex.workspace = true
+http.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Test-only helpers: loopback-only client nodes with fast timings, host order override,
+# forward attempt counter.
+test-hooks = ["mesh-forward/test-hooks"]
+
+# In-process hosts for the tests (mesh-core + mesh-services + the gateway's `httpfwd`
+# handler). Dev-only: they do not reach the library's dependency tree.
+[dev-dependencies]
+mesh-client = { path = ".", features = ["test-hooks"] }
+mesh-core = { path = "../mesh-core", features = ["test-hooks"] }
+mesh-gateway = { path = "../mesh-gateway", features = ["test-hooks"] }
+mesh-services = { path = "../mesh-services", features = ["test-hooks"] }
+mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
+blake3.workspace = true
+tempfile.workspace = true

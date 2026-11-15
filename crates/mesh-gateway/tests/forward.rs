@@ -4,13 +4,16 @@ mod common;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::{Mesh, Serve, T, dispatch, fixture, mesh, split, wait_for, wait_kv, wait_ready};
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_core::{AcceptError, Connection, ProtocolHandler};
+use mesh_gateway::{ForwardError, RemoteForwarder};
 use mesh_proto::{
-    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, NodeId, Placement, Role,
+    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, Limits, NodeId, Placement,
+    Role,
 };
 use mesh_services::{DeployOpts, LocalState};
 use tokio::time::timeout;
@@ -291,6 +294,8 @@ enum Answer {
     Reset,
     /// Records the request; answers 200 with hop-by-hop headers and `x-custom`.
     Record(Arc<Mutex<Vec<ForwardRequest>>>),
+    /// Reads the request and never answers (the stream stays open for a minute).
+    Hang,
 }
 
 #[derive(Debug)]
@@ -316,6 +321,13 @@ impl ProtocolHandler for Raw {
                 }
                 Answer::Reset => {
                     let _ = send.reset(7u32.into());
+                    continue;
+                }
+                Answer::Hang => {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        drop(send);
+                    });
                     continue;
                 }
                 Answer::Record(log) => {
@@ -493,6 +505,65 @@ async fn online_host_failing_at_connect_then_next_serves() {
     assert_eq!(mesh.fwd(1).attempts(), 2);
     assert_eq!(mesh.fwd(1).connects(), 1, "only C was connected");
     assert_eq!(mesh.served(2), 1, "C served it");
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_reports_timeout_once_a_reached_host_never_answers() {
+    // Ruling R11: A accepts the request and never answers; C serves no `httpfwd`.
+    let mesh = mesh(vec![
+        (Role::Host, raw(Answer::Hang)),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Nothing),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    mesh.svcs(0)
+        .deploy_wasm(
+            COUNTER,
+            Bytes::from(fixture(COUNTER)),
+            DeployOpts {
+                limits: Limits {
+                    request_timeout_ms: 100,
+                    ..Limits::default()
+                },
+                placement: Placement::Nodes(vec![a]),
+                ..DeployOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    wait_manifest(&mesh, 1).await;
+    let remote = RemoteForwarder::new(mesh.m[1].node.handle());
+    let forward = || async {
+        timeout(
+            T,
+            remote.forward(COUNTER, common::get(COUNTER, "/"), Duration::ZERO),
+        )
+        .await
+        .expect("forward timed out")
+    };
+    // Every attempt timed out.
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::Timeout(_))), "{r:?}");
+    // The gateway still answers 502.
+    assert_eq!(
+        dispatch(mesh.fwd(1), COUNTER, "/").await,
+        (502, "No host could serve counter".into())
+    );
+
+    // One attempt failed to connect, one timed out: a host was reached.
+    set_nodes(&mesh, vec![a, c]).await;
+    remote.try_first(vec![c, a]);
+    let attempts = remote.attempts();
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::Timeout(_))), "{r:?}");
+    assert_eq!(remote.attempts(), attempts + 2);
+
+    // Every attempt failed to connect.
+    set_nodes(&mesh, vec![c]).await;
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::NoHost)), "{r:?}");
     mesh.shutdown().await;
 }
 

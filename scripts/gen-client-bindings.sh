@@ -9,9 +9,8 @@
 #
 # The generator is mesh-client-ffi's `uniffi-bindgen` binary, run from the root workspace
 # so that crates/mesh-client-ffi/uniffi.toml applies. Re-run this whenever the exported
-# interface changes, and commit the result. As apps/android/gen-bindings.sh, ktlint formats
-# the output when it is installed unless UNIFFI_NO_FORMAT=1 (CI, and --check, which also
-# compares unformatted output; commit unformatted bindings).
+# interface changes, and commit the result. The output is always unformatted (no ktlint,
+# whatever is installed), so a regeneration and --check produce the same bytes.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,14 +38,9 @@ esac
 
 cargo build -p mesh-client-ffi --lib
 
-format=(--no-format)
-if [ "$check" = 0 ] && [ "${UNIFFI_NO_FORMAT:-}" != 1 ] && command -v ktlint >/dev/null 2>&1; then
-    format=()
-fi
-
 gen() {
     cargo run -p mesh-client-ffi --features bindgen --bin uniffi-bindgen -- \
-        generate --library "$lib" --language kotlin --out-dir "$1" "${format[@]}"
+        generate --library "$lib" --language kotlin --out-dir "$1" --no-format
 }
 
 if [ "$check" = 1 ]; then

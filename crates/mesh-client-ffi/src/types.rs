@@ -42,15 +42,17 @@ pub enum MeshClientError {
     /// Anything else, a panic in the library included.
     #[error("internal error: {message}")]
     Internal { message: String },
-    /// An argument that cannot be used (a node id that is not 64 hex digits).
+    /// An argument that cannot be used (a node id that is not 64 hex digits, a
+    /// `requestTimeoutMs` of 0).
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
     /// The client has been shut down (or is shutting down).
     #[error("the client has been shut down")]
     Closed,
-    /// Android: `MeshClientAndroid.init(context)` has not run.
-    #[error("the Android context is not initialised (call MeshClientAndroid.init first)")]
-    NotInitialised,
+    /// Android: `MeshClientAndroid.init(context)` has not run, or failed (the message says
+    /// why).
+    #[error("the Android context is not initialised: {message}")]
+    NotInitialised { message: String },
 }
 
 impl From<ClientError> for MeshClientError {
@@ -78,9 +80,23 @@ pub struct MeshClientOptions {
     /// The platform others see; empty means this OS (`"android"` on Android).
     #[uniffi(default = "")]
     pub platform: String,
-    /// Bound on a whole `request` call, every attempt included.
+    /// Bound on a whole `request` call, every attempt included; 0 is refused
+    /// (`InvalidArgument`).
     #[uniffi(default = 30000)]
     pub request_timeout_ms: u64,
+}
+
+impl MeshClientOptions {
+    /// `InvalidArgument` for options no client can use: a `requestTimeoutMs` of 0 would
+    /// time every request out at once.
+    pub(crate) fn check(&self) -> Result<(), MeshClientError> {
+        if self.request_timeout_ms == 0 {
+            return Err(MeshClientError::InvalidArgument {
+                message: "requestTimeoutMs must be greater than 0".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl From<MeshClientOptions> for ClientOptions {

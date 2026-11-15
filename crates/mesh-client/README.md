@@ -110,8 +110,9 @@ cargo run -p mesh-client --example fetch -- open ./client-data blog /about.html
 ### Android
 
 `scripts/build-client-aar.sh` builds `dist/mesh-client.aar` locally (not committed):
-`libmesh_client_ffi.so` for `arm64-v8a` and `x86_64`, the compiled bindings and a minimal
-manifest (`INTERNET`, `ACCESS_NETWORK_STATE`, minSdk 29). It needs `cargo-ndk`,
+`libmesh_client_ffi.so` for `arm64-v8a` and `x86_64`, the compiled bindings, a minimal
+manifest (`INTERNET`, `ACCESS_NETWORK_STATE`, minSdk 29) and `proguard.txt`, the consumer
+R8 rules that keep JNA and `net.meshnode.client` intact in minified (release) builds. It needs `cargo-ndk`,
 `ANDROID_NDK_HOME`, both Rust Android targets and a JDK 17. The app adds the runtime
 dependencies itself:
 
@@ -125,7 +126,8 @@ dependencies {
 
 On Android, call `MeshClientAndroid.init(context)` once (e.g. in `Application.onCreate`)
 before the first `join`/`open`: the networking code needs the application context.
-Without it they fail with `MeshClientException.NotInitialised`. The desktop JVM needs
+Without it they fail with `MeshClientException.NotInitialised`, whose message also says
+why an `init` failed (`init` itself never throws). The desktop JVM needs
 no set-up; it loads the host library through JNA (`jna.library.path`).
 
 ```kotlin
@@ -161,14 +163,21 @@ suspend fun run(dir: String, ticket: String?) {
 - `join`, `open`, `request`, `invite`, `remove` and `shutdown` are `suspend` functions;
   they run on the library's own threads, so they can be called from any dispatcher.
   `status()`, `members()`, `services()` and `setListener` return at once.
+- Cancelling the coroutine of a `join` (or `open`) does not stop it: it completes in the
+  background, and the client it made is then stopped. Its directory stays locked until
+  then, so an immediate retry may fail with `AlreadyOpen`; a `join` that went through has
+  used its ticket, so retry with `open`.
+- `requestTimeoutMs` must be greater than 0 (`InvalidArgument` otherwise).
 - Errors are the sealed `MeshClientException`: the `ClientError` variants above
   (`InvalidTicket`, `AlreadyJoined`, `NotJoined`, `AlreadyOpen`, `Removed`, `NoHost`,
   `Timeout`, `Io`, `Internal`), plus `InvalidArgument` (a node id for `remove` that is
-  not 64 hex digits), `Closed` (any call after or during `shutdown`) and
+  not 64 hex digits, a `requestTimeoutMs` of 0), `Closed` (any call after or during `shutdown`) and
   `NotInitialised` (Android, see above). A request that cannot be built (bad method,
   header or path) gets a local `400` response instead.
 - **Call `shutdown()`.** It ends calls in flight with `Closed`, stops delivering events
-  and releases the directory before it returns. An object that is only closed
+  and releases the directory before it returns. An `onEvent` call already running when
+  `shutdown` starts is not interrupted, so it may still be running when `shutdown`
+  returns; no event is delivered after it. An object that is only closed
   (`close()`/`destroy()`) or garbage-collected stops in the background, and its
   directory stays locked until then (`AlreadyOpen` meanwhile).
 - `crates/mesh-client-ffi/jvm-test` is the JVM test of the bindings

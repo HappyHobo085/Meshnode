@@ -3,7 +3,8 @@
 //! loopback-only test constructors aside).
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use mesh_client_ffi::{
@@ -181,6 +182,40 @@ fn get(path: &str) -> MeshRequest {
     }
 }
 
+/// Records each event, with whether the client listed the service `two` then (read in
+/// the callback, so the event is known to follow the refresh that listed it).
+struct Watch {
+    seen: Arc<Mutex<Vec<(MeshEvent, bool)>>>,
+    client: Weak<MeshClient>,
+}
+
+impl MeshClientListener for Watch {
+    fn on_event(&self, event: MeshEvent) {
+        let two = self
+            .client
+            .upgrade()
+            .and_then(|c| c.services().ok())
+            .is_some_and(|s| s.iter().any(|s| s.name == "two"));
+        self.seen.lock().unwrap().push((event, two));
+    }
+}
+
+/// Fails (panics) on its first event, then collects.
+struct FailFirst {
+    /// Calls so far.
+    calls: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<MeshEvent>>>,
+}
+
+impl MeshClientListener for FailFirst {
+    fn on_event(&self, event: MeshEvent) {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("listener failure (expected by the test)");
+        }
+        self.seen.lock().unwrap().push(event);
+    }
+}
+
 /// Collects the events it is given.
 #[derive(Default)]
 struct Collect(Arc<Mutex<Vec<MeshEvent>>>);
@@ -313,38 +348,115 @@ async fn ffi_listener_receives_events() {
     let h = Host::start(false).await;
     let root = tempfile::tempdir().unwrap();
     let c = join(&root.path().join("client"), h.invite().await).await;
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    c.set_listener(Box::new(Collect(seen.clone()))).unwrap();
+    let first = Arc::new(Mutex::new(Vec::new()));
+    c.set_listener(Box::new(Watch {
+        seen: first.clone(),
+        client: Arc::downgrade(&c),
+    }))
+    .unwrap();
     wait_site(&c).await;
-    // A second deploy is a manifest change the client is told about.
+    // A second deploy is a manifest change the client is told about: a ServicesChanged
+    // sent once the client lists it (not a late one from the first deploy).
     let site = tempfile::tempdir().unwrap();
     std::fs::write(site.path().join("index.html"), "two").unwrap();
-    seen.lock().unwrap().clear();
     h.svcs
         .deploy_static("two", site.path(), DeployOpts::default())
         .await
         .unwrap();
-    wait_until("ServicesChanged", || {
-        seen.lock().unwrap().contains(&MeshEvent::ServicesChanged)
+    wait_until("ServicesChanged with the second site listed", || {
+        first
+            .lock()
+            .unwrap()
+            .contains(&(MeshEvent::ServicesChanged, true))
     })
     .await;
-    wait_until("client lists the second site", || {
-        c.services().unwrap().iter().any(|s| s.name == "two")
-    })
-    .await;
-    // The host going away: Offline.
-    h.shutdown().await;
-    wait_until("Offline", || {
-        seen.lock().unwrap().contains(&MeshEvent::Offline)
-    })
-    .await;
-    // A replaced listener gets nothing more; shutdown ends delivery.
+    // A replaced listener gets nothing more: the host going away (Offline) reaches only
+    // the new one.
     let second = Arc::new(Mutex::new(Vec::new()));
     c.set_listener(Box::new(Collect(second.clone()))).unwrap();
+    sleep(Duration::from_millis(200)).await; // an event already being delivered lands
+    let first_len = first.lock().unwrap().len();
+    h.shutdown().await;
+    wait_until("Offline on the new listener", || {
+        second.lock().unwrap().contains(&MeshEvent::Offline)
+    })
+    .await;
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        first.lock().unwrap().len(),
+        first_len,
+        "the replaced listener got {:?}",
+        &first.lock().unwrap()[first_len..]
+    );
+    // Shutdown ends delivery: nothing arrives afterwards, and no listener can be set.
     c.clone().shutdown().await;
+    let second_len = second.lock().unwrap().len();
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(second.lock().unwrap().len(), second_len);
     assert_eq!(
         c.set_listener(Box::new(Collect::default())).unwrap_err(),
         MeshClientError::Closed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ffi_listener_failure_does_not_end_delivery() {
+    // A Kotlin listener that throws surfaces in Rust as a panic in `on_event`: it is
+    // caught, and the next events are still delivered.
+    let h = Host::start(false).await;
+    let root = tempfile::tempdir().unwrap();
+    let c = join(&root.path().join("client"), h.invite().await).await;
+    wait_site(&c).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    c.set_listener(Box::new(FailFirst {
+        calls: calls.clone(),
+        seen: seen.clone(),
+    }))
+    .unwrap();
+    for name in ["two", "three"] {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(site.path().join("index.html"), name).unwrap();
+        h.svcs
+            .deploy_static(name, site.path(), DeployOpts::default())
+            .await
+            .unwrap();
+        wait_until(&format!("client lists {name}"), || {
+            c.services().unwrap().iter().any(|s| s.name == name)
+        })
+        .await;
+    }
+    wait_until("events after the failure", || {
+        calls.load(Ordering::SeqCst) >= 2
+            && seen.lock().unwrap().contains(&MeshEvent::ServicesChanged)
+    })
+    .await;
+    c.clone().shutdown().await;
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ffi_zero_request_timeout_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let zero = MeshClientOptions {
+        request_timeout_ms: 0,
+        ..opts()
+    };
+    let err = MeshClient::open(dir_str(root.path()), zero.clone())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, MeshClientError::InvalidArgument { .. }),
+        "{err:?}"
+    );
+    let err = MeshClient::join(dir_str(root.path()), "not a ticket".into(), zero)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, MeshClientError::InvalidArgument { .. }),
+        "{err:?}"
     );
 }
 

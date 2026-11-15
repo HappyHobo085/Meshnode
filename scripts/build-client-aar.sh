@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds dist/mesh-client.aar (local use; not committed): libmesh_client_ffi.so for
 # arm64-v8a and x86_64 (release, symbols stripped), classes.jar (the committed Kotlin
-# bindings plus MeshClientAndroid, compiled by crates/mesh-client-ffi/jvm-test) and a
-# minimal AndroidManifest.xml.
+# bindings plus MeshClientAndroid, compiled by crates/mesh-client-ffi/jvm-test), a
+# minimal AndroidManifest.xml and proguard.txt (consumer keep rules for minified apps).
 #
 # Usage: scripts/build-client-aar.sh
 #
@@ -47,6 +47,25 @@ cat >"$stage/AndroidManifest.xml" <<'XML'
 </manifest>
 XML
 : >"$stage/R.txt"
+# Consumer R8/ProGuard rules, applied to an app that minifies (release builds): JNA binds
+# by name and the JNA AAR ships no rules (the same block as apps/android's
+# proguard-rules.pro, for this package).
+cat >"$stage/proguard.txt" <<'PRO'
+# --- mesh-client: UniFFI bindings over JNA ---
+# JNA resolves Library methods to native symbols by name, libjnidispatch looks up
+# com/sun/jna classes and fields by name, and UniFFI's Structure subclasses list their
+# fields by name: nothing in these packages may be renamed or removed.
+-dontwarn java.awt.**
+-keepattributes RuntimeVisibleAnnotations
+-keep class com.sun.jna.** { *; }
+-keep class * implements com.sun.jna.** { *; }
+-keepclassmembers class * extends com.sun.jna.Structure { <fields>; }
+-keep class net.meshnode.client.** { *; }
+# The raw JNI export Java_net_meshnode_client_MeshClientAndroid_initAndroid.
+-keepclasseswithmembernames class net.meshnode.client.MeshClientAndroid {
+    native <methods>;
+}
+PRO
 
 mkdir -p "$root/dist"
 rm -f "$root/dist/mesh-client.aar"

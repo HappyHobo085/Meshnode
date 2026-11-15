@@ -1016,7 +1016,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mesh_client_ffi_checksum_method_meshclient_services() != 28523.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_mesh_client_ffi_checksum_method_meshclient_set_listener() != 52196.toShort()) {
+    if (lib.uniffi_mesh_client_ffi_checksum_method_meshclient_set_listener() != 53060.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_client_ffi_checksum_method_meshclient_shutdown() != 59474.toShort()) {
@@ -1528,7 +1528,8 @@ public interface MeshClientInterface {
     
     /**
      * Delivers this client's events to `listener` from now on, replacing any earlier
-     * listener. Delivery ends at `shutdown`.
+     * listener. Delivery ends at `shutdown` (an `on_event` already running then is not
+     * interrupted and may outlast it).
      */
     fun `setListener`(`listener`: MeshClientListener)
     
@@ -1744,7 +1745,8 @@ open class MeshClient: Disposable, AutoCloseable, MeshClientInterface
     
     /**
      * Delivers this client's events to `listener` from now on, replacing any earlier
-     * listener. Delivery ends at `shutdown`.
+     * listener. Delivery ends at `shutdown` (an `on_event` already running then is not
+     * interrupted and may outlast it).
      */
     @Throws(MeshClientException::class)override fun `setListener`(`listener`: MeshClientListener)
         = 
@@ -1886,7 +1888,8 @@ data class MeshClientOptions (
      */
     var `platform`: kotlin.String = "", 
     /**
-     * Bound on a whole `request` call, every attempt included.
+     * Bound on a whole `request` call, every attempt included; 0 is refused
+     * (`InvalidArgument`).
      */
     var `requestTimeoutMs`: kotlin.ULong = 30000uL
 ) {
@@ -2263,7 +2266,8 @@ sealed class MeshClientException(message: String): kotlin.Exception(message) {
         class Internal(message: String) : MeshClientException(message)
         
     /**
-     * An argument that cannot be used (a node id that is not 64 hex digits).
+     * An argument that cannot be used (a node id that is not 64 hex digits, a
+     * `requestTimeoutMs` of 0).
      */
         class InvalidArgument(message: String) : MeshClientException(message)
         
@@ -2273,7 +2277,8 @@ sealed class MeshClientException(message: String): kotlin.Exception(message) {
         class Closed(message: String) : MeshClientException(message)
         
     /**
-     * Android: `MeshClientAndroid.init(context)` has not run.
+     * Android: `MeshClientAndroid.init(context)` has not run, or failed (the message says
+     * why).
      */
         class NotInitialised(message: String) : MeshClientException(message)
         

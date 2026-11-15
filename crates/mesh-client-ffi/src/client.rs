@@ -128,8 +128,8 @@ impl MeshClient {
         F: Future<Output = Result<sdk::MeshClient, ClientError>> + Send + 'static,
     {
         #[cfg(target_os = "android")]
-        if !crate::android::initialised() {
-            return Err(MeshClientError::NotInitialised);
+        if let Err(message) = crate::android::check_initialised() {
+            return Err(MeshClientError::NotInitialised { message });
         }
         on_rt(async move { start.await.map(Self::wrap).map_err(Into::into) }).await
     }
@@ -173,6 +173,7 @@ impl MeshClient {
         ticket: String,
         options: MeshClientOptions,
     ) -> Result<Arc<MeshClient>, MeshClientError> {
+        options.check()?;
         Self::start(
             async move { sdk::MeshClient::join(Path::new(&dir), &ticket, options.into()).await },
         )
@@ -185,6 +186,7 @@ impl MeshClient {
         dir: String,
         options: MeshClientOptions,
     ) -> Result<Arc<MeshClient>, MeshClientError> {
+        options.check()?;
         Self::start(async move { sdk::MeshClient::open(Path::new(&dir), options.into()).await })
             .await
     }
@@ -255,7 +257,8 @@ impl MeshClient {
     }
 
     /// Delivers this client's events to `listener` from now on, replacing any earlier
-    /// listener. Delivery ends at `shutdown`.
+    /// listener. Delivery ends at `shutdown` (an `on_event` already running then is not
+    /// interrupted and may outlast it).
     pub fn set_listener(
         &self,
         listener: Box<dyn MeshClientListener>,
@@ -278,6 +281,7 @@ impl MeshClient {
         ticket: String,
         options: MeshClientOptions,
     ) -> Result<Arc<MeshClient>, MeshClientError> {
+        options.check()?;
         Self::start(async move {
             sdk::MeshClient::join_for_test(Path::new(&dir), &ticket, options.into()).await
         })
@@ -288,6 +292,7 @@ impl MeshClient {
         dir: String,
         options: MeshClientOptions,
     ) -> Result<Arc<MeshClient>, MeshClientError> {
+        options.check()?;
         Self::start(
             async move { sdk::MeshClient::open_for_test(Path::new(&dir), options.into()).await },
         )

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header};
-use mesh_core::local::read_genesis;
+use mesh_core::local::{read_genesis, read_own_role};
 use mesh_core::{Node, NodeConfig};
 use mesh_forward::{ForwardError, RemoteForwarder, placed_hosts};
 use mesh_proto::{InviteTicket, NodeId, Role, ServiceKind};
@@ -89,23 +89,56 @@ pub struct ServiceInfo {
 }
 
 /// A client-role member of a mesh. See the crate docs.
+///
+/// Call [`MeshClient::shutdown`] to stop it. Dropping it stops it too, in the background
+/// (on the Tokio runtime it is dropped in): the directory stays locked until the node has
+/// let go of it, so reopening it meanwhile is refused with [`ClientError::AlreadyOpen`].
+/// Only `shutdown` guarantees an immediate reopen.
 pub struct MeshClient {
+    /// `None` only once shut down or dropped.
+    owned: Option<Owned>,
+    shared: Arc<Shared>,
+    request_timeout: Duration,
+}
+
+/// What holds the data directory, torn down in order.
+struct Owned {
     node: Node,
     fwd: RemoteForwarder,
-    shared: Arc<Shared>,
-    task: EventTask,
-    request_timeout: Duration,
+    task: JoinHandle<()>,
     /// Released last, once the node has let go of the directory.
     lock: File,
 }
 
-/// Aborts the event task if the client is dropped without [`MeshClient::shutdown`].
-struct EventTask(Option<JoinHandle<()>>);
+impl Owned {
+    async fn teardown(self) {
+        let Owned {
+            node,
+            fwd,
+            task,
+            lock,
+        } = self;
+        task.abort();
+        let _ = task.await;
+        // Its cached connections and node handle.
+        drop(fwd);
+        node.shutdown().await;
+        drop(lock);
+    }
+}
 
-impl Drop for EventTask {
+impl Drop for MeshClient {
     fn drop(&mut self) {
-        if let Some(t) = self.0.take() {
-            t.abort();
+        let Some(owned) = self.owned.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(owned.teardown());
+            }
+            // No runtime to finish on: the node only cancels its tasks, and the lock is
+            // released at once.
+            Err(_) => owned.task.abort(),
         }
     }
 }
@@ -124,7 +157,9 @@ impl MeshClient {
     /// Joins the mesh of a client invite `ticket`, keeping the new identity in `dir`
     /// (created if needed). Fails with [`ClientError::InvalidTicket`] for a ticket that is
     /// unreadable or not for the client role (before touching `dir`), or that the inviter
-    /// refuses; [`ClientError::AlreadyJoined`] if `dir` holds an identity;
+    /// refuses; [`ClientError::AlreadyJoined`] if `dir` holds a joined node (a `node.key`
+    /// alone, left by an interrupted or failed join, is reused: retrying with the same
+    /// ticket is how such a join completes);
     /// [`ClientError::AlreadyOpen`] if another client has `dir` open;
     /// [`ClientError::NoHost`] if the inviter cannot be reached.
     ///
@@ -139,7 +174,11 @@ impl MeshClient {
     }
 
     /// Opens the client joined earlier in `dir`: [`ClientError::NotJoined`] if there is
-    /// none, [`ClientError::AlreadyOpen`] if another client has it open.
+    /// none (a host's data directory included), [`ClientError::AlreadyOpen`] if another
+    /// client has it open.
+    ///
+    /// A client re-invited as a host while running (role upgrade) is out of scope for
+    /// sub-spec 8a; once its role has changed, `open` refuses its directory.
     pub async fn open(dir: &Path, opts: ClientOptions) -> Result<MeshClient, ClientError> {
         Self::open_with(dir, opts, Net::Normal).await
     }
@@ -175,23 +214,14 @@ impl MeshClient {
         }
         std::fs::create_dir_all(dir).map_err(ClientError::io)?;
         let lock = lock_dir(dir)?;
-        let key = dir.join(KEY_FILE);
-        if key.exists() {
+        // Joined means `mesh.json`. A failed join leaves only `node.key`, which the next
+        // join reuses: the inviter accepts a retry from the same key (ruling R15).
+        if read_genesis(dir).map_err(ClientError::node)?.is_some() {
             return Err(ClientError::AlreadyJoined);
         }
-        let node = match Node::join(node_config(dir, &opts, net), ticket).await {
-            Ok(node) => node,
-            Err(e) => {
-                // The node leaves its new key behind; without it the directory is
-                // empty again, and a later `join` is not refused as `AlreadyJoined`.
-                if let Err(e) = std::fs::remove_file(&key)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(error = %e, "cannot remove node.key after a failed join");
-                }
-                return Err(ClientError::join(e));
-            }
-        };
+        let node = Node::join(node_config(dir, &opts, net), ticket)
+            .await
+            .map_err(ClientError::join)?;
         Ok(Self::start(node, &opts, lock).await)
     }
 
@@ -200,7 +230,11 @@ impl MeshClient {
         opts: ClientOptions,
         net: Net,
     ) -> Result<MeshClient, ClientError> {
-        let joined = || dir.join(KEY_FILE).is_file() && matches!(read_genesis(dir), Ok(Some(_)));
+        let joined = || {
+            dir.join(KEY_FILE).is_file()
+                && matches!(read_genesis(dir), Ok(Some(_)))
+                && matches!(read_own_role(dir), Ok(Some(Role::Client)))
+        };
         if !joined() {
             return Err(ClientError::NotJoined);
         }
@@ -218,12 +252,14 @@ impl MeshClient {
         shared.refresh_manifests(&handle).await;
         let task = tokio::spawn(events::run(handle.clone(), shared.clone(), rx));
         MeshClient {
-            fwd: RemoteForwarder::new(handle),
-            node,
+            owned: Some(Owned {
+                fwd: RemoteForwarder::new(handle),
+                node,
+                task,
+                lock,
+            }),
             shared,
-            task: EventTask(Some(task)),
             request_timeout: opts.request_timeout,
-            lock,
         }
     }
 
@@ -251,7 +287,7 @@ impl MeshClient {
         if req.body().len() > MAX_BODY {
             return Ok(local(StatusCode::PAYLOAD_TOO_LARGE));
         }
-        let sent = self.fwd.forward(service, req, ATTEMPT_SLACK);
+        let sent = self.fwd().forward(service, req, ATTEMPT_SLACK);
         match tokio::time::timeout(self.request_timeout, sent).await {
             Err(_) => Err(ClientError::Timeout),
             Ok(Ok(resp)) => Ok(resp),
@@ -267,19 +303,19 @@ impl MeshClient {
     }
 
     pub fn status(&self) -> ClientStatus {
-        let handle = self.node.handle();
+        let handle = self.node().handle();
         ClientStatus {
-            mesh: hex::encode(self.node.mesh().0),
-            id: hex::encode(self.node.node_id().0),
+            mesh: hex::encode(self.node().mesh().0),
+            id: hex::encode(self.node().node_id().0),
             online_hosts: events::online_hosts(&handle),
-            first_sync_done: self.node.first_sync_complete(),
+            first_sync_done: self.node().first_sync_complete(),
             removed: self.shared.is_removed(&handle),
         }
     }
 
     /// Every member, this client included.
     pub fn members(&self) -> Vec<Member> {
-        self.node
+        self.node()
             .members()
             .into_iter()
             .map(|m| {
@@ -298,7 +334,7 @@ impl MeshClient {
 
     /// Every deployed service, by name, with the hosts its placement selects.
     pub fn services(&self) -> Vec<ServiceInfo> {
-        let handle = self.node.handle();
+        let handle = self.node().handle();
         self.shared
             .manifests()
             .iter()
@@ -327,7 +363,7 @@ impl MeshClient {
     pub async fn invite(&self, role: Role, ttl: Duration) -> Result<String, ClientError> {
         self.check_removed()?;
         let ticket = self
-            .node
+            .node()
             .invite(role, ttl)
             .await
             .map_err(ClientError::node)?;
@@ -337,46 +373,46 @@ impl MeshClient {
     /// Removes member `id` from the mesh (any member may; the last host cannot be).
     pub async fn remove(&self, id: NodeId) -> Result<(), ClientError> {
         self.check_removed()?;
-        self.node.remove(id).await.map_err(ClientError::node)
+        self.node().remove(id).await.map_err(ClientError::node)
     }
 
     /// Stops the client and releases its directory, which can be opened again once this
     /// returns.
-    pub async fn shutdown(self) {
-        let MeshClient {
-            node,
-            fwd,
-            shared,
-            mut task,
-            lock,
-            ..
-        } = self;
-        if let Some(t) = task.0.take() {
-            t.abort();
-            let _ = t.await;
+    pub async fn shutdown(mut self) {
+        if let Some(owned) = self.owned.take() {
+            owned.teardown().await;
         }
-        drop(fwd);
-        drop(shared);
-        node.shutdown().await;
-        drop(lock);
+    }
+
+    fn owned(&self) -> &Owned {
+        // Taken only by `shutdown(self)` and `drop`, after which no method runs.
+        self.owned.as_ref().expect("client not shut down")
+    }
+
+    fn node(&self) -> &Node {
+        &self.owned().node
+    }
+
+    fn fwd(&self) -> &RemoteForwarder {
+        &self.owned().fwd
     }
 
     /// Tries the hosts among `ids` first, in this order, instead of by RTT.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn try_first(&self, ids: Vec<NodeId>) {
-        self.fwd.try_first(ids);
+        self.fwd().try_first(ids);
     }
 
     /// Forward attempts made so far.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn attempts(&self) -> u64 {
-        self.fwd.attempts()
+        self.fwd().attempts()
     }
 
     fn check_removed(&self) -> Result<(), ClientError> {
-        if self.shared.is_removed(&self.node.handle()) {
+        if self.shared.is_removed(&self.node().handle()) {
             Err(ClientError::Removed)
         } else {
             Ok(())

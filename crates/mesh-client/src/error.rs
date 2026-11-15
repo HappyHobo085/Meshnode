@@ -1,6 +1,6 @@
 //! What a [`crate::MeshClient`] call can fail with.
 
-use mesh_core::NodeError;
+use mesh_core::{NodeError, StoreError};
 use mesh_proto::RefuseReason;
 
 /// Why a [`crate::MeshClient`] call failed. A host's own answer, `4xx`/`5xx` included, is
@@ -11,13 +11,14 @@ pub enum ClientError {
     /// already used, or refused by the inviter.
     #[error("not a valid client invite ticket")]
     InvalidTicket,
-    /// `join` into a directory that already holds a node identity (`node.key`).
-    #[error("this directory already holds a node identity")]
+    /// `join` into a directory that already holds a joined node (`mesh.json`).
+    #[error("this directory already holds a joined node")]
     AlreadyJoined,
-    /// `open` on a directory that holds no joined node.
+    /// `open` on a directory that holds no joined client (none, or a host's).
     #[error("this directory holds no joined client")]
     NotJoined,
-    /// Another client (in this process or another) has this directory open.
+    /// Another client (in this process or another, or one dropped and still stopping),
+    /// or another node, has this directory open.
     #[error("another client has this directory open")]
     AlreadyOpen,
     /// This client has been removed from the mesh; every call fails so from now on.
@@ -47,6 +48,11 @@ impl ClientError {
     pub(crate) fn node(e: NodeError) -> ClientError {
         match e {
             NodeError::Removed => ClientError::Removed,
+            // Another node (a dropped client still tearing down, a host daemon) holds the
+            // store file.
+            NodeError::Store(StoreError::Io(m)) if m == "database already open" => {
+                ClientError::AlreadyOpen
+            }
             NodeError::Io(e) => ClientError::io(e),
             NodeError::NotInitialised => ClientError::NotJoined,
             e => ClientError::Internal(e.to_string()),

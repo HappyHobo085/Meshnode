@@ -68,10 +68,17 @@ async fn run(dir: &Path, ticket: Option<&str>) -> Result<(), ClientError> {
 - **One client per data directory.** `client.lock` in the directory is held while a
   client has it open; a second `join`/`open` fails with `AlreadyOpen`.
 - **`join`** accepts only a client invite (`InvalidTicket` otherwise, before anything is
-  written), refuses a directory that already holds `node.key` (`AlreadyJoined`), and
+  written) and refuses a directory that already holds a joined node (`mesh.json`:
+  `AlreadyJoined`). A failed or interrupted join leaves only `node.key`; the next `join`
+  reuses it, so retrying with the same ticket completes a join whose reply was lost. It
   returns once joined: the first sync finishes in the background
   (`status().first_sync_done`), so `services()` may be empty for a moment.
-- **`open`** needs a directory joined earlier (`NotJoined`).
+- **`open`** needs a directory joined earlier as a client (`NotJoined` otherwise, a host's
+  data directory included). A client re-invited as a host while running (role upgrade)
+  is out of scope for now.
+- **Stopping.** `shutdown()` releases the directory before it returns. Dropping a client
+  stops it in the background; until it has let go of the directory, reopening it is
+  refused with `AlreadyOpen`.
 - **`request(service, req)`** forwards the method, path and query, headers (hop-by-hop
   ones dropped) and body to the nearest online host that runs the service, trying the
   next one on failure, up to three hosts. The host's response is returned **as it is**,

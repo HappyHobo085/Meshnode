@@ -23,6 +23,9 @@ use crate::placement::{fetch_manifest, placed_hosts};
 const MAX_ATTEMPTS: usize = 3;
 /// Forwards in flight on one forwarder at once.
 const MAX_FORWARDS: usize = 64;
+/// Longest the connect phase of one attempt may take: a host listed online that no longer
+/// answers is left for the next one, whatever the attempt's own limit (ruling R15 M6).
+const CONNECT_CAP: Duration = Duration::from_secs(5);
 /// Close code for a cached connection dropped after an error.
 const DROPPED: VarInt = VarInt::from_u32(0);
 
@@ -53,8 +56,9 @@ pub enum ForwardError {
     Unframeable(#[from] Unframeable),
     #[error("connect failed: {0}")]
     Connect(#[from] NodeError),
-    /// Connecting took the whole attempt's limit (milliseconds): counted as a failure to
-    /// connect, not as a timeout.
+    /// Connecting took the attempt's connect limit (milliseconds: at most 5 s, less if
+    /// the attempt's whole limit is shorter): counted as a failure to connect, not as a
+    /// timeout.
     #[error("connect timed out after {0} ms")]
     ConnectTimeout(u64),
     #[error("stream failed: {0}")]
@@ -91,6 +95,9 @@ struct Inner {
     connects: AtomicU64,
     /// Hosts tried first, in this order (test hook).
     first: Mutex<Vec<NodeId>>,
+    /// Hosts whose connect never completes (test hook).
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    hang: Mutex<Vec<NodeId>>,
 }
 
 impl RemoteForwarder {
@@ -103,15 +110,16 @@ impl RemoteForwarder {
                 attempts: AtomicU64::new(0),
                 connects: AtomicU64::new(0),
                 first: Mutex::new(Vec::new()),
+                hang: Mutex::new(Vec::new()),
             }),
         }
     }
 
     /// Forwards `req` for `service` to an online effective host its placement selects (this
     /// node excluded), nearest first, trying up to three. Each attempt gets the manifest's
-    /// `request_timeout_ms` plus `slack`, and a host that fails, or answers one of the
-    /// retryable `503`s (not placed there, not yet replicated, re-bootstrapping), is
-    /// followed by the next. Returns the first other answer, whatever its status. When no
+    /// `request_timeout_ms` plus `slack` (connecting at most 5 s of it), and a host that
+    /// fails, or answers one of the retryable `503`s (not placed there, not yet
+    /// replicated, re-bootstrapping), is followed by the next. Returns the first other answer, whatever its status. When no
     /// host answered: [`ForwardError::Timeout`] if some attempt reached its host and timed
     /// out, else [`ForwardError::NoHost`].
     pub async fn forward(
@@ -139,6 +147,13 @@ impl RemoteForwarder {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn try_first(&self, ids: Vec<NodeId>) {
         *self.inner.first.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+
+    /// Connecting to any of `ids` hangs from now on (a host listed online that no longer
+    /// answers).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hang_connect_to(&self, ids: Vec<NodeId>) {
+        *self.inner.hang.lock().unwrap_or_else(|e| e.into_inner()) = ids;
     }
 }
 
@@ -211,8 +226,9 @@ impl Inner {
         members.into_iter().map(|s| s.id).collect()
     }
 
-    /// One request to `peer` over a cached or new connection, within `limit`. On any
-    /// error the connection is closed and dropped from the cache.
+    /// One request to `peer` over a cached or new connection, within `limit`, of which
+    /// connecting may take at most [`CONNECT_CAP`]. On any error the connection is closed
+    /// and dropped from the cache.
     async fn attempt(
         &self,
         peer: NodeId,
@@ -221,9 +237,10 @@ impl Inner {
     ) -> Result<Response<Bytes>, ForwardError> {
         let deadline = Instant::now() + limit;
         let ms = limit.as_millis() as u64;
-        let conn = timeout_at(deadline, self.conn(peer))
+        let cap = limit.min(CONNECT_CAP);
+        let conn = timeout_at(Instant::now() + cap, self.conn(peer))
             .await
-            .map_err(|_| ForwardError::ConnectTimeout(ms))??;
+            .map_err(|_| ForwardError::ConnectTimeout(cap.as_millis() as u64))??;
         let result = match timeout_at(deadline, exchange(&conn, frame)).await {
             Ok(r) => r.and_then(to_response),
             Err(_) => Err(ForwardError::Timeout(ms)),
@@ -235,6 +252,15 @@ impl Inner {
     }
 
     async fn conn(&self, peer: NodeId) -> Result<Connection, ForwardError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .hang
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&peer)
+        {
+            std::future::pending::<()>().await;
+        }
         {
             let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
             match conns.get(&peer) {

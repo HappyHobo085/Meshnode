@@ -567,6 +567,43 @@ async fn forward_reports_timeout_once_a_reached_host_never_answers() {
     mesh.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_connect_moves_on_after_the_connect_cap() {
+    // Ruling R15 M6: A is listed online but dialing it hangs; C serves. The attempt's
+    // limit is 10 s (the default service timeout, no slack), the connect cap 5 s.
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    deploy_counter(&mesh, Placement::Nodes(vec![a, c])).await;
+    wait_active(&mesh, 2).await;
+    wait_manifest(&mesh, 1).await;
+    let remote = RemoteForwarder::new(mesh.m[1].node.handle());
+    remote.try_first(vec![a, c]);
+    remote.hang_connect_to(vec![a]);
+    let start = tokio::time::Instant::now();
+    let resp = timeout(
+        Duration::from_secs(8),
+        remote.forward(COUNTER, common::get(COUNTER, "/"), Duration::ZERO),
+    )
+    .await
+    .expect("failover took the whole attempt limit")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        start.elapsed() >= Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(remote.attempts(), 2);
+    assert_eq!(mesh.served(0), 0);
+    assert_eq!(mesh.served(2), 1);
+    mesh.shutdown().await;
+}
+
 // ------------------------------------------------------------ _ping, pause, activity
 
 use mesh_gateway::Activity;

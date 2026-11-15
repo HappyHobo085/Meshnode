@@ -380,6 +380,7 @@ async fn join_and_request_static_site() {
     // The host's own error answers come back as they are.
     assert_eq!(fetch(&c, SITE, "/missing").await.0, 404);
 
+    wait_until("first sync", || c.status().first_sync_done).await;
     let st = c.status();
     assert!(st.first_sync_done);
     assert!(!st.removed);
@@ -539,6 +540,13 @@ async fn no_host_when_none_reachable() {
     let r = c.request(SITE, get("/")).await;
     assert!(matches!(r, Err(ClientError::NoHost)), "{r:?}");
     assert!(start.elapsed() < limit, "took {:?}", start.elapsed());
+
+    // The host comes back: `Online`, and it serves again.
+    hs[0].restart().await;
+    wait_event(&mut rx, ClientEvent::Online).await;
+    assert!(c.status().online_hosts >= 1);
+    wait_ready(&hs[0], SITE).await;
+    assert_eq!(fetch(&c, SITE, "/").await, (200, PAGE.into()));
     c.shutdown().await;
     for h in hs {
         h.shutdown().await;
@@ -709,10 +717,11 @@ async fn join_into_used_dir_refused() {
         r.err()
     );
 
-    // `open` needs an identity.
+    // `open` needs a joined client: not an empty or missing dir, nor a host's.
     let empty = root.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
-    for d in [empty, root.path().join("missing")] {
+    let host_dir = hs[0].dir.path().to_path_buf();
+    for d in [empty, root.path().join("missing"), host_dir] {
         let r = MeshClient::open(&d, opts()).await;
         assert!(matches!(r, Err(ClientError::NotJoined)), "{:?}", r.err());
     }
@@ -772,12 +781,35 @@ async fn services_follow_deploy_and_remove_after_offline() {
     let root = tempfile::tempdir().unwrap();
     let dir = client_dir(&root);
     let c = join(&dir, &hs[0].invite(Role::Client).await, opts()).await;
-    wait_until("client online", || c.status().online_hosts == 1).await;
+    wait_until("client settled", || {
+        let st = c.status();
+        st.online_hosts == 1
+            && st.first_sync_done
+            && c.members()
+                .iter()
+                .any(|m| hex(m.id) == st.id && m.name == "app")
+    })
+    .await;
     let mut rx = c.subscribe();
     assert!(c.services().is_empty());
 
+    // `services()` changes only when the client re-reads the manifests, which it does on a
+    // manifest change and then sends `ServicesChanged`: an event after which the site is
+    // listed was sent for the deploy.
     let _site = deploy_site(&hs[0]).await;
-    wait_event(&mut rx, ClientEvent::ServicesChanged).await;
+    timeout(T, async {
+        loop {
+            match rx.recv().await {
+                Ok(ClientEvent::ServicesChanged) if c.services().iter().any(|s| s.name == SITE) => {
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("events: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("no ServicesChanged listing the deployed site");
     wait_service(&c, SITE, 1).await;
     c.shutdown().await;
 
@@ -880,6 +912,84 @@ async fn request_times_out_when_the_host_never_answers() {
     assert!(took >= Duration::from_millis(5100), "took {took:?}");
     assert!(took < opts().request_timeout, "took {took:?}");
     assert_eq!(c.attempts(), 1);
+    c.shutdown().await;
+    for h in hs {
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_retried_with_the_same_ticket_after_a_lost_reply() {
+    // Ruling R15 I1: the inviter applies the join but its reply is lost. The kept
+    // `node.key` lets the same ticket succeed on retry (the inviter knows that key).
+    let hs = hosts(&[Serve::Attached]).await;
+    let _site = deploy_site(&hs[0]).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = client_dir(&root);
+    let ticket = hs[0].invite(Role::Client).await;
+    hs[0].node().drop_next_join_reply();
+    let r = timeout(T, MeshClient::join_for_test(&dir, &ticket, opts()))
+        .await
+        .expect("join timed out");
+    assert!(r.is_err(), "the reply was dropped");
+    let key = std::fs::read(dir.join("node.key")).expect("node.key kept");
+
+    let c = join(&dir, &ticket, opts()).await;
+    assert_eq!(std::fs::read(dir.join("node.key")).unwrap(), key);
+    wait_service(&c, SITE, 1).await;
+    // One member for this identity, and no other client.
+    let clients: Vec<_> = hs[0]
+        .node()
+        .members()
+        .into_iter()
+        .filter(|m| m.role == Role::Client)
+        .map(|m| hex(m.id))
+        .collect();
+    assert_eq!(clients, vec![c.status().id]);
+    c.shutdown().await;
+    for h in hs {
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dir_with_only_a_node_key_accepts_join() {
+    // A join interrupted after the key was written (process killed, call cancelled).
+    let hs = hosts(&[Serve::Attached]).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = client_dir(&root);
+    let key = mesh_core::local::load_or_create_key(&dir).unwrap();
+    let r = MeshClient::open(&dir, opts()).await;
+    assert!(matches!(r, Err(ClientError::NotJoined)), "{:?}", r.err());
+
+    let c = join(&dir, &hs[0].invite(Role::Client).await, opts()).await;
+    assert_eq!(c.status().id, hex(NodeId(key.verifying_key().to_bytes())));
+    c.shutdown().await;
+    for h in hs {
+        h.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_without_shutdown_then_open() {
+    // Ruling R15 M1: a dropped client keeps its directory locked until its node has let
+    // go of it, so a reopen is refused as `AlreadyOpen` meanwhile, never Io/Internal.
+    let hs = hosts(&[Serve::Attached]).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = client_dir(&root);
+    let c = join(&dir, &hs[0].invite(Role::Client).await, opts()).await;
+    wait_until("first sync", || c.status().first_sync_done).await;
+    drop(c);
+    let deadline = Instant::now() + T;
+    let c = loop {
+        match MeshClient::open_for_test(&dir, opts()).await {
+            Ok(c) => break c,
+            Err(ClientError::AlreadyOpen) => {}
+            Err(e) => panic!("reopen after drop: {e:?}"),
+        }
+        assert!(Instant::now() < deadline, "never reopened");
+        sleep(Duration::from_millis(20)).await;
+    };
     c.shutdown().await;
     for h in hs {
         h.shutdown().await;

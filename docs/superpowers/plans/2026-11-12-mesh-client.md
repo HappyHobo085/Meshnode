@@ -96,6 +96,11 @@
 
 - [ ] **Step 1: Failing tests:** `client_upgraded_to_host_rebootstraps_full` (client C re-invited as host by A ⇒ C ends with A's `svc` data and `scope() == Full`); `partial_rebootstrap_stays_partial`; `meshd_client_role_does_not_store_service_data` (a `mesh-host` daemon joined with a client ticket serves a deployed site through its gateway by forwarding, and its store has no `svc` namespace).
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Run** `cargo test -p mesh-core -p mesh-host -j 2` — PASS; fmt, clippy.
+
+**Owner command "declare fresh" (owner decision, 2026-11-15):** a host that stayed stale (off > 80 days with no other host) skips tombstone GC for ever; the owner can clear that explicitly.
+- Produces: `Node::declare_fresh(&self) -> Result<(), NodeError>` — records a full sync NOW for the staleness clock only (never advances `synced_self_seq`); `NodeError::Rebootstrapping` while re-bootstrapping; an admin request `DeclareFresh`; CLI `meshd declare-fresh --yes` (refuses without `--yes`, printing the risk); a UI action on the node's own page behind a confirm dialog stating the risk: "deletions that other hosts already cleaned up may come back".
+- Tests: `declare_fresh_clears_staleness_and_gc_runs` (stale host → declare → `is_stale() == false`, tombstone GC runs on the next maintenance tick); `declare_fresh_refused_while_rebootstrapping`; admin/CLI round-trip test; UI unit test for the confirm dialog.
+
 - [ ] **Step 5: Commit** `feat(core): re-bootstrap as full on role upgrade`.
 
 ### Task 5: `mesh-forward` — wasmtime-free placement and remote forwarding

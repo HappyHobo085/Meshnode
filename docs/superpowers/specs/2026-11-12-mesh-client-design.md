@@ -129,3 +129,198 @@ inspection); remove the client and confirm it is refused.
 ## 9. Out of scope
 Swift/iOS bindings; Maven publishing; a sample Android app; embedding in Aegis; installers and release
 signing (8b); the full §1 E2E run (8b).
+
+## 10. As built (differences from this design)
+
+Where this section and the text above disagree, this section is what was built. Master spec §3, §5, §6, §8,
+§13 and §14 carry the same changes.
+
+### 10.1 Sync protocol and partial replication (§3)
+- **`Hello { mesh, vv, scope, freshness }`** (ruling R4). `scope` is a required field. There is no
+  scope-less `Hello`: wire compatibility with earlier builds was not kept (the owner's decision; no mesh
+  held data), and the ALPN stays `meshnode/sync/1`.
+- **`freshness`** is `Fresh | Stale { since_ms } | Empty`. `Empty` means the node never completed a full
+  sync; a re-bootstrapping node announces `Stale`.
+- **`Advertise { vv }`** is a new message. It raises the bound the peer checks `Covered` markers against.
+  In live mode a node sends it before a marker above what its `Hello` announced, so a client never gets a
+  marker above what it was told the host holds. **`Advertise` before the peer's first `Hello` is a protocol
+  error** (ruling A1).
+- **Scoped diffs** (ruling R5). `diff_since_scoped` walks at most 4 × `limit` op rows per call, filtered
+  ones included. When that budget runs out inside a filtered run, the page ends with a `Covered` up to the
+  last row walked. The join reply's catch-up to a client joiner is scoped too (ruling R1).
+- **Scope at open.** The scope comes from the node's role in `_mesh` and from `role.json`, the role it
+  joined with, written before `mesh.json`. The store is Partial if either says client. A client data dir
+  without `role.json` opens Partial once its `members` record says client.
+- **`check_scope`** (ruling R7). A peer listed as both client and host (a client re-invited as a host) may
+  announce Partial; it is then served scoped and its markers are ignored. A peer with no role yet is taken
+  at its word.
+- **M4 (known, heals by itself).** A host that does not yet hold a node's host record refuses that node's
+  `Full` `Hello` as contradicting its client role. This heals once the record reaches the host from another
+  peer and the node redials.
+
+### 10.2 Staleness and re-bootstrap
+The design did not say how staleness works with partial peers. What was built (rulings C1c, C1d, C1e, A2,
+I2; Task 3 fix rounds 1–7, Task 4 fix rounds 1–3):
+- **What a completed round records**, by the freshness the peer announced:
+  - **a Fresh Full peer:** a full sync (the time, and `synced_self_seq` to the peer's `vv[me]`);
+  - **a Fresh Partial peer:** the time only, and only when the store already has a time that is not stale.
+    A client never rescues a stale node and never makes an `Empty` one Fresh;
+  - **a Stale peer:** nothing is refreshed, but an `Empty` store inherits the peer's staleness, with
+    `since_ms` clamped to at most now − 80 days − 1 ms;
+  - **an `Empty` peer:** nothing (two `Empty` stores stay `Empty`).
+
+  A round in which the store applied ops from a Stale peer then lowers its time to that peer's clamped
+  `since_ms` (taint). The founder starts Fresh. So only the founder or a Fresh Full peer makes a host
+  Fresh.
+- **Staleness never blocks syncing.** The earlier `PeerStale` refusal is gone. The only reset trigger is a
+  **Fresh Full** peer's `Hello` reaching a stale node, and nothing is served to that peer first. A stale
+  client resets on it too; its `_mesh` data can be fetched again. A mesh in which every node is stale stays
+  stale but fully working until a Fresh Full node appears.
+- **A rebuild takes data only from Fresh Full peers** (and `_mesh` from clients). It completes only after a
+  Fresh Full peer's `Done` answered a `Hello` sent after the reset (ruling I2). The finished store records a
+  full sync time.
+- **Epoch atomicity** (Task 3 rounds 6–7, Task 4 round 2, ruling R9). The reset and `begin_epoch` are one
+  store call under the `FullPulls::decide` lock. A session takes the same lock to decide on a reset and to
+  record a completed round. A round whose `Hello` predates the current epoch records nothing, and sessions
+  whose last `Hello` predates a reset are restarted.
+- **`SessionEnd::Reset`** (Task 4 round 3, ruling R10). A session whose first `Hello` went out before the
+  current epoch ends with `SessionEnd::Reset` if the peer is Full or not yet known, and is redialed at
+  `backoff_min`.
+  - The check runs before every incoming message and every writer pass, and the reset wakes every writer.
+  - The `Covered` apply re-checks the epoch under `decide`, so a marker computed against a pre-reset
+    `Hello` never lands in the emptied store.
+- **`check_stale` while rebuilding** (Task 4 round 2, a narrower form of ruling R9 (a)). While the store is
+  actually being rebuilt (reset done, run not finished), a Fresh Full peer's `Hello` decides nothing. The
+  rebuild's sources are never turned away, even when a stale time was written into the store being rebuilt.
+  Before the reset (paused, reset decided but not yet done), a Fresh Full peer still ends the session, which
+  restarts with a fresh `Hello`. The ruling first said to skip the check for the whole paused period, but
+  that broke sessions kept up across the reset.
+- **`declare-fresh`** (ruling R6). A host alone for over 80 days stays Stale for good (ruling C1d), so
+  tombstone GC is skipped and storage grows. The owner can declare it up to date:
+  - core `Node::declare_fresh()`, which refreshes the time only and never `synced_self_seq`;
+  - admin request `DeclareFresh`;
+  - `meshd declare-fresh --yes` (without `--yes` it prints the risk and changes nothing);
+  - the UI: Settings, **Declare up to date…**, behind a type-to-confirm dialog that states the risk.
+
+  It is refused while a re-bootstrap runs or a session has decided on one (`Rebootstrapping`), and once the
+  node is removed. Beyond the ruling, it is also refused for a store that never completed a full sync
+  (`NeverSynced`).
+
+### 10.3 Role upgrade (§3)
+- **When it starts.** The upgrade uses the stale re-bootstrap's steps and starts only when a session meets a
+  **Fresh Full** peer (ruling R8, like C1). A client re-invited in a mesh whose only host is stale stays a
+  working client until a Fresh Full host appears.
+- **The flip.** From the reset on, its `Hello`s announce `Full` (and `Stale`, as every rebuild does). The
+  store's scope becomes Full and `role.json` becomes `host` **only when the rebuild completes**:
+  - the scope flips before serving resumes;
+  - `role.json` is rewritten before `rebootstrap.bin` is removed.
+
+  A failed run, including one that fails after the flip, is retried and resumes from `rebootstrap.bin`.
+- **Serving meanwhile.** While a node's store is not Full or is re-bootstrapping, its **gateway forwards**
+  every request (Task 4 M3). Its **`httpfwd` answers the retryable `503 Node re-bootstrapping`** (ruling
+  R9). This also closed an older gap: a host in the middle of a rebuild used to serve forwarded requests from
+  its incomplete store.
+- **No product path promotes a client yet.** `join` refuses a data dir already in a mesh, and there is no
+  promote request. The tests write the host record directly.
+
+### 10.4 `mesh-forward` (§2)
+- **The crate.** The gateway's forwarding moved into a new crate, `crates/mesh-forward`. It holds
+  placement, manifest reads, `RemoteForwarder` and the `_ping` probe, with no WASM runtime, services crate
+  or HTTP server. `mesh-gateway` and `mesh-services` use it through re-exports. `hyper` is banned only as a
+  direct dependency, because iroh pulls it in transitively.
+- **Attempt limits.** `forward(service, req, slack)` gives each attempt the manifest's `request_timeout_ms`
+  plus `slack`; the gateway and the client both pass 5 s. The connect phase of an attempt is capped at
+  **5 s**, and a connect timeout counts as a failure to connect (ruling R15 M6).
+- **Results.** When no host answered, `forward` returns **`Timeout` if some attempt reached its host and
+  timed out, else `NoHost`** (ruling R11). It can also return `NotDeployed` and `Unframeable`
+  (431/414/413/400).
+
+### 10.5 `mesh-client` (§4)
+- **Local answers.** `request` answers locally with `400` for a path that does not start with `/`, `413`
+  for a body over 16 MiB, and `431`/`414` for headers or a path too large for an `httpfwd` frame.
+- **Timeout.** `request_timeout` bounds the whole call, all attempts included, and gives `Timeout` (ruling
+  R12).
+- **Join retry** (ruling R15). A directory counts as joined once it holds `mesh.json`. `node.key` is never
+  deleted:
+  - after a failed join, or one whose reply was lost, the next `join` reuses the key, so a retry with the
+    same ticket succeeds;
+  - a dir holding only `node.key` accepts a join.
+
+  `join` returns before the first sync completes.
+- **`open`** needs `node.key`, `mesh.json` and `role.json` = client. A host's data dir gives `NotJoined`.
+- **Locking and teardown.** `client.lock` is an exclusive OS file lock. `shutdown()` releases it after the
+  node has torn down. A dropped client tears down on the Tokio runtime it started on (ruling R16), also
+  when it is dropped off that runtime, and keeps the lock until it is done. A redb "already open" error
+  maps to `AlreadyOpen`.
+- **Events.** `Online` and `Offline` follow whether any host is reachable. `ServicesChanged` follows
+  changes to `service/*` keys.
+
+### 10.6 `mesh-client-ffi` (§5, §6.4)
+- **`MeshClientAndroid.init(context)`** is a hand-written Kotlin object over a raw JNI export,
+  `Java_net_meshnode_client_MeshClientAndroid_initAndroid`. iroh's networking reads the Android context,
+  so on Android `join` and `open` fail with `NotInitialised` until `init` has run. `init` never throws; if it
+  fails, the reason is in `NotInitialised`'s message.
+- **Extra error variants.**
+  - `InvalidArgument`: a bad hex node id, or `requestTimeoutMs` = 0.
+  - `Closed`: any call during or after `shutdown`. `status()`, `members()`, `services()` and
+    `setListener` throw it too.
+  - `NotInitialised`: see above.
+
+  A request that cannot be built gets a local `400`.
+- **The AAR** (`scripts/build-client-aar.sh`, a release build with symbols stripped) contains
+  `proguard.txt`, the consumer R8 rules that keep JNA and `net.meshnode.client`. It does **not** declare
+  its runtime dependencies: the app adds JNA 5.14.0 (`@aar`) and `kotlinx-coroutines-android` itself, as
+  the README says.
+- **The bindings** are generated unformatted (`--no-format`, no ktlint), so a regeneration and `--check`
+  produce the same bytes.
+- **The JVM test is narrower than §6.4.** `crates/mesh-client-ffi/jvm-test` (Gradle, JDK 17, JNA) loads
+  the host library and checks error mapping: `InvalidTicket` for a bad ticket, `NotJoined` for an empty
+  dir. It also compiles the README's Kotlin example. It does not run join → request against an in-process
+  mesh; the wrapper's Rust tests (`tests/ffi.rs`) cover that.
+- **Threads and cancellation.** `onEvent` runs on a library worker thread. A coroutine cancelled during
+  `join` does not stop the join: it completes in the background, and the client is then torn down.
+
+### 10.7 Tests and CI (§6)
+- **Success criterion 5.** The in-process test is `criterion5_client_via_remaining_host` (mesh-client).
+  The real-device run is in `docs/manual-checks/sub-spec-8a.md` (ruling R23).
+- **CI** has two new jobs:
+  - **`mesh-client`:** the tests of mesh-forward, mesh-client and mesh-client-ffi, plus a
+    `cargo tree -p … -e normal` check on mesh-client and mesh-forward. Plain `cargo tree` shows wasmtime
+    through the dev-dependencies, which is expected (ruling R20).
+  - **`mesh-client-ffi-android`:** the bindings `--check`, the AAR built for both ABIs with `cargo ndk`,
+    and the Gradle JVM test against the host library built on Linux (ruling R21).
+
+  Neither job has run yet (ruling R22).
+
+### 10.8 Known limits and deferred minors
+- **Lone stale host.** It stays Stale until a Fresh Full peer appears or the owner runs `declare-fresh`.
+- **Joiner trusts its ticket's role.** If that role ever differs from the inviter's record, the joiner is
+  refused and stuck.
+- **Taint dropped mid-round.** The per-session stale-op taint is dropped if a session ends in the middle of
+  a round. In a race, stale data may then pass as Fresh. No data is lost.
+- **Restart after a re-bootstrap.** Every session restarts once after a re-bootstrap, and the redial
+  backoff can reach 5 minutes.
+- **Scope check outside the clock mutex** (Task 2). Harmless, because at runtime the scope only ever
+  widens (the upgrade).
+- **Test gaps** (Task 4):
+  - `marker_against_a_pre_reset_hello_never_lands` was RED only through timing, and the `decide` re-check
+    in the `Covered` apply is untested (t1);
+  - the record-path tests no longer reach `maybe_complete` (t2);
+  - no test pins the round-6 restart for a Partial peer spanning a reset (t3);
+  - some upgrade tests overlap (m2).
+- **Rare stalls in `stale_partial` tests.** `NotEffective` at `c.invite` happens about once in 60 runs.
+  `stale_host_not_refreshed_by_client_fresh_via_other_host` stalled before the round-2 fix. No cause was
+  found beyond the mechanisms already fixed.
+- **Duplication around mesh-forward** (Task 5, Low):
+  - two different `read_manifest` functions, one in mesh-services and one in mesh-forward;
+  - the paged `service/` listing exists three times;
+  - `mesh-gateway/src/error.rs` has a doubled doc line.
+- **F1** (Task 6). A lone `node.key` kept after a failed join can be reused to join another mesh, so one
+  node id becomes a (ghost) member of two meshes. If the ghost is removed before a retry, the dir is stuck
+  for that mesh and reports `InvalidTicket`. Fix later: a `joining.json {mesh}` next to the key, with a new
+  key for another mesh.
+- **F3** (Task 6). The 5 s connect cap may abandon a slow cold connect (relay plus hole-punching on a poor
+  mobile link). Make it a timing setting if field reports show `NoHost` on poor links.
+- **Android untested on a device.** The AAR, `MeshClientAndroid.init` and JNA on Android have never run on
+  a device; the manual check covers this. A listener that blocks holds one of the library's two worker
+  threads.

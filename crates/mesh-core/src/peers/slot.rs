@@ -343,6 +343,7 @@ impl SlotTask {
             self.note_refused();
             self.env().signout.peer_refused();
         }
+        let reset = matches!(end, SessionEnd::Reset);
         match end {
             SessionEnd::Closed => {
                 if !refused {
@@ -352,6 +353,7 @@ impl SlotTask {
             // The session future already closed the connection with `PROTOCOL`.
             SessionEnd::Protocol(m) => warn!(peer, reason = %m, "protocol violation; closed"),
             SessionEnd::Store(e) => warn!(peer, error = %e, "store error; session closed"),
+            SessionEnd::Reset => debug!(peer, "store reset; restarting the session"),
             SessionEnd::Stale => {
                 warn!(
                     peer,
@@ -362,7 +364,8 @@ impl SlotTask {
                 let _ = self.env().stale.try_send(self.slot.peer);
             }
         }
-        if self.slot.metrics.rounds_completed.load(Ordering::SeqCst) > l.rounds_at_start {
+        if self.slot.metrics.rounds_completed.load(Ordering::SeqCst) > l.rounds_at_start || reset {
+            // A reset restarts every session at once (ruling R10).
             self.backoff = self.env().timings.backoff_min;
         }
         if refused {

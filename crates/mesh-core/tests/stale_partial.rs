@@ -732,6 +732,7 @@ async fn stale_host_and_new_host_that_meets_fresh_client_first() {
     // C stays away from stale A from now on: ops it took from A would taint it (C1e) and
     // make it re-bootstrap again while E is being invited.
     c.partition(&[ia]);
+    let mut ec = c.subscribe();
     // C re-bootstraps from B and comes back Fresh (a reset store is Empty meanwhile).
     wait_until("C fresh through B", T, || async {
         c.status() == NodeStatus::Running
@@ -746,7 +747,32 @@ async fn stale_host_and_new_host_that_meets_fresh_client_first() {
     a.partition(&[ie]);
     b.partition(&[ia, ie]);
     d.partition(&[ia, ie]);
-    let (e, _) = join(&de, "e", now, c.invite(Role::Host, TTL).await.unwrap()).await;
+    // Retried: a client's status and snapshot may lag a moment behind; a lasting failure
+    // dumps C's state.
+    let deadline = tokio::time::Instant::now() + T;
+    let ticket = loop {
+        match c.invite(Role::Host, TTL).await {
+            Ok(t) => break t,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                let mut starts = 0;
+                while let Ok(ev) = ec.try_recv() {
+                    starts += usize::from(matches!(ev, NodeEvent::RebootstrapStarting));
+                }
+                let me = c.members().into_iter().find(|m| m.id == ic);
+                panic!(
+                    "C cannot invite: {err:?}; status {:?}, RebootstrapStarting x{starts},                      self {:?}, last full sync {:?}, stale {}",
+                    c.status(),
+                    me.map(|m| (m.role, m.effective)),
+                    last_full_sync(&c).await,
+                    is_stale(&c).await,
+                );
+            }
+        }
+    };
+    let (e, _) = join(&de, "e", now, ticket).await;
     more_rounds(&e, ic, 3).await;
     assert_eq!(
         last_full_sync(&e).await,

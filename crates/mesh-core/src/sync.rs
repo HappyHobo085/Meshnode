@@ -63,6 +63,12 @@ pub enum SessionEnd {
     /// The peer broke the protocol; close with `PROTOCOL`.
     Protocol(String),
     Store(StoreError),
+    /// This store was reset (re-bootstrap) after our first `Hello` of this session, and the
+    /// peer is (or may be) Full: what it sends may be computed against our pre-reset
+    /// vector, and a `Covered` marker from it would jump the emptied store's vector over ops
+    /// it never received (ruling R10). Redialed at once (`backoff_min`), so every session
+    /// of the new epoch starts from a `Hello` the peer has seen.
+    Reset,
     /// The store is stale, or a role upgrade is due (sub-spec 8a §3), and a Fresh Full peer
     /// announced itself: the node re-bootstraps from it (spec §7, sub-spec 8a rulings C1c
     /// and R8). Nothing was served to that peer, and serving is already paused.
@@ -287,6 +293,9 @@ struct State {
     told_epoch: u64,
     /// Our latest `Hello` went out while serving was paused (it announced `Stale`).
     told_paused: bool,
+    /// The [`FullPulls`] epoch of our first `Hello` in this session (`None` before it):
+    /// once the epoch moves past it, the session spans a reset ([`SessionEnd::Reset`]).
+    first_hello_epoch: Option<u64>,
     /// What we believe the peer holds.
     known: VersionVector,
     /// Bumped on every `Hello` received (it resets `known`).
@@ -595,6 +604,7 @@ impl Session {
     }
 
     async fn on_message(&self, msg: SyncMsg) -> Result<(), SessionEnd> {
+        self.check_spans_reset()?;
         match msg {
             SyncMsg::Hello {
                 mesh,
@@ -665,9 +675,24 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let acc = self.ctx.acc.clone();
-                self.call(move |s| s.apply_covered(origin, upto, advertised, &*acc))
+                let (acc, pulls) = (self.ctx.acc.clone(), self.ctx.pulls.clone());
+                let first = self.lock().first_hello_epoch;
+                let applied = self
+                    .call(move |s| {
+                        // Atomic with a reset, which holds `decide` from `reset_to_empty`
+                        // through `begin_epoch`: a marker against our pre-reset `Hello` never
+                        // lands in the emptied store (ruling R10).
+                        let _decide = pulls.decide();
+                        if first.is_some_and(|e| e != pulls.current()) {
+                            return Ok(false);
+                        }
+                        s.apply_covered(origin, upto, advertised, &*acc)?;
+                        Ok(true)
+                    })
                     .await?;
+                if !applied {
+                    return Err(SessionEnd::Reset);
+                }
                 if upto <= advertised {
                     raise(&mut self.lock().known, origin, upto);
                 }
@@ -693,6 +718,29 @@ impl Session {
                 self.maybe_complete().await
             }
         }
+    }
+
+    /// Ruling R10: ends a session that spans a reset of this store, i.e. our first `Hello`
+    /// of it went out before the current epoch, unless the peer announced a Partial scope
+    /// (its markers are ignored, it earns no pull credit, and its ops wait in `pending` as
+    /// usual). Checked before every message read and every writer pass; the reset's
+    /// `start_round_all` wakes every writer, so no such session outlives the reset by more
+    /// than a wake-up, and none applies anything of the peer's after it (the `Covered` apply
+    /// also re-checks under `decide`).
+    fn check_spans_reset(&self) -> Result<(), SessionEnd> {
+        let st = self.lock();
+        let spans = st
+            .first_hello_epoch
+            .is_some_and(|e| e != self.ctx.pulls.current());
+        if spans && !st.peer_partial() {
+            drop(st);
+            debug!(
+                peer = %self.ctx.peer.short(),
+                "this store was reset since the session began; restarting the session"
+            );
+            return Err(SessionEnd::Reset);
+        }
+        Ok(())
     }
 
     /// Spec §7 with sub-spec 8a ruling C1c, on each `Hello`: if this store is stale and the
@@ -937,6 +985,7 @@ impl Session {
 
     /// Sends whatever is due: a `Hello`, the diff, and `Done`.
     async fn write_pending<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<(), SessionEnd> {
+        self.check_spans_reset()?;
         let send_hello = {
             let mut st = self.lock();
             let r = &mut st.round;
@@ -968,6 +1017,7 @@ impl Session {
                 let mut st = self.lock();
                 st.round.hello_epoch = epoch;
                 st.told_epoch = epoch;
+                st.first_hello_epoch.get_or_insert(epoch);
                 st.told_paused = paused;
                 st.told = vv.clone();
             }

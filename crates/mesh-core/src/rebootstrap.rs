@@ -217,6 +217,9 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
     let (next, epoch) = inner
         .store
         .call_raw(move |st| {
+            // Must hold `decide` from the reset through `begin_epoch`: `record_round` and the
+            // `Covered` apply check the epoch under it, which is what keeps a pre-reset round
+            // or marker out of the emptied store (rulings R9, R10).
             let _decide = pulls.decide();
             st.reset_to_empty()?;
             pulls.set_rebuild_full(full);
@@ -225,6 +228,8 @@ pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(
         })
         .await?;
     inner.peers.start_round_all();
+    // Every writer runs once more, so a session that spans the reset ends now (R10).
+    inner.peers.wake_all();
     if next.saturating_sub(1) != file.last_seq {
         // An own op was written after the export: it is gone, and the store would refuse
         // every later local write. Never carry on silently.

@@ -927,7 +927,8 @@ async fn marker_after_reset_ends_session() {
         .await
         .expect("session ends")
         .unwrap();
-    assert!(matches!(end, SessionEnd::Closed), "{end:?}");
+    // The session spans the reset (ruling R10; before it, the latest-Hello guard).
+    assert!(matches!(end, SessionEnd::Reset), "{end:?}");
     assert_eq!(a.inner().version_vector().unwrap().get(&x), 0);
 }
 
@@ -1065,13 +1066,14 @@ async fn no_serving_under_a_hello_from_before_a_reset() {
     h.pulls.begin_epoch();
     a.inner().mark_full_sync(0).unwrap();
     assert!(!a.inner().is_stale().unwrap());
-    raw.send(&hello(VersionVector::default(), Scope::Full))
-        .await;
+    // The session may already have ended (it spans the reset), so the write may fail.
+    let _ = write_frame(&mut raw.w, &hello(VersionVector::default(), Scope::Full)).await;
     let end = timeout(Duration::from_secs(5), join)
         .await
         .expect("session ends")
         .unwrap();
-    assert!(matches!(end, SessionEnd::Closed), "{end:?}");
+    // The session spans the reset (ruling R10).
+    assert!(matches!(end, SessionEnd::Reset), "{end:?}");
     // Nothing was served under the old Hello.
     loop {
         match timeout(
@@ -1098,7 +1100,7 @@ async fn round_spanning_a_reset_records_no_inheritance() {
     let dir = tempfile::tempdir().unwrap();
     let a = founder_store(dir.path());
     assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
-    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    let (join, h, mut raw) = run_against_raw(&a, id(2));
     raw.send(&hello_with(
         VersionVector::default(),
         Scope::Full,
@@ -1112,7 +1114,8 @@ async fn round_spanning_a_reset_records_no_inheritance() {
     // The store is reset (a new epoch) before the peer's Done completes the round.
     h.pulls.begin_epoch();
     raw.send(&SyncMsg::Done).await;
-    next_round(&mut h.events).await;
+    // The session spans the reset: it ends instead of completing the round (R10).
+    assert!(matches!(end_of(join).await, SessionEnd::Reset));
     assert_eq!(
         a.inner().last_full_sync_ms().unwrap(),
         None,
@@ -1146,7 +1149,7 @@ async fn round_spanning_a_reset_records_no_taint() {
             mesh_store::SyncItem::Covered { .. } => None,
         })
         .collect();
-    let (_join, mut h, mut raw) = run_against_raw(&a, id(2));
+    let (join, h, mut raw) = run_against_raw(&a, id(2));
     raw.send(&hello_with(
         VersionVector::default(),
         Scope::Full,
@@ -1168,7 +1171,8 @@ async fn round_spanning_a_reset_records_no_taint() {
     .expect("op applied");
     h.pulls.begin_epoch();
     raw.send(&SyncMsg::Done).await;
-    next_round(&mut h.events).await;
+    // The session spans the reset: it ends instead of completing the round (R10).
+    assert!(matches!(end_of(join).await, SessionEnd::Reset));
     assert_eq!(
         a.inner().last_full_sync_ms().unwrap(),
         synced,
@@ -1535,4 +1539,49 @@ async fn removed_node_is_not_upgrading() {
         "a removed node does not upgrade"
     );
     assert!(!join.is_finished());
+}
+
+/// Ruling R10: a session that spans a reset never lets the peer's marker, computed
+/// against our pre-reset `Hello`, land in the emptied store. Here our post-reset `Hello` is
+/// sent (so the latest-Hello epoch guard alone would pass), and the peer, which has not
+/// read it yet, still serves from our old vector: an `Advertise` and then a `Covered`
+/// marker. Applied, it would jump `vv[B]` over ops the store never received.
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_against_a_pre_reset_hello_never_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    let (join, mut h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello(VersionVector::default(), Scope::Full))
+        .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    // The store is reset (a re-bootstrap) and a new epoch begins; a round starts.
+    a.inner().reset_to_empty().unwrap();
+    h.pulls.begin_epoch();
+    let _ = h.cmds.send(mesh_core::sync::SessionCmd::StartRound).await;
+    // The peer has not read our new Hello yet: it serves from our pre-reset vector.
+    let mut adv = VersionVector::default();
+    adv.set(id(2), 50);
+    let _ = write_frame(&mut raw.w, &SyncMsg::Advertise { vv: adv }).await;
+    let _ = write_frame(
+        &mut raw.w,
+        &SyncMsg::Covered {
+            origin: id(2),
+            upto: 50,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        a.inner().version_vector().unwrap().get(&id(2)),
+        0,
+        "a pre-reset marker jumped the emptied store's vector"
+    );
+    let end = timeout(Duration::from_secs(5), join)
+        .await
+        .expect("the session spanning the reset ends")
+        .unwrap();
+    assert!(matches!(end, SessionEnd::Reset), "{end:?}");
 }

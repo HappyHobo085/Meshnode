@@ -397,6 +397,12 @@ async fn stuck_on_c() -> StuckOnC {
         vv_of(&c, ib).await == vv_of(&b, ib).await && vv_of(&b, ic).await > 0
     })
     .await;
+    // C must be Fresh (a full round with B done), or stale A would not reset on meeting
+    // it (sub-spec 8a C1c: only a Fresh Full peer triggers a reset).
+    wait_until("C full-synced", T, || async {
+        last_full_sync(&c).await.is_some()
+    })
+    .await;
     c.partition(&[ia, ib]);
     b.partition(&[ic]);
     wait_until("B and C apart", T, || async {

@@ -260,6 +260,31 @@ impl<W: WallClock> Store<W> {
         Ok(())
     }
 
+    /// This store applied ops from a stale peer whose last full sync was at `at_ms`
+    /// (sub-spec 8a C1e): lowers `last_full_sync_ms` to `at_ms` clamped to at most
+    /// `now - STALE_MS - 1`, or sets it, so the store is stale like the data it took, even
+    /// if it had a recent time. `synced_self_seq` is not touched.
+    pub fn taint_full_sync(&self, at_ms: u64) -> Result<(), StoreError> {
+        let clock = self.lock_clock();
+        let latest_stale = clock
+            .wall()
+            .now_ms()
+            .saturating_sub(crate::STALE_MS)
+            .saturating_sub(1);
+        let tx = self.db.begin_write()?;
+        {
+            let mut m = tx.open_table(META)?;
+            let t = at_ms.min(latest_stale);
+            let t = meta_u64(&m, meta::LAST_FULL_SYNC_MS)?.map_or(t, |cur| cur.min(t));
+            m.insert(
+                meta::LAST_FULL_SYNC_MS.as_bytes(),
+                keys::u64_value(t).as_slice(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// A round with a Fresh peer that is no full replica (a client, sub-spec 8a C1c):
     /// `last_full_sync_ms = wall.now_ms()`, like [`Store::mark_full_sync`], but
     /// `synced_self_seq` is left as it is (a Partial peer's vector proves nothing about

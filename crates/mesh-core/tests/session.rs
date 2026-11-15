@@ -547,11 +547,12 @@ async fn paused_serves_nothing_but_applies() {
     assert!(!has(&b, "a4"));
     assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), b_synced);
 
+    // Serving resumes: the session's Hello announced `Stale` (paused), so A restarts it
+    // (the next one announces A's real freshness) rather than serve under it.
     p.a.h.serve_paused.store(false, Ordering::SeqCst);
     p.a.h.wake.notify_one();
-    next_round(&mut p.a.h.events).await;
-    next_round(&mut p.b.h.events).await;
-    assert!(has(&b, "a4") && has(&b, "while-paused"));
+    assert!(matches!(end_of(p.a).await, SessionEnd::Closed));
+    assert!(!has(&b, "a4") && !has(&b, "while-paused"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

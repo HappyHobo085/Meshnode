@@ -622,10 +622,14 @@ async fn stale_client_and_stale_host_keep_syncing() {
             && !c.members().iter().any(|m| m.id == ia && m.online)
     })
     .await;
+    // A round that completed just before the cut-off may still be recording its full
+    // sync: let that land before the clock moves (as in `age_a`).
+    sleep(Duration::from_millis(500)).await;
     for clock in [&ca, &cc] {
         clock.set(day0 + 81 * DAY);
     }
-    assert!(is_stale(&a).await && is_stale(&c).await);
+    assert!(is_stale(&a).await, "A stale");
+    assert!(is_stale(&c).await, "C stale");
     a.heal();
     c.heal();
     a.partition(&[ib]);
@@ -697,6 +701,69 @@ async fn stale_host_not_refreshed_by_client_fresh_via_other_host() {
     }
     assert!(!is_stale(&a).await);
     for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1e: a new host E that meets a Fresh client before it meets the stale host A
+/// stays Empty (a client round never makes a host Fresh), so A never resets from E; E then
+/// takes A's data and its staleness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_and_new_host_that_meets_fresh_client_first() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let now = now_of(&t.clocks[0]);
+    let Quad { a, b, c, d, .. } = t;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    let mut ea = a.subscribe();
+
+    // C turns Fresh through B (B and D keep shutting A out).
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    // C re-bootstraps from B and comes back Fresh (a reset store is Empty meanwhile).
+    wait_until("C fresh through B", T, || async {
+        c.status() == NodeStatus::Running
+            && last_full_sync(&c).await.is_some()
+            && !is_stale(&c).await
+    })
+    .await;
+
+    // E, invited by the client, first meets only C.
+    let de = tempfile::tempdir().unwrap();
+    let ie = id_of(&de);
+    a.partition(&[ie]);
+    b.partition(&[ia, ie]);
+    d.partition(&[ia, ie]);
+    let (e, _) = join(&de, "e", now, c.invite(Role::Host, TTL).await.unwrap()).await;
+    more_rounds(&e, ic, 3).await;
+    assert_eq!(
+        last_full_sync(&e).await,
+        None,
+        "a client round leaves E Empty"
+    );
+
+    // E meets stale A: A does not reset from it; E takes A's data and its staleness.
+    a.heal();
+    a.partition(&[b.node_id(), d.node_id()]);
+    wait_until("E has A's data", T, || async {
+        val(&e, "a-synced").await.is_some() && val(&e, "b-data").await.is_some()
+    })
+    .await;
+    wait_until("E stale", T, || async { is_stale(&e).await }).await;
+    more_rounds(&a, ie, 2).await;
+    assert!(!saw_rebootstrap(&mut ea), "A must not reset from E");
+    assert_eq!(a.status(), NodeStatus::Running);
+    assert!(is_stale(&a).await);
+    for n in [a, b, c, d, e] {
         timeout(T, n.shutdown()).await.unwrap();
     }
 }

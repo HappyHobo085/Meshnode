@@ -966,3 +966,71 @@ async fn rebuild_takes_data_only_from_fresh_full_peers() {
     assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
     assert!(!join.is_finished());
 }
+
+/// Ruling C1e: a round with a Fresh client never makes an Empty store Fresh (it holds only
+/// `_mesh` from it); only the founder or a Fresh Full peer can.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_host_with_fresh_client_stays_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = founder_store(dir.path());
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None);
+    let (join, mut h, mut raw) = run_against_raw(&a, id(3));
+    raw.send(&hello(VersionVector::default(), Scope::client()))
+        .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.until_done().await;
+    raw.send(&SyncMsg::Done).await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), None, "still Empty");
+    assert!(!join.is_finished());
+}
+
+/// Ruling C1e: a Fresh store that applies ops from a Stale peer in a completed round takes
+/// the peer's staleness (clamped), although it already had a sync time.
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_store_applying_stale_ops_turns_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, clock) = founder_store_with_clock(dir.path());
+    clock.advance(200 * 86_400_000);
+    a.inner().mark_full_sync(0).unwrap();
+    assert!(!a.inner().is_stale().unwrap());
+    // Ops of member 2 (a host), as a stale peer 2 would send them.
+    let b = CoreStore::open(
+        &dir.path().join("b.redb"),
+        mesh(),
+        key(2),
+        DynClock(Arc::new(ManualClock::new(1_000_000))),
+    )
+    .unwrap();
+    b.set("app", "old", b"x").unwrap();
+    let ops: Vec<_> = b
+        .diff_since(&VersionVector::default(), 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|i| match i {
+            mesh_store::SyncItem::Op(op) => Some(op),
+            mesh_store::SyncItem::Covered { .. } => None,
+        })
+        .collect();
+    let (join, mut h, mut raw) = run_against_raw(&a, id(2));
+    raw.send(&hello_with(
+        VersionVector::default(),
+        Scope::Full,
+        Freshness::Stale {
+            since_ms: 1_000_000,
+        },
+    ))
+    .await;
+    assert!(matches!(raw.recv().await, Some(SyncMsg::Hello { .. })));
+    raw.send(&SyncMsg::Ops { ops }).await;
+    raw.send(&SyncMsg::Done).await;
+    raw.until_done().await;
+    next_round(&mut h.events).await;
+    assert_eq!(a.inner().get("app", "old").unwrap(), Some(b"x".to_vec()));
+    assert!(
+        a.inner().is_stale().unwrap(),
+        "tainted by the stale peer's ops"
+    );
+    assert_eq!(a.inner().last_full_sync_ms().unwrap(), Some(1_000_000));
+    assert!(!join.is_finished());
+}

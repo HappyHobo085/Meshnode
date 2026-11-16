@@ -252,11 +252,12 @@ struct SlotState {
 }
 
 /// The address to dial `peer` at, built from the known address records. Without any, the
-/// target is still dialled when discovery can resolve it.
+/// target is still dialled when the endpoint can resolve it (`resolvable`: discovery, or a
+/// live connection whose path the endpoint knows).
 fn dial_target(
     peer: NodeId,
     records: impl IntoIterator<Item = Option<NodeAddrBytes>>,
-    discovery: bool,
+    resolvable: bool,
 ) -> Option<EndpointAddr> {
     let id = endpoint_id_of(&peer).ok()?;
     let mut target = EndpointAddr::new(id);
@@ -267,7 +268,7 @@ fn dial_target(
             Err(e) => debug!(peer = %peer.short(), error = %e, "bad address ignored"),
         }
     }
-    (!target.addrs.is_empty() || discovery).then_some(target)
+    (!target.addrs.is_empty() || resolvable).then_some(target)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -421,13 +422,16 @@ impl PeerManager {
 
     /// Dials `id` on `alpn` with the address knowledge the slots use, within `limit`.
     /// The connection is the caller's; it does not touch the `sync/1` slot.
+    /// A peer with a live session is dialled even without an address record: the endpoint
+    /// already has a path to it (a joiner that dialled in is online before its
+    /// `_mesh/addr` record has replicated here).
     pub(crate) async fn connect_within(
         &self,
         id: NodeId,
         alpn: &[u8],
         limit: Duration,
     ) -> Result<Connection, NodeError> {
-        let (addr, hint) = {
+        let (addr, hint, live) = {
             let st = self.lock();
             if st.stopped || self.0.cancel.is_cancelled() {
                 return Err(NodeError::ShuttingDown);
@@ -438,12 +442,13 @@ impl PeerManager {
                     (
                         s.addr.clone(),
                         s.hint.clone().or_else(|| st.hints.get(&id).cloned()),
+                        s.live.is_some(),
                     )
                 }
-                None => (None, st.hints.get(&id).cloned()),
+                None => (None, st.hints.get(&id).cloned(), false),
             }
         };
-        let target = dial_target(id, [addr, hint], self.0.env.discovery)
+        let target = dial_target(id, [addr, hint], self.0.env.discovery || live)
             .ok_or_else(|| NodeError::Iroh("no known address for peer".into()))?;
         match timeout(limit, self.0.env.endpoint.connect(target, alpn)).await {
             Ok(Ok(c)) => Ok(c),

@@ -89,6 +89,9 @@ pub struct WakeOutcome {
     pub timed_out: bool,
 }
 
+/// How long `set_info`/`set_tags_of` wait for the membership snapshot to show their write.
+const INFO_VISIBLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A running mesh node. Call [`Node::shutdown`] to stop it; dropping it only cancels its
 /// tasks.
 pub struct Node {
@@ -983,9 +986,7 @@ impl Node {
             tags: tags.unwrap_or(cur.tags),
         };
         info.validate()?;
-        self.store()
-            .set(MESH_NS, &info_key(&me), encode_info(&info))
-            .await
+        self.write_info_and_wait(me, info).await
     }
 
     /// Replaces the tags of member `id` (any member may change tags).
@@ -1003,9 +1004,37 @@ impl Node {
         };
         info.tags = tags;
         info.validate()?;
+        self.write_info_and_wait(id, info).await
+    }
+
+    /// Writes `info/<id>` and waits (bounded by [`INFO_VISIBLE_TIMEOUT`]) until the membership
+    /// snapshot shows it, so `members()` reads its own write. A timeout or shutdown is not an
+    /// error: the store write already succeeded.
+    async fn write_info_and_wait(&self, id: NodeId, info: MemberInfo) -> Result<(), NodeError> {
+        // Subscribe before the write so the reactor's update cannot be missed.
+        let mut rx = self.inner.membership.subscribe();
         self.store()
             .set(MESH_NS, &info_key(&id), encode_info(&info))
-            .await
+            .await?;
+        let visible = async {
+            loop {
+                if rx.borrow_and_update().info(&id) == Some(&info) {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        };
+        tokio::select! {
+            _ = self.inner.cancel.cancelled() => {}
+            r = timeout(INFO_VISIBLE_TIMEOUT, visible) => {
+                if r.is_err() {
+                    warn!(member = ?id, "membership did not show the info write in time");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stops every task, closes every connection and the endpoint, and releases the store

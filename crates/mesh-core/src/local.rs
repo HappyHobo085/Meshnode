@@ -1,5 +1,5 @@
-//! Node-local files in the data directory: `node.key`, `mesh.json`, `invites.json`,
-//! `rebootstrap.bin` and `expired-edits.bin`.
+//! Node-local files in the data directory: `node.key`, `mesh.json`, `role.json`,
+//! `invites.json`, `rebootstrap.bin` and `expired-edits.bin`.
 //!
 //! `node.key` is the raw 32-byte signing seed, readable by its owner only (spec §3.1): on Unix
 //! it is created with mode 0600; on Windows it gets a protected DACL (nothing inherited from
@@ -20,6 +20,7 @@ use crate::error::NodeError;
 
 const KEY_FILE: &str = "node.key";
 const GENESIS_FILE: &str = "mesh.json";
+const ROLE_FILE: &str = "role.json";
 const INVITES_FILE: &str = "invites.json";
 const REBOOTSTRAP_FILE: &str = "rebootstrap.bin";
 const EXPIRED_FILE: &str = "expired-edits.bin";
@@ -184,6 +185,51 @@ pub fn remove_genesis(dir: &Path) -> Result<(), NodeError> {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct RoleFile {
+    /// `"host"` or `"client"`.
+    joined_as: String,
+}
+
+/// Records the role this node entered the mesh with (`role.json`): the founder a host, a
+/// joiner its ticket's role. Written before `mesh.json`, so a node always knows whether its
+/// store is partial (sub-spec 8a §3), even before its own `members` record has arrived.
+/// A role upgrade (client to host) rewrites it as `host` once its Full rebuild is done.
+pub fn write_own_role(dir: &Path, role: Role) -> Result<(), NodeError> {
+    let f = RoleFile {
+        joined_as: match role {
+            Role::Host => "host",
+            Role::Client => "client",
+        }
+        .to_owned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&f).map_err(|e| bad_file(e.to_string()))?;
+    atomic_write(&dir.join(ROLE_FILE), &bytes)
+}
+
+/// `Ok(None)` when `role.json` does not exist.
+pub fn read_own_role(dir: &Path) -> Result<Option<Role>, NodeError> {
+    let bytes = match std::fs::read(dir.join(ROLE_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let f: RoleFile = serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+    match f.joined_as.as_str() {
+        "host" => Ok(Some(Role::Host)),
+        "client" => Ok(Some(Role::Client)),
+        other => Err(bad_file(format!("unknown role `{other}` in {ROLE_FILE}"))),
+    }
+}
+
+/// Deletes `role.json` (no error if it is already gone).
+pub fn remove_own_role(dir: &Path) -> Result<(), NodeError> {
+    match std::fs::remove_file(dir.join(ROLE_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InviteEntry {
     pub role: Role,
@@ -298,6 +344,10 @@ pub struct RebootstrapFile {
     pub expired: Vec<SignedOp>,
     /// Effective members (but this node) with their last known address.
     pub peers: Vec<(NodeId, NodeAddrBytes)>,
+    /// A role upgrade (sub-spec 8a §3): the store was Partial and is rebuilt as Full. The
+    /// rebuild announces `Full`, and on completion the scope flips to Full and `role.json`
+    /// says `host`.
+    pub full: bool,
 }
 
 /// Writes `rebootstrap.bin` atomically (temp file, fsync, rename).

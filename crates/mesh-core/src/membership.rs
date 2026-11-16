@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use mesh_proto::{MemberInfo, MeshGenesis, NodeAddrBytes, NodeId, OpBody, RemovalRecord, Role};
+use mesh_proto::{
+    MemberInfo, MeshGenesis, NodeAddrBytes, NodeId, OpBody, RemovalRecord, Role, Scope,
+};
 use mesh_store::{Acceptor, ReadView, StoreError, Verdict};
 use tracing::warn;
 
@@ -65,6 +67,38 @@ pub struct MeshAcceptor {
 impl MeshAcceptor {
     pub fn new(genesis: MeshGenesis) -> Self {
         MeshAcceptor { genesis }
+    }
+
+    /// `id`'s role in `_mesh` as [`MembershipSnapshot::role`] derives it (the founder is
+    /// a host; host outranks client), without loading the whole snapshot. `None` if `id`
+    /// is not listed (yet). Blocking.
+    pub fn role_of(&self, store: &CoreStore, id: &NodeId) -> Result<Option<Role>, StoreError> {
+        if *id == self.genesis.founder {
+            return Ok(Some(Role::Host));
+        }
+        for role in [Role::Host, Role::Client] {
+            if store.set_contains(MESH_NS, MEMBERS, &member_bytes(id, role))? {
+                return Ok(Some(role));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Whether the `removed` set holds a removal record of `id` (any cutoff). Blocking; reads
+/// the whole set, so callers use it only on rare paths.
+pub fn is_removed(store: &CoreStore, id: &NodeId) -> Result<bool, StoreError> {
+    Ok(all_members(store, REMOVED)?
+        .iter()
+        .any(|raw| postcard::from_bytes::<RemovalRecord>(raw).is_ok_and(|rec| rec.node_id == *id)))
+}
+
+/// The replication scope of a member with `role` (sub-spec 8a §3): a client replicates
+/// only `_mesh`, a host everything.
+pub fn scope_of_role(role: Role) -> Scope {
+    match role {
+        Role::Host => Scope::Full,
+        Role::Client => Scope::client(),
     }
 }
 

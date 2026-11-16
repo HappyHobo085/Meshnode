@@ -1,0 +1,23 @@
+[package]
+name = "mesh-forward"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Placement, manifest reads and remote `httpfwd` forwarding, without the WASM runtime, the
+# services crate or an HTTP server: what a thin client links. `tests/no_runtime_deps.rs`
+# keeps it that way.
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-proto = { path = "../mesh-proto" }
+bytes.workspace = true
+http.workspace = true
+iroh.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Test-only helpers: forward and connection counters, host order override.
+test-hooks = []

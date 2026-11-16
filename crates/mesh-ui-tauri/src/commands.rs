@@ -147,6 +147,11 @@ pub async fn config_set(
 }
 
 #[tauri::command]
+pub async fn declare_fresh(ui: State<'_, Ui>) -> Result<(), UiError> {
+    ui.declare_fresh().await
+}
+
+#[tauri::command]
 pub async fn reset_identity(ui: State<'_, Ui>) -> Result<StatusDto, UiError> {
     ui.reset_identity().await
 }

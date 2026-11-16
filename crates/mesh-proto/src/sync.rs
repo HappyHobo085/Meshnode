@@ -21,12 +21,66 @@ impl VersionVector {
     }
 }
 
+/// Which namespaces a sync peer replicates.
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Scope {
+    /// Everything (a full node).
+    Full,
+    /// Only the listed namespaces.
+    Partial(Vec<String>),
+}
+
+impl Scope {
+    /// The scope of a mesh client: only the `_mesh` namespace.
+    pub fn client() -> Scope {
+        Scope::Partial(vec!["_mesh".to_string()])
+    }
+
+    /// Whether namespace `ns` is replicated under this scope.
+    pub fn admits(&self, ns: &str) -> bool {
+        match self {
+            Scope::Full => true,
+            Scope::Partial(list) => list.iter().any(|n| n == ns),
+        }
+    }
+}
+
+/// How recent a sync peer's data is, announced in `Hello` (spec §7, sub-spec 8a C1b).
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Freshness {
+    /// A full sync within the staleness window: a source a stale node may restore from.
+    Fresh,
+    /// No full sync for longer than the staleness window (its last one at `since_ms`), or
+    /// re-bootstrapping. Never a restore source.
+    Stale { since_ms: u64 },
+    /// Has never completed a full sync (a new store): nothing to restore from, and nothing
+    /// that could resurrect data either.
+    Empty,
+}
+
 #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum SyncMsg {
-    Hello { mesh: MeshId, vv: VersionVector },
-    Ops { ops: Vec<SignedOp> },
-    Covered { origin: NodeId, upto: u64 },
+    Hello {
+        mesh: MeshId,
+        vv: VersionVector,
+        scope: Scope,
+        /// Whether the sender's data can be trusted as recent (spec §7, sub-spec 8a C1b).
+        freshness: Freshness,
+    },
+    Ops {
+        ops: Vec<SignedOp>,
+    },
+    Covered {
+        origin: NodeId,
+        upto: u64,
+    },
     Done,
+    /// The sender now holds `vv` (it only grows): raises the bound the receiver checks
+    /// `Covered` markers against, without starting a round. Sent in live mode before a
+    /// marker above what the sender's `Hello` announced.
+    Advertise {
+        vv: VersionVector,
+    },
 }
 
 /// Splits ops into `SyncMsg::Ops` batches of at most 256 ops and 1 MiB (sum of encoded op sizes).
@@ -75,6 +129,26 @@ mod tests {
             },
             k,
         )
+    }
+
+    #[test]
+    fn hello_with_scope_roundtrips() {
+        for scope in [Scope::Full, Scope::client()] {
+            let m = SyncMsg::Hello {
+                mesh: MeshId([7; 32]),
+                vv: VersionVector::default(),
+                scope,
+                freshness: Freshness::Stale { since_ms: 9 },
+            };
+            assert_eq!(crate::decode::<SyncMsg>(&crate::encode(&m)).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn scope_admits() {
+        assert!(Scope::Full.admits("anything"));
+        assert!(Scope::client().admits("_mesh"));
+        assert!(!Scope::client().admits("other"));
     }
 
     fn sizes(v: &[SyncMsg]) -> Vec<usize> {

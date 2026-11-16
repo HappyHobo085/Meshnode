@@ -4,13 +4,16 @@ mod common;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::{Mesh, Serve, T, dispatch, fixture, mesh, split, wait_for, wait_kv, wait_ready};
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_core::{AcceptError, Connection, ProtocolHandler};
+use mesh_gateway::{ForwardError, RemoteForwarder};
 use mesh_proto::{
-    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, NodeId, Placement, Role,
+    ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, Limits, NodeId, Placement,
+    Role,
 };
 use mesh_services::{DeployOpts, LocalState};
 use tokio::time::timeout;
@@ -291,6 +294,8 @@ enum Answer {
     Reset,
     /// Records the request; answers 200 with hop-by-hop headers and `x-custom`.
     Record(Arc<Mutex<Vec<ForwardRequest>>>),
+    /// Reads the request and never answers (the stream stays open for a minute).
+    Hang,
 }
 
 #[derive(Debug)]
@@ -316,6 +321,13 @@ impl ProtocolHandler for Raw {
                 }
                 Answer::Reset => {
                     let _ = send.reset(7u32.into());
+                    continue;
+                }
+                Answer::Hang => {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        drop(send);
+                    });
                     continue;
                 }
                 Answer::Record(log) => {
@@ -493,6 +505,102 @@ async fn online_host_failing_at_connect_then_next_serves() {
     assert_eq!(mesh.fwd(1).attempts(), 2);
     assert_eq!(mesh.fwd(1).connects(), 1, "only C was connected");
     assert_eq!(mesh.served(2), 1, "C served it");
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_reports_timeout_once_a_reached_host_never_answers() {
+    // Ruling R11: A accepts the request and never answers; C serves no `httpfwd`.
+    let mesh = mesh(vec![
+        (Role::Host, raw(Answer::Hang)),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Nothing),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    mesh.svcs(0)
+        .deploy_wasm(
+            COUNTER,
+            Bytes::from(fixture(COUNTER)),
+            DeployOpts {
+                limits: Limits {
+                    request_timeout_ms: 100,
+                    ..Limits::default()
+                },
+                placement: Placement::Nodes(vec![a]),
+                ..DeployOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    wait_manifest(&mesh, 1).await;
+    let remote = RemoteForwarder::new(mesh.m[1].node.handle());
+    let forward = || async {
+        timeout(
+            T,
+            remote.forward(COUNTER, common::get(COUNTER, "/"), Duration::ZERO),
+        )
+        .await
+        .expect("forward timed out")
+    };
+    // Every attempt timed out.
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::Timeout(_))), "{r:?}");
+    // The gateway still answers 502.
+    assert_eq!(
+        dispatch(mesh.fwd(1), COUNTER, "/").await,
+        (502, "No host could serve counter".into())
+    );
+
+    // One attempt failed to connect, one timed out: a host was reached.
+    set_nodes(&mesh, vec![a, c]).await;
+    remote.try_first(vec![c, a]);
+    let attempts = remote.attempts();
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::Timeout(_))), "{r:?}");
+    assert_eq!(remote.attempts(), attempts + 2);
+
+    // Every attempt failed to connect.
+    set_nodes(&mesh, vec![c]).await;
+    let r = forward().await;
+    assert!(matches!(r, Err(ForwardError::NoHost)), "{r:?}");
+    mesh.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_connect_moves_on_after_the_connect_cap() {
+    // Ruling R15 M6: A is listed online but dialing it hangs; C serves. The attempt's
+    // limit is 10 s (the default service timeout, no slack), the connect cap 5 s.
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    let (a, c) = (mesh.id(0), mesh.id(2));
+    deploy_counter(&mesh, Placement::Nodes(vec![a, c])).await;
+    wait_active(&mesh, 2).await;
+    wait_manifest(&mesh, 1).await;
+    let remote = RemoteForwarder::new(mesh.m[1].node.handle());
+    remote.try_first(vec![a, c]);
+    remote.hang_connect_to(vec![a]);
+    let start = tokio::time::Instant::now();
+    let resp = timeout(
+        Duration::from_secs(8),
+        remote.forward(COUNTER, common::get(COUNTER, "/"), Duration::ZERO),
+    )
+    .await
+    .expect("failover took the whole attempt limit")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        start.elapsed() >= Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(remote.attempts(), 2);
+    assert_eq!(mesh.served(0), 0);
+    assert_eq!(mesh.served(2), 1);
     mesh.shutdown().await;
 }
 
@@ -677,5 +785,61 @@ async fn activity_start_end_balanced_on_success_error_and_timeout() {
         send.reset(7u32.into()).unwrap();
     }
     wait_for("five balanced streams", || async { counts() == (5, 5) }).await;
+    mesh.shutdown().await;
+}
+
+/// Sub-spec 8a §3 / ruling R8 (M3): a host whose store is not a full replica yet (a client
+/// upgrading to host, still Partial or re-bootstrapping) forwards instead of serving from
+/// it, although it is placed and active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_store_forwards_although_listed_as_host() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+    ])
+    .await;
+    deploy_counter(&mesh, Placement::AllHosts).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
+    wait_active(&mesh, 1).await;
+    // Test hook: B's store is Partial (as while an upgrade has not rebuilt it).
+    mesh.m[1]
+        .node
+        .store()
+        .inner()
+        .set_scope(mesh_proto::Scope::client());
+    assert_eq!(dispatch(mesh.fwd(1), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.fwd(1).attempts(), 1, "forwarded, not served from B");
+    assert_eq!(mesh.served(0), 1);
+    mesh.shutdown().await;
+}
+
+/// Ruling R9: a host whose store is not a full replica (here Partial, as for a client
+/// re-invited as a host before its rebuild) answers forwarded requests with the retryable
+/// `503 Node re-bootstrapping`, not from its store, and the forwarder fails over to the
+/// next host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarder_fails_over_from_a_host_that_is_not_full() {
+    let mesh = mesh(vec![
+        (Role::Host, Serve::Attached),
+        (Role::Host, Serve::Attached),
+        (Role::Client, Serve::Attached),
+    ])
+    .await;
+    deploy_counter(&mesh, Placement::AllHosts).await;
+    wait_ready(mesh.svcs(0), COUNTER, 1).await;
+    wait_active(&mesh, 1).await;
+    wait_manifest(&mesh, 2).await;
+    // Test hook: B's store is Partial.
+    mesh.m[1]
+        .node
+        .store()
+        .inner()
+        .set_scope(mesh_proto::Scope::client());
+    mesh.fwd(2).try_first(vec![mesh.id(1), mesh.id(0)]);
+    assert_eq!(dispatch(mesh.fwd(2), COUNTER, "/").await, (200, "1".into()));
+    assert_eq!(mesh.served(1), 1, "B answered (with the retryable 503)");
+    assert_eq!(mesh.served(0), 1, "A served it");
+    assert_eq!(mesh.fwd(2).attempts(), 2);
+    wait_kv(&mesh.m[0].node, COUNTER, "n", "1").await;
     mesh.shutdown().await;
 }

@@ -1,0 +1,1047 @@
+//! Staleness and re-bootstrap with client-role members (spec §7 with sub-spec 8a §3,
+//! ruling C1c): a round with a Fresh peer (host or client) refreshes a node's last full
+//! sync; staleness never blocks syncing; the only reset is a stale node meeting a Fresh
+//! Full peer; an Empty (never synced) node turns Fresh only through a Fresh peer and
+//! inherits staleness from a Stale one. A re-bootstrap completes only after a pull from
+//! a Full peer.
+
+mod common;
+
+use std::time::Duration;
+
+use common::{T, converged, test_cfg, wait_until};
+use mesh_core::{Node, NodeEvent, NodeStatus};
+use mesh_hlc::ManualClock;
+use mesh_proto::{InviteTicket, NodeId, Role, VersionVector};
+use tempfile::TempDir;
+use tokio::sync::broadcast;
+use tokio::time::{sleep, timeout};
+
+const TTL: Duration = Duration::from_secs(900);
+const DAY: u64 = 86_400_000;
+const NS: &str = "svc";
+
+fn now_of(c: &ManualClock) -> u64 {
+    mesh_hlc::WallClock::now_ms(c)
+}
+
+async fn vv_of(n: &Node) -> VersionVector {
+    n.store().call(|s| s.version_vector()).await.unwrap()
+}
+
+async fn val(n: &Node, key: &str) -> Option<Vec<u8>> {
+    n.store().get(NS, key).await.unwrap()
+}
+
+async fn last_full_sync(n: &Node) -> Option<u64> {
+    n.store().call(|s| s.last_full_sync_ms()).await.unwrap()
+}
+
+async fn is_stale(n: &Node) -> bool {
+    n.store().call(|s| s.is_stale()).await.unwrap()
+}
+
+async fn full_sync_since(n: &Node, ms: u64) {
+    wait_until("a full sync", T, || async {
+        last_full_sync(n).await.is_some_and(|t| t >= ms)
+    })
+    .await;
+}
+
+async fn join(
+    dir: &TempDir,
+    name: &str,
+    clock_at: u64,
+    ticket: InviteTicket,
+) -> (Node, ManualClock) {
+    let (cfg, clock) = test_cfg(dir.path(), name);
+    clock.set(clock_at);
+    let n = timeout(T, Node::join(cfg, ticket))
+        .await
+        .expect("join timed out")
+        .expect("join");
+    assert!(n.wait_first_sync(T).await);
+    (n, clock)
+}
+
+fn id_of(dir: &TempDir) -> NodeId {
+    NodeId(
+        mesh_core::local::load_or_create_key(dir.path())
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
+/// Hosts A (founder), B and D, client C, on one shared clock ("day 0"), converged.
+struct Quad {
+    a: Node,
+    b: Node,
+    c: Node,
+    d: Node,
+    /// a, b, c, d
+    clocks: [ManualClock; 4],
+    dirs: Vec<TempDir>,
+    day0: u64,
+}
+
+async fn quad() -> Quad {
+    let dirs: Vec<TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let (b, cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    let (d, cd) = join(
+        &dirs[3],
+        "d",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    let (c, cc) = join(
+        &dirs[2],
+        "c",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    converged(&[&a, &b, &d], T).await;
+    Quad {
+        a,
+        b,
+        c,
+        d,
+        clocks: [ca, cb, cc, cd],
+        dirs,
+        day0,
+    }
+}
+
+impl Quad {
+    fn set_day(&self, day: u64) {
+        for c in &self.clocks {
+            c.set(self.day0 + day * DAY);
+        }
+    }
+
+    /// A and its client C lose the hosts B and D, and 81 days pass with B and D syncing
+    /// (fresh). A and C are kept apart while the clock moves (a round between them would
+    /// refresh both), then reconnected: both stale. C keeps refusing B and D, so the only
+    /// way back to a Fresh peer is through B or D healing (they shut A out until then).
+    async fn age_a(&self) {
+        let (ia, ib, ic, id) = (
+            self.a.node_id(),
+            self.b.node_id(),
+            self.c.node_id(),
+            self.d.node_id(),
+        );
+        full_sync_since(&self.a, self.day0).await;
+        self.a.partition(&[ib, id, ic]);
+        self.c.partition(&[ia, ib, id]);
+        self.b.partition(&[ia, ic]);
+        self.d.partition(&[ia, ic]);
+        wait_until("A and C cut off", T, || async {
+            !self.a.members().iter().any(|m| m.id != ia && m.online)
+                && !self.c.members().iter().any(|m| m.id != ic && m.online)
+        })
+        .await;
+        // A round that completed just before the cut-off may still be recording its full
+        // sync: let that land before the clock moves.
+        sleep(Duration::from_millis(500)).await;
+        let (sa, sc) = (last_full_sync(&self.a).await, last_full_sync(&self.c).await);
+        for day in [40, 81] {
+            self.set_day(day);
+            full_sync_since(&self.b, self.day0 + day * DAY).await;
+            full_sync_since(&self.d, self.day0 + day * DAY).await;
+        }
+        assert_eq!(
+            last_full_sync(&self.a).await,
+            sa,
+            "A refreshed while cut off"
+        );
+        assert_eq!(
+            last_full_sync(&self.c).await,
+            sc,
+            "C refreshed while cut off"
+        );
+        assert!(is_stale(&self.a).await, "A stale");
+        assert!(is_stale(&self.c).await, "C stale");
+        assert!(!is_stale(&self.b).await && !is_stale(&self.d).await);
+        self.a.heal();
+        self.c.heal();
+        self.c.partition(&[ib, id]);
+    }
+}
+
+/// Some more completed rounds between `n` and `peer`.
+async fn more_rounds(n: &Node, peer: NodeId, k: u64) {
+    let r0 = n.handle().rounds_with_for_test(peer);
+    wait_until("more rounds", T, || async {
+        n.sync_now();
+        n.handle().rounds_with_for_test(peer) >= r0 + k
+    })
+    .await;
+}
+
+fn saw_rebootstrap(rx: &mut broadcast::Receiver<NodeEvent>) -> bool {
+    let mut seen = false;
+    while let Ok(ev) = rx.try_recv() {
+        seen |= matches!(ev, NodeEvent::RebootstrapStarting);
+    }
+    seen
+}
+
+async fn wait_rebootstrap_done(rx: &mut broadcast::Receiver<NodeEvent>) {
+    timeout(T, async {
+        loop {
+            match rx.recv().await {
+                Ok(NodeEvent::RebootstrapDone) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("RebootstrapDone");
+}
+
+async fn sees_name(n: &Node, who: NodeId, name: &str) -> bool {
+    n.members()
+        .iter()
+        .any(|m| m.id == who && m.info.as_ref().is_some_and(|i| i.name == name))
+}
+
+/// Ruling C1c: a lone host with clients stays Fresh through them (each round with a
+/// Fresh peer refreshes), however long it runs; nothing resets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lone_host_with_clients_stays_fresh() {
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let (c1, cc1) = join(
+        &dirs[1],
+        "c1",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    let (c2, cc2) = join(
+        &dirs[2],
+        "c2",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    a.store().set(NS, "k", b"v".to_vec()).await.unwrap();
+    let mut ea = a.subscribe();
+    for day in (10..=90).step_by(10) {
+        for c in [&ca, &cc1, &cc2] {
+            c.set(day0 + day * DAY);
+        }
+        more_rounds(&a, c1.node_id(), 2).await;
+        more_rounds(&a, c2.node_id(), 2).await;
+    }
+    assert!(!is_stale(&a).await, "A stays fresh through its clients");
+    assert!(last_full_sync(&a).await.unwrap() >= day0 + 90 * DAY);
+    assert!(!is_stale(&c1).await && !is_stale(&c2).await);
+    assert!(!saw_rebootstrap(&mut ea));
+    assert_eq!(val(&a, "k").await, Some(b"v".to_vec()));
+    for n in [a, c1, c2] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1c: a stale host A with a (stale) client keeps its data and syncs on, also
+/// across a restart; when a Fresh Full host is back, A re-bootstraps from it and ends with
+/// all the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_resets_only_on_a_fresh_host_and_keeps_all_data() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad {
+        a,
+        b,
+        c,
+        d,
+        clocks,
+        dirs,
+        ..
+    } = t;
+    let mut events = a.subscribe();
+
+    more_rounds(&a, c.node_id(), 3).await;
+    assert!(
+        is_stale(&a).await,
+        "a round with a stale client refreshes nothing"
+    );
+    assert_eq!(a.status(), NodeStatus::Running);
+    assert_eq!(val(&a, "b-data").await, Some(b"2".to_vec()));
+    a.store().set(NS, "a-late", b"3".to_vec()).await.unwrap();
+    a.set_info(Some("a-stale".into()), None).await.unwrap();
+    wait_until("C sees A's info", T, || async {
+        sees_name(&c, a.node_id(), "a-stale").await
+    })
+    .await;
+    assert!(!saw_rebootstrap(&mut events));
+
+    // A restart while stale does not reset either (B and D still shut A out).
+    let now = now_of(&clocks[0]);
+    timeout(T, a.shutdown()).await.unwrap();
+    let (cfg, clock_a) = test_cfg(dirs[0].path(), "a");
+    clock_a.set(now);
+    let a = Node::open(cfg).await.unwrap();
+    let mut events = a.subscribe();
+    more_rounds(&a, c.node_id(), 2).await;
+    assert!(is_stale(&a).await);
+    assert_eq!(a.status(), NodeStatus::Running);
+    assert!(!saw_rebootstrap(&mut events));
+
+    // A Fresh host comes back: A re-bootstraps from it and keeps everything.
+    b.heal();
+    d.heal();
+    wait_rebootstrap_done(&mut events).await;
+    assert_eq!(a.status(), NodeStatus::Running);
+    converged(&[&a, &b, &d], T).await;
+    for k in ["a-synced", "b-data", "a-late"] {
+        assert!(val(&a, k).await.is_some(), "{k} after the re-bootstrap");
+        assert!(val(&b, k).await.is_some(), "{k} on B");
+    }
+    assert!(!is_stale(&a).await);
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1c: two stale hosts sync with each other as usual; both stay stale and
+/// neither resets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_stale_hosts_sync_and_neither_resets() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let (b, cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    a.store().set(NS, "from-a", b"1".to_vec()).await.unwrap();
+    b.store().set(NS, "from-b", b"2".to_vec()).await.unwrap();
+    converged(&[&a, &b], T).await;
+    full_sync_since(&a, day0).await;
+    full_sync_since(&b, day0).await;
+    let (ia, ib) = (a.node_id(), b.node_id());
+    a.partition(&[ib]);
+    b.partition(&[ia]);
+    wait_until("apart", T, || async {
+        !a.members().iter().any(|m| m.id == ib && m.online)
+    })
+    .await;
+    for c in [&ca, &cb] {
+        c.set(day0 + 81 * DAY);
+    }
+    assert!(is_stale(&a).await && is_stale(&b).await);
+    let (mut ea, mut eb) = (a.subscribe(), b.subscribe());
+    a.heal();
+    b.heal();
+    a.store().set(NS, "a-later", b"3".to_vec()).await.unwrap();
+    b.store().set(NS, "b-later", b"4".to_vec()).await.unwrap();
+    converged(&[&a, &b], T).await;
+    more_rounds(&a, ib, 2).await;
+    for (n, e) in [(&a, &mut ea), (&b, &mut eb)] {
+        assert!(
+            !saw_rebootstrap(e),
+            "a stale host must not reset from a stale host"
+        );
+        assert!(is_stale(n).await, "a stale peer refreshes nothing");
+        assert_eq!(n.status(), NodeStatus::Running);
+        for k in ["from-a", "from-b", "a-later", "b-later"] {
+            assert!(val(n, k).await.is_some(), "{k}");
+        }
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Ruling C1c: two new (Empty) hosts join a stale host A in parallel. A never resets, both
+/// new hosts end Stale (an Empty pair refreshes nothing), and all three keep syncing.
+/// When a Fresh host is back, all re-bootstrap from it and keep their data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_and_two_new_hosts_joining_in_parallel() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let now = now_of(&t.clocks[0]);
+    let Quad { a, b, c, d, .. } = t;
+    let mut ea = a.subscribe();
+
+    let (de, de2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ie, ie2) = (id_of(&de), id_of(&de2));
+    b.partition(&[a.node_id(), c.node_id(), ie, ie2]);
+    d.partition(&[a.node_id(), c.node_id(), ie, ie2]);
+    let (t1, t2) = (
+        a.invite(Role::Host, TTL).await.unwrap(),
+        a.invite(Role::Host, TTL).await.unwrap(),
+    );
+    let ((e, _), (e2, _)) = tokio::join!(join(&de, "e", now, t1), join(&de2, "e2", now, t2));
+    let (mut ee, mut ee2) = (e.subscribe(), e2.subscribe());
+    for n in [&e, &e2] {
+        wait_until("a new host has A's data", T, || async {
+            val(n, "a-synced").await.is_some() && val(n, "b-data").await.is_some()
+        })
+        .await;
+        wait_until("a new host reports stale", T, || async {
+            is_stale(n).await
+        })
+        .await;
+    }
+    // All three keep syncing.
+    e.store().set(NS, "e-data", b"5".to_vec()).await.unwrap();
+    e2.store().set(NS, "e2-data", b"6".to_vec()).await.unwrap();
+    a.store().set(NS, "a-late", b"7".to_vec()).await.unwrap();
+    converged(&[&a, &e, &e2], T).await;
+    more_rounds(&e, ie2, 2).await;
+    assert!(is_stale(&a).await && is_stale(&e).await && is_stale(&e2).await);
+    assert!(
+        !saw_rebootstrap(&mut ea),
+        "A must never reset from a new host"
+    );
+    assert!(!saw_rebootstrap(&mut ee) && !saw_rebootstrap(&mut ee2));
+    assert_eq!(a.status(), NodeStatus::Running);
+
+    // A Fresh host is back: everyone re-bootstraps from it and nothing is lost.
+    b.heal();
+    d.heal();
+    for ev in [&mut ea, &mut ee, &mut ee2] {
+        wait_rebootstrap_done(ev).await;
+    }
+    // A host that re-bootstrapped is Empty until a round with a Fresh peer; a round with a
+    // still-stale peer first (the client C, or a host not yet reset) makes it inherit
+    // staleness and re-bootstrap again. That settles once every stale node has reset.
+    wait_until("everyone fresh and running", T, || async {
+        let mut ok = true;
+        for n in [&a, &c, &e, &e2] {
+            ok &= n.status() == NodeStatus::Running && !is_stale(n).await;
+        }
+        ok
+    })
+    .await;
+    converged(&[&a, &b, &d, &e, &e2], T).await;
+    for n in [&a, &b, &e, &e2] {
+        for k in ["a-synced", "b-data", "e-data", "e2-data", "a-late"] {
+            assert!(val(n, k).await.is_some(), "{k} missing");
+        }
+    }
+    for n in [a, b, c, d, e, e2] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling I2: a re-bootstrap that got its own ops back from a client alone does not
+/// complete; it waits for a pull from a Full peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebootstrap_completes_only_after_a_full_round() {
+    let t = quad().await;
+    // A writes only `_mesh` (its own ops all come back from the client); B has service data.
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad { a, b, c, d, .. } = t;
+    let (ia, ib) = (a.node_id(), b.node_id());
+    let mut events = a.subscribe();
+
+    // B (fresh) triggers the re-bootstrap, then vanishes before the reset.
+    a.hold_rebootstrap_before_reset(true);
+    b.heal();
+    b.partition(&[c.node_id()]);
+    wait_until("A is re-bootstrapping", T, || async {
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    a.partition(&[ib]);
+    b.partition(&[ia]);
+    let NodeStatus::Rebootstrapping {
+        waiting_for_self_seq: s,
+    } = a.status()
+    else {
+        panic!("not re-bootstrapping");
+    };
+    a.hold_rebootstrap_before_reset(false);
+    // The client gives A's own (`_mesh`) ops back...
+    wait_until("A's own ops back from C", T, || async {
+        vv_of(&a).await.get(&ia) >= s && a.members().iter().any(|m| m.id == ia)
+    })
+    .await;
+    // ...but without a pull from a Full peer A stays re-bootstrapping.
+    for _ in 0..10 {
+        a.sync_now();
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. }),
+        "completed without a Full peer: {:?}",
+        a.status()
+    );
+    assert_eq!(val(&a, "b-data").await, None);
+
+    a.heal();
+    b.heal();
+    wait_rebootstrap_done(&mut events).await;
+    assert_eq!(val(&a, "b-data").await, Some(b"2".to_vec()));
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling I3: a live `_mesh` write after out-of-scope writes reaches a client at once, in
+/// live mode (no round), with nothing parked in the client's pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_mesh_write_after_svc_writes_reaches_client_at_once() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let hour = Duration::from_secs(3600);
+    let quiet = |dir: &std::path::Path, name: &str| {
+        let (mut cfg, clock) = test_cfg(dir, name);
+        cfg.timings.sync_interval = hour;
+        cfg.timings.silence = hour;
+        (cfg, clock)
+    };
+    let a = Node::create_mesh(quiet(dirs[0].path(), "a").0)
+        .await
+        .unwrap();
+    let ticket = a.invite(Role::Client, TTL).await.unwrap();
+    let c = timeout(T, Node::join(quiet(dirs[1].path(), "c").0, ticket))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(c.wait_first_sync(T).await);
+    let ia = a.node_id();
+    wait_until("C caught up", T, || async {
+        vv_of(&c).await.get(&ia) >= vv_of(&a).await.get(&ia)
+    })
+    .await;
+    // Rounds from the join (first sync, the end of the provisional phase) settle first.
+    let count = || {
+        (
+            a.handle().rounds_with_for_test(c.node_id()),
+            c.handle().rounds_with_for_test(ia),
+        )
+    };
+    let mut rounds = count();
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let now = count();
+        if now == rounds {
+            break;
+        }
+        rounds = now;
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            a.store()
+                .set(NS, &format!("k{i}{j}"), b"v".to_vec())
+                .await
+                .unwrap();
+        }
+        a.set_info(Some(format!("a{i}")), None).await.unwrap();
+        let want = format!("a{i}");
+        wait_until(
+            "C sees the live `_mesh` write",
+            Duration::from_secs(5),
+            || async {
+                c.members()
+                    .iter()
+                    .any(|m| m.id == ia && m.info.as_ref().is_some_and(|x| x.name == want))
+            },
+        )
+        .await;
+    }
+    // Nothing waits in C's pending: its vector has every op of A.
+    assert_eq!(vv_of(&c).await.get(&ia), vv_of(&a).await.get(&ia));
+    assert_eq!(
+        rounds,
+        (
+            a.handle().rounds_with_for_test(c.node_id()),
+            c.handle().rounds_with_for_test(ia)
+        ),
+        "no round ran: this was live push"
+    );
+    a.shutdown().await;
+    c.shutdown().await;
+}
+
+/// Ruling A2: a stale client and a stale host (its only host) keep syncing `_mesh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_client_and_stale_host_keep_syncing() {
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let (b, _cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    let (c, cc) = join(
+        &dirs[2],
+        "c",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    full_sync_since(&a, day0).await;
+    full_sync_since(&c, day0).await;
+    let (ia, ib, ic) = (a.node_id(), b.node_id(), c.node_id());
+    // Apart while the clock jumps (no round may straddle it), B gone for good.
+    a.partition(&[ib, ic]);
+    c.partition(&[ib, ia]);
+    b.partition(&[ia, ic]);
+    wait_until("A and C apart", T, || async {
+        !a.members().iter().any(|m| m.id == ic && m.online)
+            && !c.members().iter().any(|m| m.id == ia && m.online)
+    })
+    .await;
+    // A round that completed just before the cut-off may still be recording its full
+    // sync: let that land before the clock moves (as in `age_a`).
+    sleep(Duration::from_millis(500)).await;
+    for clock in [&ca, &cc] {
+        clock.set(day0 + 81 * DAY);
+    }
+    assert!(is_stale(&a).await, "A stale");
+    assert!(is_stale(&c).await, "C stale");
+    a.heal();
+    c.heal();
+    a.partition(&[ib]);
+    c.partition(&[ib]);
+    // Rounds between them: neither refreshes the other.
+    more_rounds(&a, ic, 1).await;
+    assert!(is_stale(&a).await && is_stale(&c).await);
+    let (mut ea, mut ec) = (a.subscribe(), c.subscribe());
+    a.set_info(Some("a-later".into()), None).await.unwrap();
+    wait_until("C sees A's write", T, || async {
+        c.members()
+            .iter()
+            .any(|m| m.id == ia && m.info.as_ref().is_some_and(|i| i.name == "a-later"))
+    })
+    .await;
+    c.set_info(Some("c-later".into()), None).await.unwrap();
+    wait_until("A sees C's write", T, || async {
+        a.members()
+            .iter()
+            .any(|m| m.id == ic && m.info.as_ref().is_some_and(|i| i.name == "c-later"))
+    })
+    .await;
+    more_rounds(&c, ia, 2).await;
+    assert!(!saw_rebootstrap(&mut ea) && !saw_rebootstrap(&mut ec));
+    for n in [a, b, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1d: a stale host is not refreshed by a client that is Fresh only through
+/// another host (whose GC'd deletions the stale data could bring back); it stays Stale
+/// until it resets from that Fresh host, and then has all the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_not_refreshed_by_client_fresh_via_other_host() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad { a, b, c, d, .. } = t;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    let mut ea = a.subscribe();
+
+    // C reaches the Fresh hosts (they keep shutting A out) and turns Fresh through them.
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    wait_until("C fresh through B", T, || async { !is_stale(&c).await }).await;
+    // A keeps syncing with that Fresh client, and stays stale.
+    more_rounds(&a, ic, 3).await;
+    assert!(is_stale(&a).await, "a client cannot rescue a stale host");
+    assert!(!saw_rebootstrap(&mut ea));
+    assert_eq!(val(&a, "b-data").await, Some(b"2".to_vec()));
+    a.store().set(NS, "a-late", b"3".to_vec()).await.unwrap();
+
+    // A meets B: it resets from it and ends with all the data.
+    b.heal();
+    d.heal();
+    wait_rebootstrap_done(&mut ea).await;
+    converged(&[&a, &b, &d], T).await;
+    for k in ["a-synced", "b-data", "a-late"] {
+        assert!(val(&a, k).await.is_some(), "{k} on A");
+        assert!(val(&b, k).await.is_some(), "{k} on B");
+    }
+    assert!(!is_stale(&a).await);
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling C1e: a new host E that meets a Fresh client before it meets the stale host A
+/// stays Empty (a client round never makes a host Fresh), so A never resets from E; E then
+/// takes A's data and its staleness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_host_and_new_host_that_meets_fresh_client_first() {
+    let t = quad().await;
+    t.a.store()
+        .set(NS, "a-synced", b"1".to_vec())
+        .await
+        .unwrap();
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let now = now_of(&t.clocks[0]);
+    let Quad { a, b, c, d, .. } = t;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    let mut ea = a.subscribe();
+
+    // C turns Fresh through B (B and D keep shutting A out).
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    // C stays away from stale A from now on: ops it took from A would taint it (C1e) and
+    // make it re-bootstrap again while E is being invited.
+    c.partition(&[ia]);
+    let mut ec = c.subscribe();
+    // C re-bootstraps from B and comes back Fresh (a reset store is Empty meanwhile).
+    wait_until("C fresh through B", T, || async {
+        c.status() == NodeStatus::Running
+            && last_full_sync(&c).await.is_some()
+            && !is_stale(&c).await
+    })
+    .await;
+
+    // E, invited by the client, first meets only C.
+    let de = tempfile::tempdir().unwrap();
+    let ie = id_of(&de);
+    a.partition(&[ie]);
+    b.partition(&[ia, ie]);
+    d.partition(&[ia, ie]);
+    // Retried: a client's status and snapshot may lag a moment behind; a lasting failure
+    // dumps C's state.
+    let deadline = tokio::time::Instant::now() + T;
+    let ticket = loop {
+        match c.invite(Role::Host, TTL).await {
+            Ok(t) => break t,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                let mut starts = 0;
+                while let Ok(ev) = ec.try_recv() {
+                    starts += usize::from(matches!(ev, NodeEvent::RebootstrapStarting));
+                }
+                let me = c.members().into_iter().find(|m| m.id == ic);
+                panic!(
+                    "C cannot invite: {err:?}; status {:?}, RebootstrapStarting x{starts},                      self {:?}, last full sync {:?}, stale {}",
+                    c.status(),
+                    me.map(|m| (m.role, m.effective)),
+                    last_full_sync(&c).await,
+                    is_stale(&c).await,
+                );
+            }
+        }
+    };
+    let (e, _) = join(&de, "e", now, ticket).await;
+    more_rounds(&e, ic, 3).await;
+    assert_eq!(
+        last_full_sync(&e).await,
+        None,
+        "a client round leaves E Empty"
+    );
+
+    // E meets stale A: A does not reset from it; E takes A's data and its staleness. C
+    // (whose invite is done) meets A again, so A learns E's member record.
+    c.heal();
+    a.heal();
+    a.partition(&[b.node_id(), d.node_id()]);
+    wait_until("E has A's data", T, || async {
+        val(&e, "a-synced").await.is_some() && val(&e, "b-data").await.is_some()
+    })
+    .await;
+    wait_until("E stale", T, || async { is_stale(&e).await }).await;
+    more_rounds(&a, ie, 2).await;
+    assert!(!saw_rebootstrap(&mut ea), "A must not reset from E");
+    assert_eq!(a.status(), NodeStatus::Running);
+    assert!(is_stale(&a).await);
+    for n in [a, b, c, d, e] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Sub-spec 8a §3: a client's re-bootstrap for any other reason than a role upgrade (here:
+/// stale, meeting a Fresh host) asks for a scoped catch-up and leaves it a client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_rebootstrap_stays_partial() {
+    let t = quad().await;
+    t.b.store().set(NS, "b-data", b"2".to_vec()).await.unwrap();
+    converged(&[&t.a, &t.b, &t.d], T).await;
+    t.age_a().await;
+    let Quad {
+        a, b, c, d, dirs, ..
+    } = t;
+    let ia = a.node_id();
+    let mut ec = c.subscribe();
+    // C reaches the Fresh hosts (they keep shutting A out): it resets and rebuilds.
+    b.heal();
+    b.partition(&[ia]);
+    d.heal();
+    d.partition(&[ia]);
+    c.heal();
+    wait_rebootstrap_done(&mut ec).await;
+    wait_until("C fresh", T, || async {
+        c.status() == NodeStatus::Running && !is_stale(&c).await
+    })
+    .await;
+    assert_eq!(c.scope(), mesh_proto::Scope::client());
+    assert_eq!(
+        mesh_core::local::read_own_role(dirs[2].path()).unwrap(),
+        Some(Role::Client)
+    );
+    let sizes = c.store().call(|s| s.namespace_sizes()).await.unwrap();
+    assert!(
+        sizes.keys().all(|ns| ns == "_mesh"),
+        "client holds {sizes:?}"
+    );
+    assert_eq!(val(&c, "b-data").await, None);
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------- declare fresh (R6)
+
+/// Ops of `key` in `NS` this node holds (any origin).
+async fn ops_of(n: &Node) -> usize {
+    n.store()
+        .call(|s| s.diff_since(&VersionVector::default(), 100_000))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|i| matches!(i, mesh_store::SyncItem::Op(op) if op.body.payload.ns() == NS))
+        .count()
+}
+
+/// Ruling R6: a host that stayed stale (off for more than 80 days with no other host)
+/// skips tombstone GC for ever; the owner's `declare_fresh` records a full sync now (the
+/// time only), and the next GC tick collects old tombstones again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_clears_staleness_and_gc_runs() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (mut cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    cfg_a.timings.gc = Duration::from_millis(100);
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    a.store().set(NS, "gone", b"v".to_vec()).await.unwrap();
+    a.store().delete(NS, "gone").await.unwrap();
+    let (b, _cb) = join(
+        &dirs[1],
+        "b",
+        day0,
+        a.invite(Role::Host, TTL).await.unwrap(),
+    )
+    .await;
+    // A's own ops reached B (a full round): they are below `synced_self_seq`.
+    let own = vv_of(&a).await.get(&a.node_id());
+    wait_until("A's ops synced", T, || async {
+        a.store()
+            .call(|s| s.synced_self_seq())
+            .await
+            .unwrap()
+            .is_some_and(|s| s >= own)
+    })
+    .await;
+    timeout(T, b.shutdown()).await.unwrap();
+    let synced_seq = a.store().call(|s| s.synced_self_seq()).await.unwrap();
+    assert_eq!(ops_of(&a).await, 2);
+
+    // 91 days alone: stale, and the tombstone is past its TTL, but GC skips a stale store.
+    ca.set(day0 + 91 * DAY);
+    assert!(is_stale(&a).await);
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(ops_of(&a).await, 2, "no GC while stale");
+
+    a.declare_fresh().await.unwrap();
+    assert!(!is_stale(&a).await);
+    assert!(last_full_sync(&a).await.unwrap() >= day0 + 91 * DAY);
+    assert_eq!(
+        a.store().call(|s| s.synced_self_seq()).await.unwrap(),
+        synced_seq,
+        "the time only"
+    );
+    wait_until("GC on the next tick", T, || async { ops_of(&a).await == 0 }).await;
+    timeout(T, a.shutdown()).await.unwrap();
+}
+
+/// Ruling R6: `declare_fresh` is refused while the node re-bootstraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_refused_while_rebootstrapping() {
+    let t = quad().await;
+    t.age_a().await;
+    let Quad { a, b, c, d, .. } = t;
+    // A stays away from its stale client: ops taken from C would taint A again after its
+    // rebuild (C1e), and the final `declare_fresh` would meet the next re-bootstrap.
+    a.partition(&[c.node_id()]);
+    c.partition(&[a.node_id()]);
+    let mut ea = a.subscribe();
+    a.hold_rebootstrap_before_reset(true);
+    b.heal();
+    d.heal();
+    wait_until("A rebuilding", T, || async {
+        matches!(a.status(), NodeStatus::Rebootstrapping { .. })
+    })
+    .await;
+    let r = a.declare_fresh().await;
+    assert!(
+        matches!(r, Err(mesh_core::NodeError::Rebootstrapping)),
+        "{r:?}"
+    );
+    a.hold_rebootstrap_before_reset(false);
+    wait_rebootstrap_done(&mut ea).await;
+    a.declare_fresh().await.unwrap();
+    for n in [a, b, c, d] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// `declare_fresh` on a store that never completed a full sync is refused: it holds
+/// nothing a stale host could safely rebuild from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declare_fresh_refused_on_a_never_synced_store() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    let ib = id_of(&dirs[1]);
+    a.partition(&[ib]);
+    let ticket = a.invite(Role::Host, TTL).await.unwrap();
+    let (cfg_b, cb) = test_cfg(dirs[1].path(), "b");
+    cb.set(day0);
+    let b = timeout(T, Node::join(cfg_b, ticket))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last_full_sync(&b).await, None);
+    let r = b.declare_fresh().await;
+    assert!(matches!(r, Err(mesh_core::NodeError::NeverSynced)), "{r:?}");
+    assert_eq!(last_full_sync(&b).await, None);
+    for n in [a, b] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}
+
+/// Ruling R8: a client re-invited as a host while the mesh's only host is stale has no
+/// source to rebuild from, so it does not reset: it stays a working client (Running,
+/// Partial, `_mesh` writes accepted). Once a Fresh Full host is there (here: the owner
+/// declares A up to date), it upgrades and ends with the service data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_listed_as_host_waits_for_a_fresh_host() {
+    let dirs: Vec<TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (cfg_a, ca) = test_cfg(dirs[0].path(), "a");
+    let day0 = now_of(&ca);
+    let a = Node::create_mesh(cfg_a).await.unwrap();
+    a.store().set(NS, "k", b"v".to_vec()).await.unwrap();
+    let (c, cc) = join(
+        &dirs[1],
+        "c",
+        day0,
+        a.invite(Role::Client, TTL).await.unwrap(),
+    )
+    .await;
+    full_sync_since(&a, day0).await;
+    full_sync_since(&c, day0).await;
+    let (ia, ic) = (a.node_id(), c.node_id());
+    // Apart while the clock jumps (a round between them would refresh both).
+    a.partition(&[ic]);
+    c.partition(&[ia]);
+    wait_until("A and C apart", T, || async {
+        !a.members().iter().any(|m| m.id == ic && m.online)
+            && !c.members().iter().any(|m| m.id == ia && m.online)
+    })
+    .await;
+    sleep(Duration::from_millis(500)).await;
+    for clock in [&ca, &cc] {
+        clock.set(day0 + 81 * DAY);
+    }
+    assert!(is_stale(&a).await, "A stale");
+    a.heal();
+    c.heal();
+
+    // Re-invited as a host while A, the only host, is stale.
+    let mut ec = c.subscribe();
+    a.store()
+        .set_add(
+            mesh_core::membership::MESH_NS,
+            mesh_core::membership::MEMBERS,
+            mesh_core::membership::member_bytes(&ic, Role::Host).to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_until("C knows it is a host", T, || async {
+        c.members()
+            .iter()
+            .any(|m| m.id == ic && m.role == Role::Host)
+    })
+    .await;
+    more_rounds(&c, ia, 3).await;
+    assert!(
+        !saw_rebootstrap(&mut ec),
+        "no reset without a Fresh Full host"
+    );
+    assert_eq!(c.status(), NodeStatus::Running);
+    assert_eq!(c.scope(), mesh_proto::Scope::client());
+    c.set_info(Some("c-waiting".into()), None).await.unwrap();
+    wait_until("A sees C's write", T, || async {
+        sees_name(&a, ic, "c-waiting").await
+    })
+    .await;
+    // Let the rounds that carried C's (stale) ops complete before A is declared fresh.
+    more_rounds(&a, ic, 2).await;
+    assert!(!saw_rebootstrap(&mut ec));
+
+    // A Fresh Full host appears: C upgrades from it.
+    a.declare_fresh().await.unwrap();
+    wait_rebootstrap_done(&mut ec).await;
+    wait_until("C a full replica", T, || async {
+        c.status() == NodeStatus::Running && c.scope() == mesh_proto::Scope::Full
+    })
+    .await;
+    assert_eq!(val(&c, "k").await, Some(b"v".to_vec()));
+    assert!(
+        sees_name(&c, ic, "c-waiting").await,
+        "own `_mesh` write kept"
+    );
+    for n in [a, c] {
+        timeout(T, n.shutdown()).await.unwrap();
+    }
+}

@@ -29,6 +29,8 @@ pub enum NodeError {
     Removed,
     #[error("node is rebootstrapping; local writes are refused")]
     Rebootstrapping,
+    #[error("this node never completed a full sync; there is nothing to declare fresh")]
+    NeverSynced,
     #[error("join refused: {0:?}")]
     JoinRefused(RefuseReason),
     #[error("inviter unreachable")]

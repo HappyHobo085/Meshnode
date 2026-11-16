@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mesh_proto::{
-    MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, SignedOp, SyncMsg, VersionVector, batch_ops,
+    Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, MeshId, NodeId, Role, Scope, SignedOp, SyncMsg,
+    VersionVector, batch_ops,
 };
 use mesh_store::{StoreError, SyncItem};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -28,7 +29,7 @@ use crate::db::StoreHandle;
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::frame::{FrameError, SYNC_MAX_FRAME, read_frame, write_frame};
-use crate::membership::MeshAcceptor;
+use crate::membership::{MEMBERS, MESH_NS, MeshAcceptor, is_removed, member_bytes, scope_of_role};
 
 /// Items per `diff_since` page.
 const PAGE: usize = 256;
@@ -62,8 +63,110 @@ pub enum SessionEnd {
     /// The peer broke the protocol; close with `PROTOCOL`.
     Protocol(String),
     Store(StoreError),
-    /// The store is stale; the node re-bootstraps (spec §7).
+    /// This store was reset (re-bootstrap) after our first `Hello` of this session, and the
+    /// peer is (or may be) Full: what it sends may be computed against our pre-reset
+    /// vector, and a `Covered` marker from it would jump the emptied store's vector over ops
+    /// it never received (ruling R10). Redialed at once (`backoff_min`), so every session
+    /// of the new epoch starts from a `Hello` the peer has seen.
+    Reset,
+    /// The store is stale, or a role upgrade is due (sub-spec 8a §3), and a Fresh Full peer
+    /// announced itself: the node re-bootstraps from it (spec §7, sub-spec 8a rulings C1c
+    /// and R8). Nothing was served to that peer, and serving is already paused.
     Stale,
+}
+
+/// Completed pulls from Full peers, per re-bootstrap epoch (sub-spec 8a ruling I2).
+///
+/// A re-bootstrap calls [`FullPulls::begin_epoch`] when it resets the store; a session
+/// records, with each `Hello` it sends, the epoch current then, and when a Full peer
+/// answers that `Hello` with `Done` (it sent everything it holds beyond our vector) the
+/// session reports that epoch. A re-bootstrap completes only once a pull of its own epoch
+/// was reported: everything a Full peer had, against a `Hello` sent after the reset.
+///
+/// It also carries the scope the current re-bootstrap rebuilds with: a role upgrade
+/// (sub-spec 8a §3) rebuilds a Partial store as Full, so from its reset on every `Hello`
+/// announces `Full` while the store's own scope flips only once the rebuild is done.
+#[derive(Debug, Default)]
+pub struct FullPulls {
+    epoch: AtomicU64,
+    pulled: AtomicU64,
+    rebuild_full: AtomicBool,
+    /// A re-bootstrap reset the store (`begin_epoch`) and has not finished yet.
+    rebuilding: AtomicBool,
+    /// Held (inside a store call) while a session decides on a reset and pauses serving,
+    /// and while the owner declares the store fresh, so the two never interleave.
+    decide: Mutex<()>,
+    /// Test hook: while set, a completed round waits right before its `record_round` store
+    /// call (`held` counts the rounds that reached that point).
+    #[cfg(any(test, feature = "test-hooks"))]
+    hold_record: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    held: AtomicU64,
+}
+
+impl FullPulls {
+    /// See the `decide` field. Blocking; held only inside a store call.
+    pub(crate) fn decide(&self) -> MutexGuard<'_, ()> {
+        self.decide.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets whether the re-bootstrap in progress rebuilds the store as Full (a role
+    /// upgrade); `Hello`s announce `Full` while it is set.
+    pub fn set_rebuild_full(&self, on: bool) {
+        self.rebuild_full.store(on, Ordering::SeqCst);
+    }
+
+    /// See [`FullPulls::set_rebuild_full`].
+    pub fn rebuild_full(&self) -> bool {
+        self.rebuild_full.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: while `on`, completed rounds wait right before recording themselves.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hold_record_round(&self, on: bool) {
+        self.hold_record.store(on, Ordering::SeqCst);
+    }
+
+    /// Test hook: rounds that reached the [`FullPulls::hold_record_round`] point.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn record_rounds_held(&self) -> u64 {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    async fn wait_record_hold(&self) {
+        if !self.hold_record.load(Ordering::SeqCst) {
+            return;
+        }
+        self.held.fetch_add(1, Ordering::SeqCst);
+        while self.hold_record.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Starts a new epoch (the store was just reset) and returns it.
+    pub fn begin_epoch(&self) -> u64 {
+        self.rebuilding.store(true, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The re-bootstrap that began the current epoch is done (or abandoned).
+    pub(crate) fn end_rebuild(&self) {
+        self.rebuilding.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn current(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn note(&self, epoch: u64) {
+        self.pulled.fetch_max(epoch, Ordering::SeqCst);
+    }
+
+    /// Whether a Full peer's `Done` answered a `Hello` sent in `epoch` (or later).
+    pub fn reached(&self, epoch: u64) -> bool {
+        self.pulled.load(Ordering::SeqCst) >= epoch
+    }
 }
 
 pub struct SessionCtx {
@@ -81,6 +184,7 @@ pub struct SessionCtx {
     pub(crate) signout: Arc<crate::peers::SignOut>,
     /// Told of every message read (the node's incoming-traffic catch-up).
     pub(crate) incoming: Option<crate::peers::IncomingHook>,
+    pub(crate) pulls: Arc<FullPulls>,
 }
 
 /// The other ends of a test session's channels.
@@ -91,6 +195,8 @@ pub struct TestHandles {
     pub wake: Arc<Notify>,
     pub metrics: Arc<PeerMetrics>,
     pub serve_paused: Arc<AtomicBool>,
+    /// The session's re-bootstrap epochs (`begin_epoch` simulates a reset).
+    pub pulls: Arc<FullPulls>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -106,6 +212,7 @@ impl SessionCtx {
         let wake = Arc::new(Notify::new());
         let metrics = Arc::new(PeerMetrics::default());
         let serve_paused = Arc::new(AtomicBool::new(false));
+        let pulls = Arc::new(FullPulls::default());
         let ctx = SessionCtx {
             mesh: store.raw().mesh(),
             me: store.raw().node_id(),
@@ -120,6 +227,7 @@ impl SessionCtx {
             serve_paused: serve_paused.clone(),
             signout: Arc::default(),
             incoming: None,
+            pulls: pulls.clone(),
         };
         let handles = TestHandles {
             cmds: cmd_tx,
@@ -127,6 +235,7 @@ impl SessionCtx {
             wake,
             metrics,
             serve_paused,
+            pulls,
         };
         (ctx, handles)
     }
@@ -146,6 +255,8 @@ struct Round {
     hello_received: bool,
     done_sent: bool,
     done_received: bool,
+    /// The [`FullPulls`] epoch when our `Hello` of this round went out.
+    hello_epoch: u64,
     /// When the round began (our start or the peer's `Hello`); `None` when idle.
     began: Option<Instant>,
 }
@@ -172,15 +283,56 @@ impl Round {
 
 #[derive(Debug, Default)]
 struct State {
-    /// The vv from the peer's latest `Hello`.
+    /// The vv from the peer's latest `Hello`, raised by its `Advertise`s.
     advertised: VersionVector,
+    /// What we last announced we hold (our `Hello`, then our `Advertise`s): the bound the
+    /// peer checks our `Covered` markers against.
+    told: VersionVector,
+    /// The [`FullPulls`] epoch when our latest `Hello` went out: the peer's picture of us
+    /// (its `known`) dates from it.
+    told_epoch: u64,
+    /// Our latest `Hello` went out while serving was paused (it announced `Stale`).
+    told_paused: bool,
+    /// The [`FullPulls`] epoch of our first `Hello` in this session (`None` before it):
+    /// once the epoch moves past it, the session spans a reset ([`SessionEnd::Reset`]).
+    first_hello_epoch: Option<u64>,
     /// What we believe the peer holds.
     known: VersionVector,
     /// Bumped on every `Hello` received (it resets `known`).
     hello_gen: u64,
     /// Live mode is on once the peer's first `Hello` arrived.
     live: bool,
+    /// The scope from the peer's latest `Hello` (`None` before the first). Decides what
+    /// we serve it and whether its `Covered` markers count (sub-spec 8a §3).
+    peer_scope: Option<Scope>,
+    /// The freshness from the peer's latest `Hello`.
+    peer_freshness: Option<Freshness>,
+    /// The oldest `since_ms` of a Stale peer whose ops this store applied since the last
+    /// completed round (sub-spec 8a C1e): recorded as a taint when the round completes.
+    stale_applied: Option<u64>,
     round: Round,
+}
+
+impl State {
+    /// The peer announced a Partial scope: its `Covered` markers may mean "filtered",
+    /// and its `vv[me]` does not prove it holds our ops.
+    fn peer_partial(&self) -> bool {
+        matches!(self.peer_scope, Some(Scope::Partial(_)))
+    }
+}
+
+/// This store's freshness for its `Hello` (sub-spec 8a C1b): re-bootstrapping (`paused`)
+/// counts as stale, never as a source.
+fn own_freshness(s: &crate::db::CoreStore, paused: bool) -> Result<Freshness, StoreError> {
+    let last = s.last_full_sync_ms()?;
+    Ok(match last {
+        _ if paused => Freshness::Stale {
+            since_ms: last.unwrap_or(0),
+        },
+        None => Freshness::Empty,
+        Some(since_ms) if s.is_stale()? => Freshness::Stale { since_ms },
+        Some(_) => Freshness::Fresh,
+    })
 }
 
 /// Why a round start was requested.
@@ -198,6 +350,46 @@ fn raise(vv: &mut VersionVector, origin: NodeId, seq: u64) {
     if vv.get(&origin) < seq {
         vv.set(origin, seq);
     }
+}
+
+/// What a completed round records (spec §7 with sub-spec 8a C1c), by the freshness the
+/// peer announced in its `Hello`:
+/// - **Fresh:** refreshes this node's last-full-sync time. With a Full peer that is
+///   `mark_full_sync` (it also advances `synced_self_seq` to the peer's `vv[me]`); with a
+///   Partial peer the time only (its vector moves past what it filtered out), and only
+///   to keep an existing, non-stale time current (rulings C1d, C1e): a client never
+///   rescues a stale node (its data could bring back deletions the host the client is
+///   fresh through has GC'd) and never makes an Empty one Fresh (it holds only `_mesh`
+///   from the client). So only the founder or a Fresh Full peer makes a host Fresh, and a
+///   stale node turns Fresh only by resetting from a Fresh Full peer.
+/// - **Stale:** refreshes nothing; a store that never synced inherits the peer's
+///   staleness ([`mesh_store::Store::inherit_full_sync`], clamped).
+/// - **Empty** (or unknown): nothing. Two Empty stores stay Empty.
+///
+/// Then, if this store applied ops from a Stale peer since the last completed round
+/// (`stale_applied`, the oldest such `since_ms`), its time is lowered to that (clamped),
+/// even if it had one (ruling C1e): it holds stale data now.
+fn record_round(
+    s: &crate::db::CoreStore,
+    synced: u64,
+    peer_partial: bool,
+    peer: Option<Freshness>,
+    stale_applied: Option<u64>,
+) -> Result<(), StoreError> {
+    match peer {
+        Some(Freshness::Fresh) if peer_partial => {
+            if s.last_full_sync_ms()?.is_some() && !s.is_stale()? {
+                s.refresh_full_sync_time()?;
+            }
+        }
+        Some(Freshness::Fresh) => s.mark_full_sync(synced)?,
+        Some(Freshness::Stale { since_ms }) => s.inherit_full_sync(since_ms)?,
+        Some(Freshness::Empty) | None => {}
+    }
+    if let Some(since_ms) = stale_applied {
+        s.taint_full_sync(since_ms)?;
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -236,6 +428,7 @@ struct Parts {
     serve_paused: Arc<AtomicBool>,
     signout: Arc<crate::peers::SignOut>,
     incoming: Option<crate::peers::IncomingHook>,
+    pulls: Arc<FullPulls>,
 }
 
 /// Runs one session until the stream closes or an error ends it. The dialer starts a
@@ -259,6 +452,7 @@ where
         serve_paused,
         signout,
         incoming,
+        pulls,
     } = ctx;
     let s = Session {
         ctx: Parts {
@@ -274,6 +468,7 @@ where
             serve_paused,
             signout,
             incoming,
+            pulls,
         },
         st: Mutex::new(State::default()),
         kick: Notify::new(),
@@ -332,17 +527,42 @@ impl Session {
     }
 
     /// Completes the round if both `Done`s have crossed: `mark_full_sync` with the peer's
-    /// confirmed `vv[me]`, count it and emit `RoundComplete`.
+    /// confirmed `vv[me]` (not with a Partial peer), count it and emit `RoundComplete`.
     async fn maybe_complete(&self) -> Result<(), SessionEnd> {
-        let synced = {
+        let (synced, partial, peer_fresh, stale_applied, hello_epoch) = {
             let mut st = self.lock();
             if !st.round.complete() {
                 return Ok(());
             }
+            let hello_epoch = st.round.hello_epoch;
             st.round = Round::default();
-            st.advertised.get(&self.ctx.me)
+            // The round changed the peer's freshness (an Empty peer is empty no more): until
+            // its next Hello say, it is unknown, so a stale store does not serve it live.
+            let peer_fresh = st.peer_freshness.take();
+            let stale_applied = st.stale_applied.take();
+            (
+                st.advertised.get(&self.ctx.me),
+                st.peer_partial(),
+                peer_fresh,
+                stale_applied,
+                hello_epoch,
+            )
         };
-        self.call(move |s| s.mark_full_sync(synced)).await?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.ctx.pulls.wait_record_hold().await;
+        let pulls = self.ctx.pulls.clone();
+        self.call(move |s| {
+            // A round whose Hello went out before a reset (re-bootstrap) describes the store
+            // that was reset: record nothing from it, and drop its stale-op taint. Checked
+            // under `decide`, which the reset holds together with `begin_epoch`, so a reset
+            // cannot slip in between this check and the write (ruling R9).
+            let _decide = pulls.decide();
+            if hello_epoch != pulls.current() {
+                return Ok(());
+            }
+            record_round(s, synced, partial, peer_fresh, stale_applied)
+        })
+        .await?;
         self.ctx
             .metrics
             .rounds_completed
@@ -384,20 +604,95 @@ impl Session {
     }
 
     async fn on_message(&self, msg: SyncMsg) -> Result<(), SessionEnd> {
+        self.check_spans_reset()?;
         match msg {
-            SyncMsg::Hello { mesh, vv } => {
+            SyncMsg::Hello {
+                mesh,
+                vv,
+                scope,
+                freshness,
+            } => {
                 if mesh != self.ctx.mesh {
                     return Err(SessionEnd::Protocol("Hello for another mesh".into()));
                 }
-                self.on_hello(vv);
+                self.check_scope(&scope).await?;
+                self.check_stale(&scope, freshness).await?;
+                self.check_rebuild_source(Some(&scope), Some(freshness))?;
+                self.on_hello(vv, scope, freshness);
                 Ok(())
             }
-            SyncMsg::Ops { ops } => self.on_ops(ops).await,
+            SyncMsg::Advertise { vv } => {
+                let mut st = self.lock();
+                // Before the peer's Hello its scope and role are unchecked (ruling A1).
+                if st.peer_scope.is_none() {
+                    return Err(SessionEnd::Protocol("Advertise before Hello".into()));
+                }
+                self.ctx.signout.peer_hello(&self.ctx.me, &vv);
+                for (o, &seq) in &vv.0 {
+                    raise(&mut st.advertised, *o, seq);
+                    raise(&mut st.known, *o, seq);
+                }
+                Ok(())
+            }
+            SyncMsg::Ops { ops } => {
+                let (scope, fresh) = self.peer_view();
+                self.check_rebuild_source(scope.as_ref(), fresh)?;
+                let any = !ops.is_empty();
+                self.on_ops(ops).await?;
+                if let (true, Some(Freshness::Stale { since_ms })) = (any, fresh) {
+                    let mut st = self.lock();
+                    st.stale_applied = Some(st.stale_applied.map_or(since_ms, |t| t.min(since_ms)));
+                }
+                Ok(())
+            }
             SyncMsg::Covered { origin, upto } => {
-                let advertised = self.lock().advertised.get(&origin);
-                let acc = self.ctx.acc.clone();
-                self.call(move |s| s.apply_covered(origin, upto, advertised, &*acc))
+                let (advertised, partial, told_epoch) = {
+                    let st = self.lock();
+                    (st.advertised.get(&origin), st.peer_partial(), st.told_epoch)
+                };
+                if told_epoch != self.ctx.pulls.current() {
+                    // This store was reset (re-bootstrap) after our latest Hello: the peer
+                    // diffs against what we held before, so its marker may cover only the
+                    // top of a range the reset deleted. Applying it would skip those ops for
+                    // good; end the session so the next one starts with a fresh Hello.
+                    debug!(
+                        peer = %self.ctx.peer.short(),
+                        "marker against a Hello from before a reset; restarting the session"
+                    );
+                    return Err(SessionEnd::Closed);
+                }
+                let (scope, fresh) = self.peer_view();
+                self.check_rebuild_source(scope.as_ref(), fresh)?;
+                if partial {
+                    // Sub-spec 8a §3: from a Partial peer a marker may mean "filtered", not
+                    // "compacted"; the gap waits in `pending` for a Full peer. `known` is
+                    // not raised either (the scoped diff we serve covers it anyway).
+                    debug!(
+                        peer = %self.ctx.peer.short(),
+                        origin = %origin.short(),
+                        upto,
+                        "ignoring Covered from a partial peer"
+                    );
+                    return Ok(());
+                }
+                let (acc, pulls) = (self.ctx.acc.clone(), self.ctx.pulls.clone());
+                let first = self.lock().first_hello_epoch;
+                let applied = self
+                    .call(move |s| {
+                        // Atomic with a reset, which holds `decide` from `reset_to_empty`
+                        // through `begin_epoch`: a marker against our pre-reset `Hello` never
+                        // lands in the emptied store (ruling R10).
+                        let _decide = pulls.decide();
+                        if first.is_some_and(|e| e != pulls.current()) {
+                            return Ok(false);
+                        }
+                        s.apply_covered(origin, upto, advertised, &*acc)?;
+                        Ok(true)
+                    })
                     .await?;
+                if !applied {
+                    return Err(SessionEnd::Reset);
+                }
                 if upto <= advertised {
                     raise(&mut self.lock().known, origin, upto);
                 }
@@ -411,13 +706,153 @@ impl Session {
                         return Ok(());
                     }
                     st.round.done_received = true;
+                    // A Full peer sent all it holds beyond our Hello of this round.
+                    // Only a Fresh one counts: a stale peer's data must not rebuild a store.
+                    if st.round.hello_sent
+                        && !st.peer_partial()
+                        && st.peer_freshness == Some(Freshness::Fresh)
+                    {
+                        self.ctx.pulls.note(st.round.hello_epoch);
+                    }
                 }
                 self.maybe_complete().await
             }
         }
     }
 
-    fn on_hello(&self, vv: VersionVector) {
+    /// Ruling R10: ends a session that spans a reset of this store, i.e. our first `Hello`
+    /// of it went out before the current epoch, unless the peer announced a Partial scope
+    /// (its markers are ignored, it earns no pull credit, and its ops wait in `pending` as
+    /// usual). Checked before every message read and every writer pass; the reset's
+    /// `start_round_all` wakes every writer, so no such session outlives the reset by more
+    /// than a wake-up, and none applies anything of the peer's after it (the `Covered` apply
+    /// also re-checks under `decide`).
+    fn check_spans_reset(&self) -> Result<(), SessionEnd> {
+        let st = self.lock();
+        let spans = st
+            .first_hello_epoch
+            .is_some_and(|e| e != self.ctx.pulls.current());
+        if spans && !st.peer_partial() {
+            drop(st);
+            debug!(
+                peer = %self.ctx.peer.short(),
+                "this store was reset since the session began; restarting the session"
+            );
+            return Err(SessionEnd::Reset);
+        }
+        Ok(())
+    }
+
+    /// Spec §7 with sub-spec 8a ruling C1c, on each `Hello`: if this store is stale and the
+    /// peer is a **Fresh Full** peer, the session ends with [`SessionEnd::Stale`] before
+    /// anything is served to it, and the node re-bootstraps from it. Staleness never blocks
+    /// syncing otherwise: stale, Empty and Partial peers are synced with as usual.
+    ///
+    /// The same holds for a role upgrade (sub-spec 8a §3, ruling R8): a Partial store whose
+    /// node is listed as a host resets only once a Fresh Full peer is there to rebuild from
+    /// (not while a re-bootstrap already runs). Until then it stays a working client.
+    ///
+    /// Nothing is decided while the store is being rebuilt (reset done, run not finished;
+    /// ruling R9): its rebuild needs exactly these Fresh Full peers, so even a stale time in
+    /// the store being rebuilt never turns them away. Before the reset (serving paused, the
+    /// reset decided but not done) a Fresh Full peer still ends the session as before, so
+    /// it restarts with a fresh `Hello` once the store is reset.
+    ///
+    /// The decision and the pause it implies are taken under [`FullPulls::decide`], so an
+    /// owner's `declare_fresh` either comes first (the store is fresh: no reset) or sees
+    /// serving paused and is refused.
+    async fn check_stale(&self, peer_scope: &Scope, peer: Freshness) -> Result<(), SessionEnd> {
+        if matches!(peer_scope, Scope::Partial(_)) || peer != Freshness::Fresh {
+            return Ok(());
+        }
+        let (acc, me) = (self.ctx.acc.clone(), self.ctx.me);
+        let (paused, pulls) = (self.ctx.serve_paused.clone(), self.ctx.pulls.clone());
+        let reset = self
+            .call(move |s| {
+                let _decide = pulls.decide();
+                let is_paused = paused.load(Ordering::SeqCst);
+                if is_paused && pulls.rebuilding.load(Ordering::SeqCst) {
+                    // The store is being rebuilt: these peers are its sources.
+                    return Ok(false);
+                }
+                // A client re-invited as a host: listed as both (as in `check_scope`), and
+                // an effective member (as in the driver's `upgrade_due`).
+                let upgrade = !is_paused
+                    && s.scope() != Scope::Full
+                    && acc.role_of(s, &me)? == Some(Role::Host)
+                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&me, Role::Client))?
+                    && !is_removed(s, &me)?;
+                let reset = upgrade || s.is_stale()?;
+                if reset {
+                    // A reset must not serve (spec §7); the re-bootstrap clears this.
+                    paused.store(true, Ordering::SeqCst);
+                }
+                Ok(reset)
+            })
+            .await?;
+        if reset {
+            return Err(SessionEnd::Stale);
+        }
+        Ok(())
+    }
+
+    /// The peer's scope and freshness from its latest `Hello`.
+    fn peer_view(&self) -> (Option<Scope>, Option<Freshness>) {
+        let st = self.lock();
+        (st.peer_scope.clone(), st.peer_freshness)
+    }
+
+    /// While this node re-bootstraps (serving paused) it rebuilds only from Fresh Full peers
+    /// (and `_mesh` from clients): a session with any other Full peer ends before anything
+    /// of it is applied, and is redialed later. So a rebuilt store holds no data from a
+    /// stale source, and comes back Fresh (sub-spec 8a C1c/C1d).
+    fn check_rebuild_source(
+        &self,
+        peer_scope: Option<&Scope>,
+        peer: Option<Freshness>,
+    ) -> Result<(), SessionEnd> {
+        if !self.paused()
+            || matches!(peer_scope, Some(Scope::Partial(_)))
+            || peer == Some(Freshness::Fresh)
+        {
+            return Ok(());
+        }
+        debug!(
+            peer = %self.ctx.peer.short(),
+            "re-bootstrapping: not taking data from a peer that is not Fresh"
+        );
+        Err(SessionEnd::Closed)
+    }
+
+    /// Refuses a peer whose announced scope contradicts its role in `_mesh` (host ⇔
+    /// `Full`, client ⇔ `Scope::client()`), like an unknown member. A peer with no role
+    /// yet (a provisional peer during a join) is taken at its word: serving it scoped and
+    /// ignoring its markers is always safe, and `Full` is today's treatment.
+    ///
+    /// A peer listed both as a client and as a host is a client re-invited as a host
+    /// (sub-spec 8a §3 role upgrade): until it learns that and rebuilds as Full it still
+    /// announces Partial, and it must be served (scoped) to learn it at all; so for it
+    /// either scope is accepted. A node listed only as a host must announce Full.
+    async fn check_scope(&self, scope: &Scope) -> Result<(), SessionEnd> {
+        let (acc, peer) = (self.ctx.acc.clone(), self.ctx.peer);
+        let (role, upgrading) = self
+            .call(move |s| {
+                let role = acc.role_of(s, &peer)?;
+                let upgrading = role == Some(Role::Host)
+                    && s.set_contains(MESH_NS, MEMBERS, &member_bytes(&peer, Role::Client))?;
+                Ok((role, upgrading))
+            })
+            .await?;
+        match role {
+            Some(_) if upgrading && *scope == scope_of_role(Role::Client) => Ok(()),
+            Some(role) if scope_of_role(role) != *scope => Err(SessionEnd::Protocol(format!(
+                "Hello scope {scope:?} contradicts the peer's role {role:?}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn on_hello(&self, vv: VersionVector, scope: Scope, freshness: Freshness) {
         self.ctx.signout.peer_hello(&self.ctx.me, &vv);
         let mut st = self.lock();
         if st.round.awaiting_reply {
@@ -439,6 +874,8 @@ impl Session {
         }
         st.advertised = vv.clone();
         st.known = vv;
+        st.peer_scope = Some(scope);
+        st.peer_freshness = Some(freshness);
         st.hello_gen += 1;
         st.live = true;
         drop(st);
@@ -548,6 +985,7 @@ impl Session {
 
     /// Sends whatever is due: a `Hello`, the diff, and `Done`.
     async fn write_pending<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<(), SessionEnd> {
+        self.check_spans_reset()?;
         let send_hello = {
             let mut st = self.lock();
             let r = &mut st.round;
@@ -559,16 +997,71 @@ impl Session {
             due
         };
         if send_hello {
-            // Spec §7: a stale node does not take part in rounds.
-            if self.call(|s| s.is_stale()).await? {
-                return Err(SessionEnd::Stale);
+            // Spec §7 / ruling C1: a stale (or re-bootstrapping) node says so; whether it
+            // syncs is decided on the peer's `Hello` (`check_stale`).
+            // The epoch is read before the vector: a reset in between leaves this Hello
+            // with an older epoch (conservative), never a pre-reset vector with a new one.
+            let epoch = self.ctx.pulls.current();
+            let paused = self.paused();
+            // A role upgrade's rebuild asks for everything (sub-spec 8a §3). Read after the
+            // epoch: the flag is set before the reset's `begin_epoch`, so a Hello that can
+            // earn the new epoch's pull credit always announced `Full`.
+            let full = self.ctx.pulls.rebuild_full();
+            let (vv, scope, freshness) = self
+                .call(move |s| {
+                    let scope = if full { Scope::Full } else { s.scope() };
+                    Ok((s.version_vector()?, scope, own_freshness(s, paused)?))
+                })
+                .await?;
+            {
+                let mut st = self.lock();
+                st.round.hello_epoch = epoch;
+                st.told_epoch = epoch;
+                st.first_hello_epoch.get_or_insert(epoch);
+                st.told_paused = paused;
+                st.told = vv.clone();
             }
-            let vv = self.call(|s| s.version_vector()).await?;
             let mesh = self.ctx.mesh;
-            self.send(w, &SyncMsg::Hello { mesh, vv }).await?;
+            let hello = SyncMsg::Hello {
+                mesh,
+                vv,
+                scope,
+                freshness,
+            };
+            self.send(w, &hello).await?;
         }
 
         if self.paused() || !self.lock().live {
+            return Ok(());
+        }
+        // Serving resumed (a re-bootstrap is done) under a Hello that announced `Stale`,
+        // sent while paused or before the reset (an older epoch): the peer would take what
+        // we send as stale data (C1e taint). Restart the session, so the next Hello
+        // announces what this store is now.
+        let stale_hello = {
+            let st = self.lock();
+            st.told_paused || st.told_epoch != self.ctx.pulls.current()
+        };
+        if stale_hello {
+            debug!(
+                peer = %self.ctx.peer.short(),
+                "serving resumed; restarting the session to announce the new freshness"
+            );
+            return Err(SessionEnd::Closed);
+        }
+        // A stale store never serves a Fresh Full peer (spec §7, C1c): it would hand on what
+        // the other replicas may have GC'd the tombstones of; the peer's `Hello` makes it
+        // re-bootstrap instead. A Full peer whose freshness is unknown (forgotten when a
+        // round completes, as it may have changed) counts as Fresh until its next `Hello`.
+        let gated = {
+            let st = self.lock();
+            !st.peer_partial()
+                && !matches!(
+                    st.peer_freshness,
+                    Some(Freshness::Empty | Freshness::Stale { .. })
+                )
+        };
+        if gated && self.call(|s| s.is_stale()).await? {
             return Ok(());
         }
         let Some(gen_flushed) = self.flush(w).await? else {
@@ -593,19 +1086,25 @@ impl Session {
         Ok(())
     }
 
-    /// Streams `diff_since(known)` page by page until a page is empty, raising `known` for
-    /// every item sent. Returns the `hello_gen` the empty page was computed under, or
-    /// `None` if serving was paused meanwhile.
+    /// Streams `diff_since_scoped(known, peer scope)` page by page until a page is empty,
+    /// raising `known` for every item sent. A Partial peer gets only what its scope
+    /// admits; the rest of each origin goes as `Covered` markers. Returns the `hello_gen`
+    /// the empty page was computed under, or `None` if serving was paused meanwhile.
     async fn flush<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<Option<u64>, SessionEnd> {
         loop {
             if self.paused() {
                 return Ok(None);
             }
-            let (known, gen_now) = {
+            let (known, gen_now, scope) = {
                 let st = self.lock();
-                (st.known.clone(), st.hello_gen)
+                // `live` (checked by the caller) implies a Hello, so the scope is known;
+                // were it not, serving less is the safe side.
+                let scope = st.peer_scope.clone().unwrap_or_else(Scope::client);
+                (st.known.clone(), st.hello_gen, scope)
             };
-            let items = self.call(move |s| s.diff_since(&known, PAGE)).await?;
+            let items = self
+                .call(move |s| s.diff_since_scoped(&known, PAGE, &scope))
+                .await?;
             if items.is_empty() {
                 return Ok(Some(gen_now));
             }
@@ -615,6 +1114,13 @@ impl Session {
                     SyncItem::Op(op) => ops.push(op),
                     SyncItem::Covered { origin, upto } => {
                         self.send_ops(w, std::mem::take(&mut ops)).await?;
+                        // Ruling I3: the peer ignores a marker above what we announced, so
+                        // in live mode (a write since our Hello) announce more first.
+                        if upto > self.lock().told.get(&origin) {
+                            let vv = self.call(|s| s.version_vector()).await?;
+                            self.send(w, &SyncMsg::Advertise { vv: vv.clone() }).await?;
+                            self.lock().told = vv;
+                        }
                         self.send(w, &SyncMsg::Covered { origin, upto }).await?;
                         raise(&mut self.lock().known, origin, upto);
                     }

@@ -24,6 +24,7 @@
     "allow-config-get",
     "allow-config-set",
     "allow-reset-identity",
+    "allow-declare-fresh",
     "allow-platform",
     "allow-logs-follow",
     "allow-probe",

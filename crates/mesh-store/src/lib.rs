@@ -48,10 +48,10 @@ pub use sync::SyncItem;
 
 use ed25519_dalek::SigningKey;
 use mesh_hlc::{Clock, Hlc, SystemClock, WallClock};
-use mesh_proto::{MeshId, NodeId};
+use mesh_proto::{MeshId, NodeId, Scope};
 use redb::{Database, ReadableTable};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, RwLock};
 use tables::{META, SCHEMA_VERSION, meta};
 
 /// The replicated store. All methods take `&self`; writers are serialized internally.
@@ -70,6 +70,9 @@ pub struct Store<W: WallClock = SystemClock> {
     /// A second handle to the wall clock, for readers that must not wait on `clock`
     /// (node-local entry TTLs).
     wall: W,
+    /// Namespaces this node replicates (sub-spec 8a §3); local writes outside it are
+    /// refused. In memory only, default `Full`: the node sets it from its role at open.
+    scope: RwLock<Scope>,
     /// Rows read by local-entry sweeps (test-hooks only).
     #[cfg(feature = "test-hooks")]
     local_scanned: std::sync::atomic::AtomicU64,
@@ -163,6 +166,7 @@ impl<W: WallClock> Store<W> {
             clock: Mutex::new(Clock::new(wall.clone(), Hlc::from_u64(last_hlc))),
             events,
             wall,
+            scope: RwLock::new(Scope::Full),
             #[cfg(feature = "test-hooks")]
             local_scanned: std::sync::atomic::AtomicU64::new(0),
         })
@@ -174,6 +178,33 @@ impl<W: WallClock> Store<W> {
 
     pub fn mesh(&self) -> MeshId {
         self.mesh
+    }
+
+    /// Sets the namespaces this node replicates. Not persisted: the node sets it from
+    /// its effective role after each open. Only local writes are checked against it
+    /// ([`StoreError::OutOfScope`]); remote ops are filtered by the sync session, and
+    /// node-local entries (`local_*`) are not replicated, so neither is affected.
+    pub fn set_scope(&self, scope: Scope) {
+        *self.scope.write().unwrap_or_else(|e| e.into_inner()) = scope;
+    }
+
+    /// The scope set by [`Store::set_scope`] (`Full` until then).
+    pub fn scope(&self) -> Scope {
+        self.scope.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `Err(OutOfScope)` unless the current scope admits `ns`.
+    pub(crate) fn check_scope(&self, ns: &str) -> Result<(), StoreError> {
+        if self
+            .scope
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .admits(ns)
+        {
+            Ok(())
+        } else {
+            Err(StoreError::OutOfScope { ns: ns.to_owned() })
+        }
     }
 
     /// How far this node's HLC floor (the highest HLC it has issued or observed, persisted

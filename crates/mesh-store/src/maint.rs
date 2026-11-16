@@ -426,8 +426,12 @@ impl<W: WallClock> Store<W> {
     /// Set members are untouched: sets are grow-only, so they survive a purge until the
     /// namespace itself is tombstoned in `_mesh` (sub-spec 3). A `ns` containing NUL has
     /// no keys, so nothing is written.
+    ///
+    /// Refused with [`StoreError::OutOfScope`] before anything is written when the store's
+    /// scope does not admit `ns`.
     pub fn purge_namespace(&self, ns: &str) -> Result<Vec<SignedOp>, StoreError> {
         const PAGE: u32 = 1024;
+        self.check_scope(ns)?;
         let mut live: Vec<String> = Vec::new();
         loop {
             let page = self.list_keys(ns, "", live.last().map(String::as_str), PAGE)?;

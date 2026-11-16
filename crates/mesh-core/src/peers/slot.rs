@@ -281,6 +281,7 @@ impl SlotTask {
             serve_paused: env.serve_paused.clone(),
             signout: env.signout.clone(),
             incoming: Some(super::PeerManager::incoming_hook(&self.sh)),
+            pulls: env.pulls.clone(),
         };
         {
             let mut s = self.slot.lock();
@@ -342,6 +343,7 @@ impl SlotTask {
             self.note_refused();
             self.env().signout.peer_refused();
         }
+        let reset = matches!(end, SessionEnd::Reset);
         match end {
             SessionEnd::Closed => {
                 if !refused {
@@ -351,14 +353,19 @@ impl SlotTask {
             // The session future already closed the connection with `PROTOCOL`.
             SessionEnd::Protocol(m) => warn!(peer, reason = %m, "protocol violation; closed"),
             SessionEnd::Store(e) => warn!(peer, error = %e, "store error; session closed"),
+            SessionEnd::Reset => debug!(peer, "store reset; restarting the session"),
             SessionEnd::Stale => {
-                warn!(peer, "store is stale; session stopped");
-                // A stale store must not serve (spec §7); the re-bootstrap clears this.
+                warn!(
+                    peer,
+                    "re-bootstrap due (stale store or role upgrade); session stopped"
+                );
+                // Already paused by the session (`check_stale`); the re-bootstrap clears this.
                 self.env().serve_paused.store(true, Ordering::SeqCst);
                 let _ = self.env().stale.try_send(self.slot.peer);
             }
         }
-        if self.slot.metrics.rounds_completed.load(Ordering::SeqCst) > l.rounds_at_start {
+        if self.slot.metrics.rounds_completed.load(Ordering::SeqCst) > l.rounds_at_start || reset {
+            // A reset restarts every session at once (ruling R10).
             self.backoff = self.env().timings.backoff_min;
         }
         if refused {

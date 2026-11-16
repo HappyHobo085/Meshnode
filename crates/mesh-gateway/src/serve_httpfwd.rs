@@ -8,18 +8,17 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use iroh::endpoint::{RecvStream, SendStream, VarInt};
 use mesh_core::frame::{read_frame, write_frame};
 use mesh_core::{AcceptError, Connection, ProtocolHandler};
-use mesh_proto::{ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, PING_SERVICE, is_hop_by_hop};
+use mesh_forward::{FrameConvError, copy_headers, frame_headers};
+use mesh_proto::{ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, PING_SERVICE};
 use mesh_services::Services;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, warn};
-
-use crate::error::FrameConvError;
 
 /// The request frame must arrive within this time, or the stream is reset.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -292,32 +291,6 @@ fn to_request(fr: ForwardRequest) -> Result<Request<Bytes>, FrameConvError> {
         .map_err(|_| FrameConvError::Path)?;
     copy_headers(fr.headers, req.headers_mut())?;
     Ok(req)
-}
-
-/// Appends `headers` to `map`, skipping hop-by-hop ones.
-pub(crate) fn copy_headers(
-    headers: Vec<(String, Vec<u8>)>,
-    map: &mut http::HeaderMap,
-) -> Result<(), FrameConvError> {
-    for (name, value) in headers {
-        if is_hop_by_hop(&name) {
-            continue;
-        }
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| FrameConvError::HeaderName(name))?;
-        let value = HeaderValue::from_bytes(&value).map_err(|_| FrameConvError::HeaderValue)?;
-        map.append(name, value);
-    }
-    Ok(())
-}
-
-/// `headers` as frame headers, without hop-by-hop ones.
-pub(crate) fn frame_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
-    headers
-        .iter()
-        .filter(|(n, _)| !is_hop_by_hop(n.as_str()))
-        .map(|(n, v)| (n.as_str().to_owned(), v.as_bytes().to_vec()))
-        .collect()
 }
 
 fn from_response(resp: Response<Bytes>) -> ForwardResponse {

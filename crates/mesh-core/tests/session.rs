@@ -82,6 +82,8 @@ fn pair_nodes(dir: &std::path::Path, own_a: u64, own_b: u64) -> (TestNode, TestN
     let a = open(dir, 1, "a.redb");
     let b = open(dir, 2, "b.redb");
     let s = a.store.inner();
+    // The founder starts Fresh, as `Node::create_mesh` makes it (sub-spec 8a C1c).
+    s.mark_full_sync(0).unwrap();
     s.set_add(MESH_NS, MEMBERS, &member_bytes(&id(1), Role::Host))
         .unwrap();
     s.set_add(MESH_NS, MEMBERS, &member_bytes(&id(2), Role::Host))
@@ -165,7 +167,12 @@ impl Raw {
     }
 
     fn hello(vv: VersionVector) -> SyncMsg {
-        SyncMsg::Hello { mesh: mesh(), vv }
+        SyncMsg::Hello {
+            mesh: mesh(),
+            vv,
+            scope: mesh_proto::Scope::Full,
+            freshness: mesh_proto::Freshness::Fresh,
+        }
     }
 
     /// Reads frames up to and including the session's next `Done`; returns how many
@@ -355,6 +362,8 @@ async fn covered_above_advertised_ignored() {
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: hello_vv,
+        scope: mesh_proto::Scope::Full,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Covered { origin: x, upto: 7 }).await;
@@ -386,6 +395,8 @@ async fn oversized_batch_is_protocol_error() {
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Ops { ops }).await;
@@ -416,6 +427,8 @@ async fn hello_from_other_mesh_is_protocol_error() {
     raw.send(&SyncMsg::Hello {
         mesh: MeshId([0xEE; 32]),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     assert!(matches!(end_of(side).await, SessionEnd::Protocol(_)));
@@ -442,11 +455,16 @@ async fn max_size_op_replicates() {
 async fn drop_mid_round_does_not_mark_sync() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = pair_nodes(dir.path(), 2000, 0);
+    // The founder starts Fresh; the dropped round must not record anything over that.
+    let a_synced = a.store.inner().last_full_sync_ms().unwrap();
+    let a_seq = a.store.inner().synced_self_seq().unwrap();
     let (side, mut raw) = run_against_raw(&a, b.id);
     // B has nothing: it says so and sends Done at once; A's own Done never goes out.
     raw.send(&SyncMsg::Hello {
         mesh: mesh(),
         vv: VersionVector::default(),
+        scope: mesh_proto::Scope::Full,
+        freshness: mesh_proto::Freshness::Fresh,
     })
     .await;
     raw.send(&SyncMsg::Done).await;
@@ -460,7 +478,8 @@ async fn drop_mid_round_does_not_mark_sync() {
     }
     drop(raw);
     assert!(matches!(end_of(side).await, SessionEnd::Closed));
-    assert_eq!(a.store.inner().last_full_sync_ms().unwrap(), None);
+    assert_eq!(a.store.inner().last_full_sync_ms().unwrap(), a_synced);
+    assert_eq!(a.store.inner().synced_self_seq().unwrap(), a_seq);
     assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), None);
 
     let mut p = run_pair(&a, &b, quiet());
@@ -498,6 +517,9 @@ async fn stale_store_ends_session() {
 async fn paused_serves_nothing_but_applies() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = pair_nodes(dir.path(), 5, 5);
+    // A re-bootstrapping store rebuilds only from a Fresh Full peer (sub-spec 8a C1c).
+    b.store.inner().mark_full_sync(0).unwrap();
+    let b_synced = b.store.inner().last_full_sync_ms().unwrap();
     let mut p = {
         let (a_w, b_r) = tokio::io::duplex(PIPE);
         let (b_w, a_r) = tokio::io::duplex(PIPE);
@@ -523,13 +545,14 @@ async fn paused_serves_nothing_but_applies() {
     p.a.h.wake.notify_one();
     assert!(p.b.h.events.try_recv().is_err());
     assert!(!has(&b, "a4"));
-    assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), None);
+    assert_eq!(b.store.inner().last_full_sync_ms().unwrap(), b_synced);
 
+    // Serving resumes: the session's Hello announced `Stale` (paused), so A restarts it
+    // (the next one announces A's real freshness) rather than serve under it.
     p.a.h.serve_paused.store(false, Ordering::SeqCst);
     p.a.h.wake.notify_one();
-    next_round(&mut p.a.h.events).await;
-    next_round(&mut p.b.h.events).await;
-    assert!(has(&b, "a4") && has(&b, "while-paused"));
+    assert!(matches!(end_of(p.a).await, SessionEnd::Closed));
+    assert!(!has(&b, "a4") && !has(&b, "while-paused"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

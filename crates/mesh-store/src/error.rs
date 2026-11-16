@@ -22,6 +22,10 @@ pub enum StoreError {
     /// re-applied export restore them; Ruling R18). Retry after re-bootstrap completes.
     #[error("store is re-bootstrapping: local writes wait until this node's own ops are restored")]
     Rebootstrapping,
+    /// A local write to namespace `ns` was refused: this store's scope
+    /// ([`crate::Store::scope`]) does not replicate it (sub-spec 8a §3). Nothing was written.
+    #[error("namespace `{ns}` is outside this store's replication scope")]
+    OutOfScope { ns: String },
     #[error(transparent)]
     Proto(#[from] ProtoError),
 }

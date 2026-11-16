@@ -878,3 +878,134 @@ async fn probe_streams_in_process() {
         assert!(l.unwrap().contains(" ms="));
     }
 }
+
+/// Sub-spec 8a §3: a `mesh-host` daemon joined with a client ticket replicates only
+/// `_mesh`. Its gateway serves a deployed site by forwarding it to a host, and its store
+/// holds no service data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meshd_client_role_does_not_store_service_data() {
+    let a = initialised("a").await;
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("index.html");
+    std::fs::write(&path, "hello client").unwrap();
+    let meta = FileMeta {
+        path: "index.html".into(),
+        size: "hello client".len() as u64,
+    };
+    let mut c = a.client().await;
+    let r = timeout(
+        T,
+        c.deploy_static("site".into(), DeployOpts::default(), vec![(meta, path)]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(manifest_of(r).name, "site");
+    wait_ready(&a, "site").await;
+    // Some service-side data on the host, outside `_mesh`.
+    let ha = a.daemon.node_handle_for_test().unwrap();
+    ha.store().set("svc", "k", b"v".to_vec()).await.unwrap();
+
+    let b = uninitialised().await;
+    let ticket = match a
+        .req(AdminRequest::Invite {
+            role: Role::Client,
+            ttl_secs: 900,
+        })
+        .await
+    {
+        AdminResponse::Ticket { text } => text,
+        other => panic!("invite: {other:?}"),
+    };
+    let r = b
+        .req(AdminRequest::Join {
+            ticket,
+            name: "b".into(),
+        })
+        .await;
+    assert_eq!(r, AdminResponse::Ok);
+    let hb = b.daemon.node_handle_for_test().unwrap();
+    assert_eq!(hb.scope(), mesh_proto::Scope::client());
+    // B knows the site (its manifest is in `_mesh`) and caught up with A's ops.
+    wait_for("B caught up with A", || async {
+        let ia = ha.node_id();
+        let want = ha
+            .store()
+            .call(|s| s.version_vector())
+            .await
+            .unwrap()
+            .get(&ia);
+        hb.store()
+            .call(|s| s.version_vector())
+            .await
+            .unwrap()
+            .get(&ia)
+            >= want
+    })
+    .await;
+
+    let served = a.daemon.httpfwd_served_for_test().await;
+    let (code, body) = http_get(b.gateway(), "site.mesh.localhost", "/").await;
+    assert_eq!((code, body.as_str()), (200, "hello client"));
+    assert!(
+        a.daemon.httpfwd_served_for_test().await > served,
+        "B forwarded the request to A"
+    );
+    let sizes = hb.store().call(|s| s.namespace_sizes()).await.unwrap();
+    assert!(
+        sizes.keys().all(|ns| ns == "_mesh"),
+        "the client stores {sizes:?}"
+    );
+    assert_eq!(hb.store().get("svc", "k").await.unwrap(), None);
+    // Final review I1: purge needs a full replica; refused as a state error, nothing written.
+    let r = b
+        .req(AdminRequest::Purge {
+            name: "site".into(),
+        })
+        .await;
+    assert_error(&r, ErrorCode::WrongState);
+    b.stop().await;
+    a.stop().await;
+}
+
+/// Ruling R6: `DeclareFresh` reaches the node (a founder has a full sync, so it is
+/// accepted) and needs a mesh.
+#[tokio::test]
+async fn declare_fresh_through_daemon() {
+    let u = uninitialised().await;
+    assert_error(
+        &u.req(AdminRequest::DeclareFresh).await,
+        ErrorCode::WrongState,
+    );
+    u.stop().await;
+    // A founder on a manual clock, 81 days later: stale (no other host to sync with).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let clock = mesh_hlc::ManualClock::new(now);
+    let mut opts = TestOptions::fast();
+    opts.wall = Some(mesh_core::DynClock(std::sync::Arc::new(clock.clone())));
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = timeout(
+        T,
+        Daemon::start_with(dir.path().to_path_buf(), test_config(), opts),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let d = D { daemon, dir };
+    assert_eq!(
+        d.req(AdminRequest::Init { name: "a".into() }).await,
+        AdminResponse::Ok
+    );
+    let h = d.daemon.node_handle_for_test().unwrap();
+    clock.advance(81 * 86_400_000);
+    assert!(h.store().call(|s| s.is_stale()).await.unwrap());
+    assert_eq!(d.req(AdminRequest::DeclareFresh).await, AdminResponse::Ok);
+    assert!(
+        !h.store().call(|s| s.is_stale()).await.unwrap(),
+        "declared fresh"
+    );
+    d.stop().await;
+}

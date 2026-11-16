@@ -62,6 +62,13 @@ fn error_answer(code: mesh_admin::ErrorCode, message: String) -> CliError {
     })
 }
 
+/// Printed when `declare-fresh` is not confirmed (sub-spec 8a ruling R6).
+const DECLARE_FRESH_RISK: &str = concat!(
+    "declare-fresh marks this node as up to date without a sync with another host, so it ",
+    "counts as a fresh copy again. The risk: deletions that other hosts already cleaned up ",
+    "may come back. Nothing was changed; run \"meshd declare-fresh --yes\" to do it."
+);
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     // An explicitly chosen data directory (`--data`, else `MESHD_DATA`), if any.
     let requested = cli.data.clone().or_else(|| {
@@ -79,6 +86,14 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             init(&data, name, Some(ticket)).await
         }
         Command::ResetIdentity { yes } => reset_identity(&data, yes).await,
+        Command::DeclareFresh { yes } => {
+            if !yes {
+                return Err(CliError::usage(DECLARE_FRESH_RISK));
+            }
+            call(&data, AdminRequest::DeclareFresh).await?;
+            say!("This node is declared up to date.");
+            Ok(())
+        }
         Command::Status { json } => {
             let r = call(&data, AdminRequest::Status).await?;
             let AdminResponse::Status(s) = r else {

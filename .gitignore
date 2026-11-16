@@ -18,3 +18,8 @@ apps/ui/node_modules/
 # A library: the app workspaces' lock files pin its dependencies.
 crates/mesh-ui-tauri/Cargo.lock
 services/*/target/
+# Local AAR output (scripts/build-client-aar.sh).
+/dist/
+crates/mesh-client-ffi/jvm-test/build/
+crates/mesh-client-ffi/jvm-test/.gradle/
+crates/mesh-client-ffi/jvm-test/.kotlin/

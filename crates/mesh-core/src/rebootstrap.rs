@@ -5,15 +5,29 @@
 //! It exports its unsynced own ops (to `rebootstrap.bin`, before anything is deleted),
 //! empties itself, pulls everything back from its peers, then re-applies the export.
 //!
-//! Detection: when the node opens (`rebootstrap.bin` exists, or the store is stale), and when
-//! a session ends with `SessionEnd::Stale`. Serving is paused (`serve_paused`) from the
-//! moment staleness is seen until step 7; sessions still receive and apply.
+//! Detection: when the node opens with `rebootstrap.bin` (an interrupted run resumes), and
+//! when a session ends with `SessionEnd::Stale`, which it does only when this store is
+//! stale and a **Fresh Full** peer announced itself (sub-spec 8a ruling C1c). A stale
+//! store is never reset otherwise, and staleness never blocks syncing: a stale node syncs
+//! with stale, Empty and Partial peers as usual. A round with a Fresh peer (host or
+//! client) refreshes the last full sync; one with a Stale or Empty peer refreshes nothing,
+//! and a never-synced (Empty) store inherits a Stale peer's staleness. So a mesh where
+//! every node is stale stays stale but fully working (no owner action is needed): all its
+//! nodes keep syncing, and they re-bootstrap once a Fresh Full peer appears. Serving is
+//! paused (`serve_paused`) from the reset decision until step 7; sessions still receive
+//! and apply. The run completes only after a completed pull from a Full peer since the
+//! reset (ruling I2), besides getting its own ops and `members` record back.
+//!
+//! Role upgrade (sub-spec 8a §3): a client whose effective role becomes host (re-invited
+//! as host) re-bootstraps through the same steps as Full, once a session met a Fresh Full
+//! peer (ruling R8, like C1): its Partial store is reset and caught up in full, and only
+//! then does its scope flip to Full and `role.json` say `host` (see [`run_rebootstrap`]).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use mesh_proto::{NodeId, Payload, Role};
+use mesh_proto::{NodeId, Payload, Role, Scope};
 use mesh_store::SyncItem;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{MissedTickBehavior, sleep};
@@ -22,7 +36,8 @@ use tracing::{debug, error, info, warn};
 use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::local::{
-    RebootstrapFile, append_expired_edits, read_rebootstrap, remove_rebootstrap, write_rebootstrap,
+    RebootstrapFile, append_expired_edits, read_rebootstrap, remove_rebootstrap, write_own_role,
+    write_rebootstrap,
 };
 use crate::membership::{MEMBERS, MESH_NS, member_bytes};
 use crate::node::{Inner, NodeStatus, publish_addr};
@@ -30,39 +45,85 @@ use crate::node::{Inner, NodeStatus, publish_addr};
 /// How often step 4 re-checks `vv[self]` besides each `RoundComplete` (events are lossy).
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
-/// Runs the re-bootstrap at start (if `due`) and whenever a session reports a stale store.
-/// A failed run is retried after `backoff_max`.
+/// Runs the re-bootstrap at start (if `due`: an interrupted run) and whenever a session
+/// reports a stale store, or a due role upgrade, next to a fresh Full peer. When a
+/// membership change makes a role upgrade due, it only starts rounds with every peer, so
+/// that a Fresh Full peer's `Hello` (the reset trigger) comes soon. A failed run is
+/// retried after `backoff_max` (also one that failed after an upgrade flipped the scope:
+/// the retry resumes from `rebootstrap.bin`).
 pub(crate) async fn driver(
     inner: Arc<Inner>,
     stale: Arc<Mutex<mpsc::Receiver<NodeId>>>,
     due: bool,
 ) {
     let mut stale = stale.lock().await;
+    let mut members = inner.membership.subscribe();
     let cancel = inner.cancel.clone();
     let mut due = due;
+    // A stale store is reset only right after a session met a fresh Full peer.
+    let mut fresh_peer = false;
     loop {
-        if due && let Err(e) = run_rebootstrap(&inner).await {
-            error!(error = %e, "re-bootstrap failed; retrying");
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = sleep(inner.cfg.timings.backoff_max) => continue,
+        if due {
+            match run_rebootstrap(&inner, fresh_peer).await {
+                Ok(()) => (due, fresh_peer) = (false, false),
+                Err(e) => {
+                    error!(error = %e, "re-bootstrap failed; retrying");
+                    due = true;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = sleep(inner.cfg.timings.backoff_max) => continue,
+                    }
+                }
             }
         }
         tokio::select! {
             _ = cancel.cancelled() => return,
             r = stale.recv() => match r {
-                Some(peer) => debug!(peer = %peer.short(), "a session found the store stale"),
+                Some(peer) => {
+                    debug!(peer = %peer.short(), "a session found the store stale");
+                    (due, fresh_peer) = (true, true);
+                }
                 None => return,
             },
+            r = members.changed() => {
+                if r.is_err() {
+                    return;
+                }
+                if upgrade_due(&inner) {
+                    debug!("role upgrade due; starting rounds to meet a Fresh Full peer");
+                    inner.peers.start_round_all();
+                }
+            }
         }
-        due = true;
     }
 }
 
-/// Spec §7 steps 1–7. Does nothing (and lets sessions serve again) if the store is not stale
-/// and no re-bootstrap is pending. Returns early, leaving `rebootstrap.bin` for the next
-/// start, when the node is shut down meanwhile.
-pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
+/// Whether this node must re-bootstrap as Full (sub-spec 8a §3 role upgrade): it is an
+/// effective host in `_mesh` (re-invited as host; host outranks client) but its store is
+/// still Partial, so it holds only `_mesh` and its vector moved past everything else.
+fn upgrade_due(inner: &Inner) -> bool {
+    let host = {
+        let snap = inner.membership.borrow();
+        snap.is_effective(&inner.me) && snap.role(&inner.me) == Some(Role::Host)
+    };
+    host && inner.store.raw().scope() != Scope::Full
+}
+
+/// Spec §7 steps 1–7. Does nothing (and lets sessions serve again) if no re-bootstrap is
+/// pending, no role upgrade is due ([`upgrade_due`]) and the store is not stale, or is
+/// stale but `fresh_peer` is false (no Full, non-stale peer was just met to restore from;
+/// ruling C1). Returns early, leaving `rebootstrap.bin` for the next start, when the node
+/// is shut down meanwhile.
+///
+/// A role upgrade, like a stale reset, starts only right after a session met a Fresh Full
+/// peer (`fresh_peer`, ruling R8): with no source to rebuild from, the node stays a
+/// working Partial client (it syncs, and writes `_mesh`) instead of an empty, paused
+/// store. Its rebuild announces `Full` from the reset on
+/// ([`crate::sync::FullPulls::set_rebuild_full`]), takes data only from Fresh Full peers
+/// (and `_mesh` from clients) like any rebuild, and only once done flips the store's scope
+/// to Full and rewrites `role.json` as `host`. A Partial node's re-bootstrap for any other
+/// reason stays Partial (a scoped catch-up).
+pub(crate) async fn run_rebootstrap(inner: &Inner, fresh_peer: bool) -> Result<(), NodeError> {
     let _one_at_a_time = inner.rebootstrap.lock().await;
     let dir = inner.cfg.data_dir.clone();
     if matches!(*inner.status.borrow(), NodeStatus::Removed { .. }) {
@@ -78,14 +139,19 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             file
         }
         None => {
-            if !inner.store.call_raw(|s| s.is_stale()).await? {
+            let upgrade = fresh_peer && upgrade_due(inner);
+            if !upgrade && (!fresh_peer || !inner.store.call_raw(|s| s.is_stale()).await?) {
                 resume_serving(inner);
                 return Ok(());
             }
             // From here no own op can be written until step 7.
             pause(inner).await;
             // 1.
-            warn!("store is stale (no full sync for 80 days); re-bootstrapping");
+            if upgrade {
+                warn!("this client is a host now; re-bootstrapping as a full replica");
+            } else {
+                warn!("store is stale (no full sync for 80 days); re-bootstrapping");
+            }
             let _ = inner.events.send(NodeEvent::RebootstrapStarting);
             // 2. `synced_self_seq` before the reset, which deletes it.
             let (s, last_seq, export) = inner
@@ -110,6 +176,7 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
                 items: export.items,
                 expired: export.expired,
                 peers,
+                full: upgrade,
             };
             let (d, f) = (dir.clone(), file.clone());
             blocking(move || write_rebootstrap(&d, &f)).await?;
@@ -138,13 +205,31 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             _ = hold.wait_for(|on| !*on) => {}
         }
     }
-    let next = inner
+    // The reset and the new epoch are one step under `decide` (ruling R9): a round that
+    // records itself (`maybe_complete`) checks its epoch under the same lock, so it either
+    // writes into the old store (which the reset then clears) or sees the new epoch and
+    // records nothing.
+    // A role upgrade asks for everything from here on: every Hello of the new epoch
+    // announces `Full` (with the emptied vector), so the pull credit below is a full one.
+    // Only a pull answering a `Hello` sent from now on counts (ruling I2); new rounds send
+    // one with the emptied vector (a round in progress counts once the next one starts).
+    let (pulls, full) = (inner.pulls.clone(), file.full);
+    let (next, epoch) = inner
         .store
-        .call_raw(|st| {
+        .call_raw(move |st| {
+            // Must hold `decide` from the reset through `begin_epoch`: `record_round` and the
+            // `Covered` apply check the epoch under it, which is what keeps a pre-reset round
+            // or marker out of the emptied store (rulings R9, R10).
+            let _decide = pulls.decide();
             st.reset_to_empty()?;
-            st.next_seq()
+            pulls.set_rebuild_full(full);
+            let epoch = pulls.begin_epoch();
+            Ok((st.next_seq()?, epoch))
         })
         .await?;
+    inner.peers.start_round_all();
+    // Every writer runs once more, so a session that spans the reset ends now (R10).
+    inner.peers.wake_all();
     if next.saturating_sub(1) != file.last_seq {
         // An own op was written after the export: it is gone, and the store would refuse
         // every later local write. Never carry on silently.
@@ -170,13 +255,14 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
     // 5. Then re-apply the export; retried until every exported op was accepted.
     let items = Arc::new(file.items);
     loop {
-        match wait_for_self_seq(inner, s).await? {
+        match wait_for_self_seq(inner, s, epoch).await? {
             Wait::Reached => {}
             Wait::Stopped => return Ok(()),
             Wait::Removed => {
                 // Nothing left to rebuild: the node is stopped for good (spec §3.3 step 6).
                 warn!("this node was removed during its re-bootstrap; abandoning it");
                 blocking(move || remove_rebootstrap(&dir)).await?;
+                inner.pulls.end_rebuild();
                 inner.store.refuse_writes_rebootstrapping(false);
                 inner.serve_paused.store(false, Ordering::SeqCst);
                 return Ok(());
@@ -217,8 +303,25 @@ pub(crate) async fn run_rebootstrap(inner: &Inner) -> Result<(), NodeError> {
             .send(NodeEvent::ExpiredOfflineEdits { count, keys });
     }
 
-    // 7.
+    // 7. The store was rebuilt from a Fresh Full peer only (`check_rebuild_source`): it is a
+    // fresh copy now (sub-spec 8a C1c), so it cannot inherit staleness and re-bootstrap
+    // again.
+    inner
+        .store
+        .call_raw(|st| st.refresh_full_sync_time())
+        .await?;
+    // A role upgrade is done: the store is a full replica now (sub-spec 8a §3). The scope
+    // flips before serving resumes, and `role.json` is rewritten before `rebootstrap.bin`
+    // goes, so a restart in between still resumes as Full.
+    if file.full {
+        inner.store.raw().set_scope(Scope::Full);
+        let d = dir.clone();
+        blocking(move || write_own_role(&d, Role::Host)).await?;
+        inner.pulls.set_rebuild_full(false);
+        info!("role upgrade done: this node is a full replica now");
+    }
     blocking(move || remove_rebootstrap(&dir)).await?;
+    inner.pulls.end_rebuild();
     inner.store.refuse_writes_rebootstrapping(false);
     inner.status.send_if_modified(|st| {
         let was = matches!(st, NodeStatus::Rebootstrapping { .. });
@@ -311,9 +414,12 @@ fn resume_serving(inner: &Inner) {
     }
 }
 
-/// Waits until `vv[self] >= s` and this node's `members` record is back, checking after each completed round, each status change
-/// and every [`CHECK_EVERY`]; gives up if the node stops or is removed meanwhile.
-async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
+/// Waits until `vv[self] >= s`, this node's `members` record is back and a Full peer has
+/// answered a `Hello` sent in `epoch` with everything it holds (ruling I2: own ops back
+/// from a client alone leave every other namespace missing), checking after each
+/// completed round, each status change and every [`CHECK_EVERY`]; gives up if the node
+/// stops or is removed meanwhile.
+async fn wait_for_self_seq(inner: &Inner, s: u64, epoch: u64) -> Result<Wait, NodeError> {
     let (me, founder) = (inner.me, inner.genesis.founder);
     let mut events = inner.events.subscribe();
     let mut status = inner.status.subscribe();
@@ -342,12 +448,13 @@ async fn wait_for_self_seq(inner: &Inner, s: u64) -> Result<Wait, NodeError> {
         if matches!(*status.borrow_and_update(), NodeStatus::Removed { .. }) {
             return Ok(Wait::Removed);
         }
-        if have >= s && member {
+        let pulled = inner.pulls.reached(epoch);
+        if have >= s && member && pulled {
             return Ok(Wait::Reached);
         }
         debug!(
             have,
-            s, member, "waiting for this node's synced ops and members record"
+            s, member, pulled, "waiting for own synced ops, members record and a Full pull"
         );
         loop {
             tokio::select! {

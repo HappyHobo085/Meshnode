@@ -134,7 +134,16 @@ async fn join_via_non_founder_after_founder_removed() {
             && !effective(&d, ia)
     })
     .await;
-    key_reaches(&b, &d, "k2").await;
+    // D is a client: it replicates only `_mesh` (sub-spec 8a §3).
+    assert_eq!(d.scope(), mesh_proto::Scope::client());
+    b.store()
+        .set("_mesh", "test/k2", b"from b".to_vec())
+        .await
+        .unwrap();
+    wait_until("the `_mesh` key reaches the joiner", T, || async {
+        d.store().get("_mesh", "test/k2").await.unwrap().as_deref() == Some(b"from b".as_slice())
+    })
+    .await;
 
     b.shutdown().await;
     d.shutdown().await;

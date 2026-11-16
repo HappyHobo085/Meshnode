@@ -7,7 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use mesh_core::membership::MESH_NS;
 use mesh_core::{Node, NodeHandle};
-use mesh_proto::{Limits, Placement, ServiceKind, ServiceManifest, encode_raw, valid_service_name};
+use mesh_proto::{
+    Limits, Placement, Scope, ServiceKind, ServiceManifest, encode_raw, valid_service_name,
+};
 use mesh_runtime::{CodeCache, Runtime, RuntimeConfig, RuntimeError};
 use tokio::sync::Mutex;
 
@@ -268,8 +270,16 @@ impl Services {
 
     /// Starts a new data generation, then tombstones the old namespace on this node.
     /// Allowed whether or not the service is deployed.
+    ///
+    /// Refused with [`ServicesError::NotFullReplica`], before anything is written, on a node
+    /// whose store is not Full (sub-spec 8a): it may not write the old namespace's
+    /// tombstones (`OutOfScope`), and a generation bump without them would leave the old
+    /// data on every host for good.
     pub async fn purge(&self, name: &str) -> Result<(), ServicesError> {
         check_name(name)?;
+        if self.node().scope() != Scope::Full {
+            return Err(ServicesError::NotFullReplica("purge"));
+        }
         let store = self.node().store();
         let old = current_generation(store, name).await?;
         let new = old.saturating_add(1);

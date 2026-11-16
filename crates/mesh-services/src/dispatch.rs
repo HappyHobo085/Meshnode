@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{Response, StatusCode, header};
 use mesh_core::NodeStatus;
+use mesh_proto::Scope;
 use mesh_runtime::RequestCtx;
 use tracing::warn;
 
@@ -32,7 +33,8 @@ pub enum LocalState {
     /// Placed here, but not fetched and loaded yet (`503 Service not yet replicated`).
     /// Also reported when this node cannot read the service's manifest.
     NotReady,
-    /// This node is re-bootstrapping; its store is incomplete (`503 Node re-bootstrapping`).
+    /// This node is re-bootstrapping, or its store is not a full replica (yet): its store is
+    /// incomplete (`503 Node re-bootstrapping`).
     Frozen,
     /// No manifest (`404 Service not deployed`).
     NotDeployed,
@@ -97,6 +99,12 @@ impl Services {
             return Route::Refuse(Refusal::Frozen);
         }
         if let Some(active) = shared.active(name) {
+            // A store that is not a full replica (a client re-invited as a host, before its
+            // rebuild as Full; sub-spec 8a §3) lacks the service's data: refused like a
+            // re-bootstrapping one, so a forwarder tries the next host (ruling R9).
+            if shared.node.scope() != Scope::Full {
+                return Route::Refuse(Refusal::Frozen);
+            }
             return Route::Serve(active);
         }
         match read_manifest(shared.node.store(), name).await {

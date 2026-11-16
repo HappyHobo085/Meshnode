@@ -11,6 +11,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
 use mesh_proto::{
     InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, RemovalRecord, Role,
+    Scope,
 };
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
@@ -26,11 +27,12 @@ use crate::error::NodeError;
 use crate::events::NodeEvent;
 use crate::join::{JoinHandler, JoinInner};
 use crate::local::{
-    Invites, load_or_create_key, read_genesis, read_rebootstrap, remove_rebootstrap, write_genesis,
+    Invites, load_or_create_key, read_genesis, read_own_role, read_rebootstrap, remove_rebootstrap,
+    write_genesis, write_own_role,
 };
 use crate::membership::{
     MEMBERS, MESH_NS, MembershipSnapshot, MeshAcceptor, REMOVED, addr_key, encode_addr,
-    encode_info, encode_removal, info_key, member_bytes,
+    encode_info, encode_removal, info_key, member_bytes, scope_of_role,
 };
 use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
@@ -115,6 +117,8 @@ pub(crate) struct Inner {
     pub(crate) serve_paused: Arc<AtomicBool>,
     /// Held for a whole re-bootstrap run: one at a time.
     pub(crate) rebootstrap: tokio::sync::Mutex<()>,
+    /// Completed pulls from Full peers, per re-bootstrap epoch.
+    pub(crate) pulls: Arc<crate::sync::FullPulls>,
     /// Test hook: the next re-bootstrap stops the node right after its step 3.
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     pub(crate) crash_after_reset: AtomicBool,
@@ -192,6 +196,11 @@ impl NodeHandle {
 
     pub fn blobs(&self) -> &Blobs {
         &self.inner.blobs
+    }
+
+    /// The namespaces this node replicates (see [`Node::scope`]).
+    pub fn scope(&self) -> Scope {
+        self.inner.store.raw().scope()
     }
 
     pub fn members(&self) -> Vec<MemberStatus> {
@@ -397,6 +406,23 @@ async fn first_sync(
     }
 }
 
+/// The scope of this node's store (sub-spec 8a §3), from its role in `_mesh` (`listed`)
+/// and the role it entered the mesh with (`joined_as`, from `role.json`).
+///
+/// A client is Partial. So is a node that joined as a client and is now listed as a host
+/// (re-invited as host): its store still lacks every other namespace and its vector has
+/// moved past those ops, so as Full it would serve markers over ops it never held and a
+/// peer would take them as seen. It stays Partial until a re-bootstrap as Full (role
+/// upgrade) rebuilds the store. A node listed nowhere yet (a joiner before its first
+/// sync) goes by `joined_as`; with neither, it is a host (the pre-8a default).
+pub(crate) fn own_scope(listed: Option<Role>, joined_as: Option<Role>) -> Scope {
+    if listed == Some(Role::Client) || joined_as == Some(Role::Client) {
+        scope_of_role(Role::Client)
+    } else {
+        scope_of_role(Role::Host)
+    }
+}
+
 /// Starts a node on an established membership: opens the store, binds the endpoint, mounts
 /// the gated `sync/1` handler, publishes the address, runs the first rescan and spawns
 /// the reactor, the address watcher and the peer tasks.
@@ -410,13 +436,26 @@ pub(crate) async fn start(
     let mesh = genesis.mesh_id();
     let path = cfg.data_dir.join(STORE_FILE);
     let (k, wall) = (key.clone(), DynClock(cfg.wall.clone()));
-    let store = tokio::task::spawn_blocking(move || CoreStore::open(&path, mesh, k, wall))
+    let dir = cfg.data_dir.clone();
+    let joined_as = tokio::task::spawn_blocking(move || read_own_role(&dir))
         .await
-        .map_err(join_err)?
-        .map_err(|e| match e {
-            StoreError::WrongMesh => NodeError::WrongMesh,
-            e => NodeError::Store(e),
-        })?;
+        .map_err(join_err)??;
+    let g = genesis.clone();
+    // The scope is set right after the open, before anything can write or serve a diff
+    // (the store is `Full` until then).
+    let (store, snap) = tokio::task::spawn_blocking(move || {
+        let store = CoreStore::open(&path, mesh, k, wall)?;
+        let snap = MembershipSnapshot::load(&store, &g)?;
+        store.set_scope(own_scope(snap.role(&me), joined_as));
+        Ok((store, snap))
+    })
+    .await
+    .map_err(join_err)?
+    .map_err(|e| match e {
+        StoreError::WrongMesh => NodeError::WrongMesh,
+        e => NodeError::Store(e),
+    })?;
+    debug!(scope = ?store.scope(), "store opened");
     let store = StoreHandle::new(Arc::new(store));
     let dir = cfg.data_dir.clone();
     let invites = tokio::task::spawn_blocking(move || Invites::load(&dir))
@@ -424,13 +463,11 @@ pub(crate) async fn start(
         .map_err(join_err)??;
     let invites = Arc::new(Mutex::new(invites));
     let acc = Arc::new(MeshAcceptor::new(genesis.clone()));
-    let g = genesis.clone();
-    let snap = store
-        .call_raw(move |s| MembershipSnapshot::load(s, &g))
-        .await?;
-    // Spec §7: a re-bootstrap is due at open if one was interrupted or the store is stale.
-    // A removed node has nothing to rebuild (an interrupted run is dropped). Serving is
-    // paused before any session starts.
+    // Spec §7: a re-bootstrap is due at open if one was interrupted. A stale store is not
+    // reset at open: only once a Full peer that is not stale is there to restore from
+    // (a session then ends with `SessionEnd::Stale`; sub-spec 8a ruling C1). A removed
+    // node has nothing to rebuild (an interrupted run is dropped). Serving is paused
+    // before any session starts.
     let removed_self = snap.removed_by(&me).is_some();
     let dir = cfg.data_dir.clone();
     let pending = tokio::task::spawn_blocking(move || read_rebootstrap(&dir))
@@ -440,8 +477,7 @@ pub(crate) async fn start(
         warn!("this node was removed; dropping its interrupted re-bootstrap");
         remove_rebootstrap(&cfg.data_dir)?;
     }
-    let rebootstrap_due =
-        !removed_self && (pending.is_some() || store.call_raw(|s| s.is_stale()).await?);
+    let rebootstrap_due = !removed_self && pending.is_some();
     // The remembered peers of a resumed run: the emptied store holds no addresses.
     let resume_peers: Vec<(NodeId, NodeAddrBytes)> = pending
         .filter(|_| rebootstrap_due)
@@ -458,6 +494,10 @@ pub(crate) async fn start(
     let lose_events = Arc::new(AtomicBool::new(false));
     let signout = Arc::new(SignOut::default());
     let (stale_tx, stale_rx) = mpsc::channel(16);
+    // A resumed role upgrade announces what the store is (Partial) until the resumed run's
+    // reset sets `rebuild_full`; `Hello`s before that belong to the old epoch and never
+    // earn the rebuild's pull credit.
+    let pulls = Arc::new(crate::sync::FullPulls::default());
 
     if let Some(ms) = store.call_raw(|s| Ok(s.clock_floor_ahead_ms())).await? {
         warn!(ms, "HLC floor is ahead of the wall clock");
@@ -485,6 +525,7 @@ pub(crate) async fn start(
                 cfg.catch_up_on_incoming_after,
             )),
             on_catch_up: cfg.on_catch_up.clone(),
+            pulls: pulls.clone(),
         },
         cancel.child_token(),
     );
@@ -613,6 +654,7 @@ pub(crate) async fn start(
         status,
         serve_paused,
         rebootstrap: tokio::sync::Mutex::new(()),
+        pulls,
         crash_after_reset: AtomicBool::new(false),
         hold_before_reset: watch::Sender::new(false),
         network_changes: AtomicU64::new(0),
@@ -660,10 +702,16 @@ impl Node {
             founder: me,
             nonce: rand::random(),
         };
+        write_own_role(&cfg.data_dir, Role::Host)?;
         write_genesis(&cfg.data_dir, &genesis)?;
         let node = start(cfg, key, genesis, Vec::new()).await?;
         let store = node.store().clone();
         let r = async {
+            // A new mesh's founder holds all of it: it starts Fresh (sub-spec 8a C1c), so
+            // the members it brings in become Fresh through it. Without this no node of a
+            // new mesh would ever be Fresh (an Empty pair stays Empty) and staleness would
+            // never apply.
+            store.call_raw(|s| s.mark_full_sync(0)).await?;
             store
                 .set_add(MESH_NS, MEMBERS, member_bytes(&me, Role::Host).to_vec())
                 .await?;
@@ -716,8 +764,61 @@ impl Node {
         start(cfg, key, genesis, Vec::new()).await
     }
 
+    /// The owner declares this node up to date (sub-spec 8a ruling R6): records a full sync
+    /// now, for the staleness clock only (`synced_self_seq` is not advanced: nothing proves
+    /// that a peer holds this node's own ops). For a host that stayed stale (off for more
+    /// than 80 days with no other host), which would otherwise skip tombstone GC for ever.
+    ///
+    /// The risk is the owner's: this node becomes a Fresh source again, so deletions that
+    /// other hosts already cleaned up (tombstone GC) may come back through it.
+    ///
+    /// Refused with [`NodeError::Rebootstrapping`] while a re-bootstrap runs or a session
+    /// has decided on one (serving paused; its rebuilt store is fresh anyway), with
+    /// [`NodeError::Removed`] once removed, and with [`NodeError::NeverSynced`] for a store
+    /// that never completed a full sync (it holds nothing a stale host could safely rebuild
+    /// from). The final check and the refresh run under the same lock as a session's reset
+    /// decision ([`crate::sync::FullPulls`]), so a reset decided meanwhile is never undone.
+    pub async fn declare_fresh(&self) -> Result<(), NodeError> {
+        let inner = &self.inner;
+        let busy = || {
+            matches!(*inner.status.borrow(), NodeStatus::Rebootstrapping { .. })
+                || inner.serve_paused.load(Ordering::SeqCst)
+        };
+        if busy() {
+            return Err(NodeError::Rebootstrapping);
+        }
+        // No re-bootstrap can start its reset meanwhile.
+        let _one_at_a_time = inner.rebootstrap.lock().await;
+        if busy() {
+            return Err(NodeError::Rebootstrapping);
+        }
+        if matches!(*inner.status.borrow(), NodeStatus::Removed { .. }) {
+            return Err(NodeError::Removed);
+        }
+        let (pulls, paused) = (inner.pulls.clone(), inner.serve_paused.clone());
+        let declared = inner
+            .store
+            .call_raw(move |s| {
+                // A session decides on a reset (and pauses serving) under the same lock.
+                let _decide = pulls.decide();
+                if paused.load(Ordering::SeqCst) {
+                    return Ok(Err(NodeError::Rebootstrapping));
+                }
+                if s.last_full_sync_ms()?.is_none() {
+                    return Ok(Err(NodeError::NeverSynced));
+                }
+                s.refresh_full_sync_time()?;
+                Ok(Ok(()))
+            })
+            .await?;
+        declared?;
+        warn!("declared up to date by the owner; staleness cleared");
+        Ok(())
+    }
+
     /// Whether a sync round has completed since this node started (sticky; no race with
-    /// `subscribe`).
+    /// `subscribe`). A round with a client counts: see [`NodeEvent::FirstSyncComplete`]
+    /// for what this does not promise.
     pub fn first_sync_complete(&self) -> bool {
         *self.inner.first_sync.borrow()
     }
@@ -753,6 +854,13 @@ impl Node {
 
     pub fn mesh(&self) -> MeshId {
         self.inner.genesis.mesh_id()
+    }
+
+    /// The namespaces this node replicates (sub-spec 8a §3): `Scope::client()` (only
+    /// `_mesh`) for a client-role member, `Full` otherwise. Set from the node's own role
+    /// when its store is opened, before any local write or sync.
+    pub fn scope(&self) -> Scope {
+        self.inner.store.raw().scope()
     }
 
     /// Every member of the mesh, with this node's view of its link.
@@ -1012,10 +1120,19 @@ impl Node {
     /// would, without any connection. The reactor then reacts as usual.
     pub async fn deliver_from(&self, other: &Node) -> Result<(), NodeError> {
         let mine = self.inner.store.call_raw(|s| s.version_vector()).await?;
+        let scope = self.scope();
+        // As a session would: served within this node's scope, and a Partial sender's
+        // markers ignored.
+        let from_partial = matches!(other.scope(), Scope::Partial(_));
         let (items, theirs) = other
             .inner
             .store
-            .call_raw(move |s| Ok((s.diff_since(&mine, 100_000)?, s.version_vector()?)))
+            .call_raw(move |s| {
+                Ok((
+                    s.diff_since_scoped(&mine, 100_000, &scope)?,
+                    s.version_vector()?,
+                ))
+            })
             .await?;
         let acc = self.inner.acc.clone();
         self.inner
@@ -1025,6 +1142,7 @@ impl Node {
                 for item in items {
                     match item {
                         mesh_store::SyncItem::Op(op) => ops.push(op),
+                        mesh_store::SyncItem::Covered { .. } if from_partial => {}
                         mesh_store::SyncItem::Covered { origin, upto } => {
                             s.apply_batch(std::mem::take(&mut ops), &*acc)?;
                             s.apply_covered(origin, upto, theirs.get(&origin), &*acc)?;

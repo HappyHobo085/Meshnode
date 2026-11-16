@@ -2774,6 +2774,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-client"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "hex",
+ "http",
+ "mesh-client",
+ "mesh-core",
+ "mesh-forward",
+ "mesh-gateway",
+ "mesh-proto",
+ "mesh-runtime",
+ "mesh-services",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mesh-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hex",
+ "http",
+ "jni 0.21.1",
+ "mesh-client",
+ "mesh-client-ffi",
+ "mesh-core",
+ "mesh-gateway",
+ "mesh-proto",
+ "mesh-services",
+ "ndk-context",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uniffi",
+]
+
+[[package]]
 name = "mesh-core"
 version = "0.1.0"
 dependencies = [
@@ -2823,6 +2867,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-forward"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "iroh",
+ "mesh-core",
+ "mesh-proto",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mesh-gateway"
 version = "0.1.0"
 dependencies = [
@@ -2836,6 +2894,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "mesh-core",
+ "mesh-forward",
  "mesh-gateway",
  "mesh-hlc",
  "mesh-proto",
@@ -2937,6 +2996,7 @@ dependencies = [
  "hex",
  "http",
  "mesh-core",
+ "mesh-forward",
  "mesh-hlc",
  "mesh-proto",
  "mesh-runtime",
@@ -2977,6 +3037,8 @@ dependencies = [
  "futures-util",
  "hex",
  "mesh-admin",
+ "mesh-core",
+ "mesh-hlc",
  "mesh-host",
  "mesh-proto",
  "qrcode",

@@ -51,6 +51,74 @@ jobs:
       - run: cargo test -p mesh-services --test aegis_sync --test aegis_sync_mesh -j 2
       - run: bash scripts/sync-aegis-core.sh --check
 
+  # Sub-spec 8a: the client SDK (mesh-client), the forwarding crate it shares with the
+  # gateway (mesh-forward) and the Kotlin wrapper's Rust tests (mesh-client-ffi). The tests
+  # start in-process hosts, which run the wasm32-wasip2 fixtures. What apps link must not
+  # contain the WASM runtime or the host stack: `-e normal`, because the dev-dependencies
+  # (the in-process hosts) do pull wasmtime in, and they are not linked by apps.
+  mesh-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p mesh-forward -p mesh-client -p mesh-client-ffi -j 2
+      - name: No WASM runtime in what apps link
+        run: |
+          for p in mesh-client mesh-forward; do
+            tree="$(cargo tree -p "$p" -e normal --prefix none)"
+            if grep -E '^(wasmtime|mesh-runtime|mesh-services|mesh-gateway)( |$)' <<<"$tree"; then
+              echo "::error::$p must not depend on the WASM runtime, services or gateway"
+              exit 1
+            fi
+          done
+
+  # Sub-spec 8a: the Kotlin bindings of mesh-client. The committed bindings must match the
+  # exported interface; the Android libraries build for both ABIs and are packaged as the
+  # AAR; the JVM test loads the host library built here through JNA.
+  mesh-client-ffi-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The NDK the android-apk job and apps/android/build-apk.sh use.
+      NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;${NDK_VERSION}"
+      - run: echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-ndk --locked
+      - name: Kotlin bindings are up to date
+        run: bash scripts/gen-client-bindings.sh --check
+      # Release libmesh_client_ffi.so for arm64-v8a and x86_64, classes.jar, proguard.txt.
+      - name: Build the AAR
+        run: bash scripts/build-client-aar.sh
+      - name: AAR contents
+        run: |
+          unzip -l dist/mesh-client.aar
+          for f in AndroidManifest.xml classes.jar proguard.txt \
+              jni/arm64-v8a/libmesh_client_ffi.so jni/x86_64/libmesh_client_ffi.so; do
+            unzip -l dist/mesh-client.aar "$f" >/dev/null
+          done
+      - name: JVM test of the bindings
+        run: bash crates/mesh-client-ffi/jvm-test/run.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesh-client-aar
+          path: dist/mesh-client.aar
+
   proptest-long:
     runs-on: ubuntu-latest
     timeout-minutes: 45

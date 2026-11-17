@@ -114,11 +114,33 @@ async fn uninitialised() -> D {
     start_in(tempfile::tempdir().unwrap(), test_config()).await
 }
 
+/// Starts a daemon with `make_cfg()` in a fresh data dir and runs Init. Init binds the
+/// gateway itself and, when the port is taken, leaves the node running with an error, so
+/// a `free_port` pick lost to a parallel test cannot be retried in place: stop that daemon
+/// and start over with a fresh config (up to 3 attempts in all).
+async fn init_with(name: &str, make_cfg: impl Fn() -> HostConfig) -> D {
+    let mut attempt = 1;
+    loop {
+        let d = start_in(tempfile::tempdir().unwrap(), make_cfg()).await;
+        let r = d.req(AdminRequest::Init { name: name.into() }).await;
+        match &r {
+            AdminResponse::Ok => return d,
+            AdminResponse::Error { code, message }
+                if *code == ErrorCode::Internal
+                    && message.contains("the gateway did not start")
+                    && attempt < 3 =>
+            {
+                eprintln!("init: {message}; retrying on a fresh port");
+                attempt += 1;
+                d.stop().await;
+            }
+            other => panic!("init: {other:?}"),
+        }
+    }
+}
+
 async fn initialised(name: &str) -> D {
-    let d = uninitialised().await;
-    let r = d.req(AdminRequest::Init { name: name.into() }).await;
-    assert_eq!(r, AdminResponse::Ok);
-    d
+    init_with(name, test_config).await
 }
 
 fn assert_error(r: &AdminResponse, want: ErrorCode) {
@@ -312,14 +334,14 @@ async fn join_through_daemon() {
 
 #[tokio::test]
 async fn every_request_against_real_daemon() {
-    let mut cfg = test_config();
-    let mapped = free_port();
-    cfg.gateway.ports = BTreeMap::from([(mapped, "counter".to_string())]);
-    let d = start_in(tempfile::tempdir().unwrap(), cfg).await;
-    assert_eq!(
-        d.req(AdminRequest::Init { name: "pc".into() }).await,
-        AdminResponse::Ok
-    );
+    let d = init_with("pc", || {
+        let mut cfg = test_config();
+        cfg.gateway.ports = BTreeMap::from([(free_port(), "counter".to_string())]);
+        cfg
+    })
+    .await;
+    // The retry may have picked a different mapped port: read it back.
+    let mapped = d.status().await.ports[0].0;
     let me = d.status().await.node_id.unwrap();
     assert_eq!(
         d.status().await.ports,

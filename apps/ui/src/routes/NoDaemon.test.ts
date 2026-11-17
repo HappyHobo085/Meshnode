@@ -165,3 +165,16 @@ it("no_daemon_without_a_start_error_shows_no_alert", async () => {
   await mount();
   expect(screen.queryByRole("alert")).toBeNull();
 });
+
+it("no_daemon_rereads_the_start_error_on_each_poll", async () => {
+  await mount();
+  expect(screen.queryByRole("alert")).toBeNull();
+  api.desktop.connection.mockResolvedValue({
+    kind: "none",
+    otherRunning: false,
+    startError: "data was written by an incompatible Meshnode version",
+  });
+  banner.set({ kind: "unreachable", error: UNREACHABLE });
+  for (let i = 0; i < 3; i++) await tick();
+  expect(screen.getByRole("alert")).toHaveTextContent("Meshnode refused to start");
+});

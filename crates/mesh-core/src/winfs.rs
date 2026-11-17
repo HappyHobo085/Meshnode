@@ -8,12 +8,14 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetLengthSid,
-    GetTokenInformation, InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
+    ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+    GetLengthSid, GetTokenInformation, InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION,
+    SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WinAuthenticatedUserSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    FILE_ALL_ACCESS, FILE_GENERIC_READ, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -99,6 +101,59 @@ pub(crate) fn restrict_to_current_user(path: &Path) -> io::Result<()> {
             path.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(r as i32));
+    }
+    Ok(())
+}
+
+/// Adds read access for Authenticated Users (S-1-5-11) to `path` as its one explicit ACE,
+/// keeping the entries it inherits from its directory: an unprotected DACL "inherits ACEs
+/// from the parent object"
+/// (<https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information>).
+/// For non-secret files in a directory the user cannot list (a direct open works through
+/// the default bypass-traverse privilege).
+pub(crate) fn grant_read_to_authenticated_users(path: &Path) -> io::Result<()> {
+    let mut sid_buf = [0u64; (SECURITY_MAX_SID_SIZE as usize).div_ceil(8)];
+    let sid = sid_buf.as_mut_ptr().cast::<c_void>();
+    let mut sid_len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: `sid` points to `sid_len` writable bytes; no domain SID is needed.
+    if unsafe {
+        CreateWellKnownSid(
+            WinAuthenticatedUserSid,
+            std::ptr::null_mut(),
+            sid,
+            &mut sid_len,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // ACL header + one ACCESS_ALLOWED_ACE (whose last u32 is the SID's start) + the SID.
+    let acl_len = size_of::<ACL>() + 2 * size_of::<u32>() + 2 * size_of::<u16>() + sid_len as usize;
+    let mut acl_buf = vec![0u64; acl_len.div_ceil(8)];
+    let acl = acl_buf.as_mut_ptr().cast::<ACL>();
+    // SAFETY: `acl` points to `acl_len` writable bytes, aligned for `ACL`.
+    if unsafe { InitializeAcl(acl, acl_len as u32, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `acl` was initialised above with room for this ACE; `sid` is valid.
+    if unsafe { AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ, sid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = wide(path);
+    // SAFETY: `path` is NUL-terminated; `acl` is a valid ACL; no owner, group or SACL.
+    let r = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             acl,

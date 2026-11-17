@@ -780,6 +780,28 @@ async fn incompatible_start_writes_start_error() {
 }
 
 #[tokio::test]
+async fn other_start_failure_removes_a_stale_start_error() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    let store = dir.path().join("store.redb");
+    let error_file = dir.path().join(mesh_host::paths::START_ERROR_FILE);
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION + 1).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
+    assert!(r.err().expect("refused").is_incompatible());
+    assert!(error_file.exists(), "start-error.txt written");
+    // The store is fixed, but the gateway port is taken: a different failure, so the old
+    // reason must not stay behind.
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION).unwrap();
+    let blocker = std::net::TcpListener::bind(cfg.gateway.listen).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg, TestOptions::fast()).await;
+    let e = r.err().expect("start refused while the port is taken");
+    assert!(!e.is_incompatible(), "{e:?}");
+    assert!(!error_file.exists(), "stale start-error.txt left behind");
+    drop(blocker);
+}
+
+#[tokio::test]
 async fn gateway_port_in_use_fails_start_then_restarts() {
     let d = initialised("pc").await;
     let addr = d.gateway();

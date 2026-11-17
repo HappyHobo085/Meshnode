@@ -78,14 +78,17 @@ impl DaemonError {
 }
 
 /// After a failed start: when `err` is an incompatible-data refusal, its message goes to
-/// `<data_dir>/start-error.txt` for `meshd status` and the desktop app. Hosts that load
-/// `meshd.toml` themselves call this for a load error too.
+/// `<data_dir>/start-error.txt` for `meshd status` and the desktop app; any other failure
+/// removes the file, so it never names a stale cause. Hosts that load `meshd.toml`
+/// themselves call this for a load error too.
 pub fn record_start_failure(data_dir: &Path, err: &DaemonError) {
-    if !err.is_incompatible() {
-        return;
-    }
-    if let Err(e) = paths::write_start_error(data_dir, &err.to_string()) {
-        warn!("cannot write {}: {e}", paths::START_ERROR_FILE);
+    let r = if err.is_incompatible() {
+        paths::write_start_error(data_dir, &err.to_string())
+    } else {
+        paths::clear_start_error(data_dir)
+    };
+    if let Err(e) = r {
+        warn!("cannot update {}: {e}", paths::START_ERROR_FILE);
     }
 }
 
@@ -253,7 +256,7 @@ impl Daemon {
     }
 
     /// [`Daemon::start_serving`], then `start-error.txt` recorded (an incompatible
-    /// refusal) or removed (a successful start).
+    /// refusal) or removed (a successful start or any other failure).
     async fn start_inner(
         data_dir: PathBuf,
         cfg: HostConfig,

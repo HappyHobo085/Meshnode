@@ -47,16 +47,26 @@
   }
 
   /** Why the daemon last refused to start (incompatible data), when it left that word. */
+  let startError: string | null = $state(null);
+  /** An action's problem first; otherwise the daemon's own refusal. */
+  const shown: Problem | null = $derived(
+    problem ??
+      (startError ? { title: "Meshnode refused to start", detail: startError, hint: null } : null),
+  );
+
   async function loadStartError() {
     try {
-      const c = await api.desktop.connection();
-      if (c.startError && problem === null) {
-        problem = { title: "Meshnode refused to start", detail: c.startError, hint: null };
-      }
+      startError = (await api.desktop.connection()).startError;
     } catch {
       // No connection info: the screen works without it.
     }
   }
+
+  // Each failed status poll (the banner is set again) re-reads it, so a refusal that
+  // happens while this screen is open shows up, and a cleared one goes away.
+  $effect(() => {
+    if ($banner !== null) void loadStartError();
+  });
 
   onMount(() => {
     api
@@ -64,7 +74,6 @@
       .then((p) => (platform = p))
       .catch(() => {});
     void locate();
-    void loadStartError();
   });
 
   async function runUser() {
@@ -180,21 +189,21 @@
     </p>
   {/if}
 
-  {#if problem}
+  {#if shown}
     <div class="problem" role="alert">
       <Icon name="alert" size={18} />
       <div>
-        <strong>{problem.title}</strong>
-        {#if problem.detail}<p>{problem.detail}</p>{/if}
-        {#if problem.log}
+        <strong>{shown.title}</strong>
+        {#if shown.detail}<p>{shown.detail}</p>{/if}
+        {#if shown.log}
           <p class="log">
-            <code>{problem.log}</code>
+            <code>{shown.log}</code>
             <Button size="sm" variant="ghost" onclick={copyLog}
               ><Icon name="copy" size={14} />Copy path</Button
             >
           </p>
         {/if}
-        {#if problem.hint}<p class="hint">{problem.hint}</p>{/if}
+        {#if shown.hint}<p class="hint">{shown.hint}</p>{/if}
       </div>
     </div>
   {/if}

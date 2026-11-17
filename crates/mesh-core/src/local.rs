@@ -93,6 +93,14 @@ fn write_durably(
     res
 }
 
+/// Windows: lets every signed-in user read `path` (Authenticated Users, read only), on top
+/// of what it inherits from its directory. For non-secret status files such as
+/// `start-error.txt` in the service's private data directory.
+#[cfg(windows)]
+pub fn grant_read_to_authenticated_users(path: &Path) -> std::io::Result<()> {
+    crate::winfs::grant_read_to_authenticated_users(path)
+}
+
 /// Write `bytes` to `path` via a temp file in the same directory, fsync, then a durable
 /// rename over `path` (the directory entry is synced too: on Unix by fsyncing the
 /// directory, on Windows by `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).

@@ -71,9 +71,15 @@ pub fn default_data_dir() -> PathBuf {
 /// clients can say why no daemon answers.
 pub const START_ERROR_FILE: &str = "start-error.txt";
 
-/// The first line of `<data_dir>/start-error.txt`, when there is one (and it is readable).
+/// The first line of `<data_dir>/start-error.txt`, when there is one. A file that exists
+/// but cannot be read is reported as `(start error unreadable: <error>)` rather than
+/// hidden.
 pub fn start_error(data_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(data_dir.join(START_ERROR_FILE)).ok()?;
+    let text = match std::fs::read_to_string(data_dir.join(START_ERROR_FILE)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("(start error unreadable: {e})")),
+    };
     let line = text.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_owned())
 }
@@ -135,5 +141,23 @@ pub(crate) fn bind(endpoint: &Endpoint, access: &Access) -> Result<Listener, Adm
         Endpoint::Socket(path) => Listener::bind(path, access),
         #[cfg(windows)]
         Endpoint::Pipe(name) => Listener::bind(name, access),
+    }
+}
+
+#[cfg(test)]
+mod start_error_tests {
+    use super::*;
+
+    #[test]
+    fn start_error_reads_the_first_line_and_reports_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(start_error(dir.path()), None);
+        std::fs::write(dir.path().join(START_ERROR_FILE), "why\nmore\n").unwrap();
+        assert_eq!(start_error(dir.path()).as_deref(), Some("why"));
+        // Not readable as a file: said, not swallowed.
+        std::fs::remove_file(dir.path().join(START_ERROR_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(START_ERROR_FILE)).unwrap();
+        let shown = start_error(dir.path()).unwrap();
+        assert!(shown.starts_with("(start error unreadable: "), "{shown}");
     }
 }

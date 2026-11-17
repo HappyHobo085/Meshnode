@@ -149,6 +149,13 @@ fn hex32(s: &str) -> Result<[u8; 32], NodeError> {
         .map_err(|_| bad_file("expected 32 bytes".into()))
 }
 
+fn incompatible_file(file: &str, detail: String) -> NodeError {
+    NodeError::Incompatible {
+        file: file.into(),
+        detail,
+    }
+}
+
 fn bad_file(msg: String) -> NodeError {
     NodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
 }
@@ -160,10 +167,12 @@ pub fn read_genesis(dir: &Path) -> Result<Option<MeshGenesis>, NodeError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let f: GenesisFile = serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+    let incompatible = |detail: String| incompatible_file(GENESIS_FILE, detail);
+    let f: GenesisFile = serde_json::from_slice(&bytes).map_err(|e| incompatible(e.to_string()))?;
+    let hex = |s: &str| hex32(s).map_err(|_| incompatible("not a 32-byte hex id".into()));
     Ok(Some(MeshGenesis {
-        founder: NodeId(hex32(&f.founder)?),
-        nonce: hex32(&f.nonce)?,
+        founder: NodeId(hex(&f.founder)?),
+        nonce: hex(&f.nonce)?,
     }))
 }
 
@@ -214,11 +223,15 @@ pub fn read_own_role(dir: &Path) -> Result<Option<Role>, NodeError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let f: RoleFile = serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+    let f: RoleFile =
+        serde_json::from_slice(&bytes).map_err(|e| incompatible_file(ROLE_FILE, e.to_string()))?;
     match f.joined_as.as_str() {
         "host" => Ok(Some(Role::Host)),
         "client" => Ok(Some(Role::Client)),
-        other => Err(bad_file(format!("unknown role `{other}` in {ROLE_FILE}"))),
+        other => Err(incompatible_file(
+            ROLE_FILE,
+            format!("unknown role `{other}`"),
+        )),
     }
 }
 
@@ -256,13 +269,15 @@ impl Invites {
         let mut map = BTreeMap::new();
         match std::fs::read(&path) {
             Ok(bytes) => {
+                let bad = |detail: String| incompatible_file(INVITES_FILE, detail);
+                let hex = |s: &str| hex32(s).map_err(|_| bad("not a 32-byte hex id".into()));
                 let rows: BTreeMap<String, InviteRow> =
-                    serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+                    serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
                 for (k, r) in rows {
-                    let redeemed_by = r.redeemed_by.as_deref().map(hex32).transpose()?.map(NodeId);
+                    let redeemed_by = r.redeemed_by.as_deref().map(hex).transpose()?.map(NodeId);
                     let role = if r.host { Role::Host } else { Role::Client };
                     map.insert(
-                        hex32(&k)?,
+                        hex(&k)?,
                         InviteEntry {
                             role,
                             expires_ms: r.expires_ms,

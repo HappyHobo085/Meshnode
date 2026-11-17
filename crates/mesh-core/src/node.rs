@@ -456,6 +456,10 @@ pub(crate) async fn start(
     .map_err(join_err)?
     .map_err(|e| match e {
         StoreError::WrongMesh => NodeError::WrongMesh,
+        e @ StoreError::IncompatibleSchema { .. } => NodeError::Incompatible {
+            file: "store".into(),
+            detail: e.to_string(),
+        },
         e => NodeError::Store(e),
     })?;
     debug!(scope = ?store.scope(), "store opened");

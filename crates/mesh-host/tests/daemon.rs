@@ -741,6 +741,22 @@ async fn second_daemon_on_same_data_dir_refused() {
 }
 
 #[tokio::test]
+async fn start_on_incompatible_store_is_incompatible() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    mesh_store::test_hooks::set_schema(
+        &dir.path().join("store.redb"),
+        mesh_store::SCHEMA_VERSION + 1,
+    )
+    .unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg, TestOptions::fast()).await;
+    let e = r.err().expect("incompatible store refused");
+    assert!(e.is_incompatible(), "{e:?}");
+    assert!(e.to_string().contains("store schema"), "{e}");
+}
+
+#[tokio::test]
 async fn gateway_port_in_use_fails_start_then_restarts() {
     let d = initialised("pc").await;
     let addr = d.gateway();

@@ -65,6 +65,18 @@ pub enum DaemonError {
     Admin(#[from] AdminError),
 }
 
+impl DaemonError {
+    /// True when the data (or `meshd.toml`) was written by an incompatible Meshnode
+    /// version or is invalid for this one: the daemon must refuse, not retry.
+    pub fn is_incompatible(&self) -> bool {
+        matches!(
+            self,
+            DaemonError::Node(NodeError::Incompatible { .. })
+                | DaemonError::Config(ConfigError::Parse { .. })
+        )
+    }
+}
+
 /// Settings that only tests change.
 #[derive(Clone, Default)]
 struct StartOptions {

@@ -38,6 +38,7 @@ test-hooks = [
 
 [dev-dependencies]
 mesh-hlc = { path = "../mesh-hlc" }
+mesh-store = { path = "../mesh-store", features = ["test-hooks"] }
 mesh-host = { path = ".", features = ["test-hooks"] }
 mesh-runtime = { path = "../mesh-runtime", features = ["test-hooks"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

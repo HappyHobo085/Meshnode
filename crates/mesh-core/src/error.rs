@@ -13,6 +13,10 @@ pub enum NodeError {
     Proto(#[from] ProtoError),
     #[error("iroh error: {0}")]
     Iroh(String),
+    /// A state file or the store was written by an incompatible Meshnode version (or is
+    /// unreadable as one this build knows).
+    #[error("{file}: {detail}")]
+    Incompatible { file: String, detail: String },
     #[error("node.key is not a valid 32-byte key")]
     BadKey,
     #[error("data directory holds no mesh")]

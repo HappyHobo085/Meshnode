@@ -987,3 +987,19 @@ async fn set_tags_of_is_visible_in_members_immediately() {
     assert_eq!(info.tags, ["lab"]);
     timeout(T, a.shutdown()).await.unwrap();
 }
+
+#[test]
+fn unknown_role_file_is_incompatible() {
+    use mesh_core::local::read_own_role;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("role.json"), r#"{"joined_as":"overlord"}"#).unwrap();
+    match read_own_role(dir.path()) {
+        Err(NodeError::Incompatible { file, .. }) => assert_eq!(file, "role.json"),
+        other => panic!("role.json: {other:?}"),
+    }
+    std::fs::write(dir.path().join("mesh.json"), "not json {").unwrap();
+    match read_genesis(dir.path()) {
+        Err(NodeError::Incompatible { file, .. }) => assert_eq!(file, "mesh.json"),
+        other => panic!("mesh.json: {other:?}"),
+    }
+}

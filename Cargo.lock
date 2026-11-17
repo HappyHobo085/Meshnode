@@ -2933,6 +2933,7 @@ dependencies = [
  "mesh-proto",
  "mesh-runtime",
  "mesh-services",
+ "mesh-store",
  "rand 0.9.5",
  "serde",
  "serde_json",

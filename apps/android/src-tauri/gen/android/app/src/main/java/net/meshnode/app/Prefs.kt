@@ -12,6 +12,15 @@ class Prefs(context: Context) {
     get() = sp.getBoolean(KEY_USER_STOPPED, false)
     set(value) = sp.edit { putBoolean(KEY_USER_STOPPED, value) }
 
+  /**
+   * Set when a start was refused for data from an incompatible Meshnode version; while set,
+   * no automatic trigger starts the service ([RestartPolicy]). Opening the app or Start
+   * clears it.
+   */
+  var refusedIncompatible: Boolean
+    get() = sp.getBoolean(KEY_REFUSED_INCOMPATIBLE, false)
+    set(value) = sp.edit { putBoolean(KEY_REFUSED_INCOMPATIBLE, value) }
+
   /** Whether onboarding has been completed (Continue pressed). */
   var onboarded: Boolean
     get() = sp.getBoolean(KEY_ONBOARDED, false)
@@ -25,6 +34,7 @@ class Prefs(context: Context) {
   private companion object {
     const val FILE = "meshnode"
     const val KEY_USER_STOPPED = "user_stopped"
+    const val KEY_REFUSED_INCOMPATIBLE = "refused_incompatible"
     const val KEY_ONBOARDED = "onboarded"
     const val KEY_NOTIFICATION_DENIALS = "notification_denials"
   }

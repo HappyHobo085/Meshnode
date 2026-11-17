@@ -7,5 +7,6 @@ pub use mesh_host::HostConfig as MeshdConfig;
 #[cfg(feature = "test-hooks")]
 pub use mesh_host::TestOptions;
 pub use mesh_host::{
-    ConfigError, Daemon, DaemonError, config, lock, logging, paths, wipe_identity,
+    ConfigError, Daemon, DaemonError, config, lock, logging, paths, record_start_failure,
+    wipe_identity,
 };

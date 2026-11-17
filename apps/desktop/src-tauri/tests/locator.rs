@@ -101,6 +101,26 @@ async fn locator_none_when_nothing_answers() {
     );
 }
 
+/// No daemon answers, and one candidate's last start was refused: the connection names why.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_without_daemon_carries_the_start_error() {
+    let (system, user) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let transport = RelocatingTransport::new(locator(system.path(), user.path()));
+    transport.relocate().await;
+    assert_eq!(transport.connection().start_error, None);
+    std::fs::write(
+        user.path().join(mesh_admin::START_ERROR_FILE),
+        "data was written by an incompatible Meshnode version\nmore\n",
+    )
+    .unwrap();
+    let c = transport.connection();
+    assert_eq!(c.kind, ConnectionKindDto::None);
+    assert_eq!(
+        c.start_error.as_deref(),
+        Some("data was written by an incompatible Meshnode version")
+    );
+}
+
 /// A command through the desktop `Ui` after its daemon went away: the first attempt fails
 /// with `DaemonUnreachable`, the transport locates once more and retries.
 #[tokio::test(flavor = "multi_thread")]

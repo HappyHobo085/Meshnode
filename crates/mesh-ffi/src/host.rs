@@ -48,6 +48,10 @@ pub enum FfiError {
     AlreadyRunning { message: String },
     #[error("cannot start the host: {message}")]
     Start { message: String },
+    /// The data (or `meshd.toml`) was written by an incompatible Meshnode version: the
+    /// app must not retry on its own (spec 8b §5.2).
+    #[error("{message}")]
+    Incompatible { message: String },
     #[error("the host is not running")]
     NotRunning,
     #[error("invalid bytes: {message}")]
@@ -429,8 +433,10 @@ impl Host {
     }
 
     async fn start_daemon(&self, dir: &Path) -> Result<Daemon, FfiError> {
-        let cfg = HostConfig::load_or_default(dir).map_err(|e| FfiError::Start {
-            message: e.to_string(),
+        let cfg = HostConfig::load_or_default(dir).map_err(|e| {
+            let e = DaemonError::from(e);
+            mesh_host::record_start_failure(dir, &e);
+            start_error(e)
         })?;
         self.init_logging(dir, &cfg.log_level);
         let sink: Arc<dyn WakeLockSink> = self.sink.clone();
@@ -441,14 +447,7 @@ impl Host {
         };
         let daemon = Daemon::start_opts(dir.to_owned(), cfg, opts)
             .await
-            .map_err(|e| match e {
-                DaemonError::AlreadyRunning(_) => FfiError::AlreadyRunning {
-                    message: e.to_string(),
-                },
-                e => FfiError::Start {
-                    message: e.to_string(),
-                },
-            })?;
+            .map_err(start_error)?;
         #[cfg(feature = "test-hooks")]
         self.test.starts.fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "test-hooks")]
@@ -545,6 +544,21 @@ impl From<FfiPowerPolicy> for PowerPolicy {
             FfiPowerPolicy::AlwaysOn => PowerPolicy::AlwaysOn,
             FfiPowerPolicy::Saver => PowerPolicy::Saver,
         }
+    }
+}
+
+/// A failed daemon start as Kotlin sees it.
+fn start_error(e: DaemonError) -> FfiError {
+    match e {
+        DaemonError::AlreadyRunning(_) => FfiError::AlreadyRunning {
+            message: e.to_string(),
+        },
+        e if e.is_incompatible() => FfiError::Incompatible {
+            message: e.to_string(),
+        },
+        e => FfiError::Start {
+            message: e.to_string(),
+        },
     }
 }
 

@@ -32,6 +32,7 @@ pub fn unit_file(binary: &Path, data: &Path) -> String {
          UMask=0027\n\
          ExecStart={exec}\n\
          Restart=always\n\
+         RestartPreventExitStatus=4\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -242,6 +243,20 @@ mod installer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_prevents_restart_on_incompatible() {
+        let unit = unit_file(
+            Path::new("/usr/local/bin/meshd"),
+            Path::new("/var/lib/meshnode"),
+        );
+        let service = unit
+            .split("[Service]\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a [Service] section");
+        assert!(service.contains("RestartPreventExitStatus=4\n"), "{unit}");
+    }
 
     #[test]
     fn data_dir_is_read_back_from_the_unit() {

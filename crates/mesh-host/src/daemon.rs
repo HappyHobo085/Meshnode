@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 use crate::config::{CONFIG_FILE, ConfigError, HostConfig};
 use crate::lock::{DataLock, LOCK_FILE, LockError};
 use crate::options::HostOptions;
-use crate::paths::{logs_dir, tmp_dir};
+use crate::paths::{self, logs_dir, tmp_dir};
 use crate::power::{CATCH_UP_AFTER, Periodic, Power, PowerState, WakeReason, saver_paused};
 
 mod requests;
@@ -74,6 +74,18 @@ impl DaemonError {
             DaemonError::Node(NodeError::Incompatible { .. })
                 | DaemonError::Config(ConfigError::Parse { .. })
         )
+    }
+}
+
+/// After a failed start: when `err` is an incompatible-data refusal, its message goes to
+/// `<data_dir>/start-error.txt` for `meshd status` and the desktop app. Hosts that load
+/// `meshd.toml` themselves call this for a load error too.
+pub fn record_start_failure(data_dir: &Path, err: &DaemonError) {
+    if !err.is_incompatible() {
+        return;
+    }
+    if let Err(e) = paths::write_start_error(data_dir, &err.to_string()) {
+        warn!("cannot write {}: {e}", paths::START_ERROR_FILE);
     }
 }
 
@@ -240,7 +252,26 @@ impl Daemon {
         Self::start_inner(data_dir, cfg, opts).await
     }
 
+    /// [`Daemon::start_serving`], then `start-error.txt` recorded (an incompatible
+    /// refusal) or removed (a successful start).
     async fn start_inner(
+        data_dir: PathBuf,
+        cfg: HostConfig,
+        opts: StartOptions,
+    ) -> Result<Daemon, DaemonError> {
+        let r = Self::start_serving(data_dir.clone(), cfg, opts).await;
+        match &r {
+            Ok(_) => {
+                if let Err(e) = paths::clear_start_error(&data_dir) {
+                    warn!("cannot remove {}: {e}", paths::START_ERROR_FILE);
+                }
+            }
+            Err(e) => record_start_failure(&data_dir, e),
+        }
+        r
+    }
+
+    async fn start_serving(
         data_dir: PathBuf,
         cfg: HostConfig,
         opts: StartOptions,

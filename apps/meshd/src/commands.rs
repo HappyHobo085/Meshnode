@@ -17,7 +17,8 @@ use crate::output::{say, say_raw};
 use crate::{local, output};
 
 /// A failed command: the message for stderr and the process exit code (1 daemon-reported
-/// or other failure, 2 usage, 3 daemon not running).
+/// or other failure, 2 usage, 3 daemon not running, 4 data from an incompatible Meshnode
+/// version: the systemd unit does not restart on it).
 #[derive(Debug)]
 pub struct CliError {
     pub code: u8,
@@ -35,6 +36,14 @@ impl CliError {
     pub fn usage(message: impl Into<String>) -> Self {
         CliError {
             code: 2,
+            message: message.into(),
+        }
+    }
+
+    /// `meshd run` refused data written by an incompatible version (spec 8b §5.2).
+    pub fn incompatible(message: impl Into<String>) -> Self {
+        CliError {
+            code: 4,
             message: message.into(),
         }
     }
@@ -95,7 +104,9 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Status { json } => {
-            let r = call(&data, AdminRequest::Status).await?;
+            let r = call(&data, AdminRequest::Status)
+                .await
+                .map_err(|e| not_running_reason(e, &data))?;
             let AdminResponse::Status(s) = r else {
                 return Err(unexpected(&r));
             };
@@ -280,6 +291,17 @@ fn service_status_json(status: meshd::service::ServiceStatus, data_dir: Option<&
 }
 
 // --- talking to the daemon ---------------------------------------------------------------
+
+/// No daemon answers and its last start was refused (`start-error.txt`): say why.
+fn not_running_reason(e: CliError, data: &Path) -> CliError {
+    match meshd::paths::start_error(data) {
+        Some(reason) if e.code == 3 => CliError {
+            code: 3,
+            message: format!("not running: {reason}"),
+        },
+        _ => e,
+    }
+}
 
 async fn connect(data: &Path) -> Result<AdminClient, CliError> {
     Ok(AdminClient::connect(&endpoint_for(data)).await?)

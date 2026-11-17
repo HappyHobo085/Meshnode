@@ -10,7 +10,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::ConfigError;
+use crate::{ConfigError, DaemonError};
 
 pub mod linux;
 pub mod macos;
@@ -65,6 +65,40 @@ pub enum ServiceError {
     Failed(String),
     #[error(transparent)]
     Config(#[from] ConfigError),
+}
+
+/// The exit code a Windows service reports to the SCM when it stops; the cross-platform
+/// mirror of `windows_service::service::ServiceExitCode`, so [`service_exit`] is tested on
+/// every platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceExit {
+    /// `NO_ERROR`.
+    NoError,
+    /// `ERROR_SERVICE_SPECIFIC_ERROR` with this service-specific code.
+    ServiceSpecific(u32),
+}
+
+/// How the Windows service ends after its start failed with `err`: the exit code reported
+/// with `SERVICE_STOPPED`, and whether the message goes to the Event Log.
+///
+/// Incompatible data (spec 8b §5.2) must not be retried. The service's failure actions
+/// (restart 3 times) are set with `set_failure_actions_on_non_crash_failures(true)`, and
+/// with that flag "the failure actions are queued if the service process terminates
+/// without reporting a status of SERVICE_STOPPED or if it enters the SERVICE_STOPPED state
+/// but the dwWin32ExitCode member of the SERVICE_STATUS structure is not ERROR_SUCCESS
+/// (0)" (<https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actions_flag>).
+/// A service-specific code sets `dwWin32ExitCode` to `ERROR_SERVICE_SPECIFIC_ERROR`
+/// (1066, <https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_status>),
+/// so `ServiceSpecific(4)` would be restarted. The incompatible refusal therefore stops
+/// with `NO_ERROR` after logging the reason to the Event Log (and `start-error.txt`, which
+/// `meshd status` shows); every other start failure keeps `ServiceSpecific(1)`, which the
+/// failure actions restart.
+pub fn service_exit(err: &DaemonError) -> (ServiceExit, bool) {
+    if err.is_incompatible() {
+        (ServiceExit::NoError, true)
+    } else {
+        (ServiceExit::ServiceSpecific(1), true)
+    }
 }
 
 /// Who may change services, as §7's messages name them.
@@ -364,6 +398,20 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_exit_incompatible_stops() {
+        let incompatible = DaemonError::Node(mesh_core::NodeError::Incompatible {
+            file: "store".into(),
+            detail: "store schema 2, this build reads 1".into(),
+        });
+        assert_eq!(service_exit(&incompatible), (ServiceExit::NoError, true));
+        let other = DaemonError::AlreadyRunning(PathBuf::from("/var/lib/meshnode"));
+        assert_eq!(
+            service_exit(&other),
+            (ServiceExit::ServiceSpecific(1), true)
+        );
+    }
 
     fn parse_fixed(_: &str) -> Option<PathBuf> {
         Some(PathBuf::from("/var/lib/meshnode"))

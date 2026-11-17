@@ -92,6 +92,7 @@ impl RelocatingTransport {
             None => ConnectionDto {
                 kind: ConnectionKindDto::None,
                 other_running: false,
+                start_error: self.start_error(),
             },
             Some(l) => ConnectionDto {
                 kind: match l.kind {
@@ -99,8 +100,18 @@ impl RelocatingTransport {
                     ConnectionKind::User => ConnectionKindDto::User,
                 },
                 other_running: l.other_running,
+                start_error: None,
             },
         }
+    }
+
+    /// Why a candidate's daemon last refused to start (its `start-error.txt`), in the
+    /// candidates' order.
+    fn start_error(&self) -> Option<String> {
+        lock(&self.locator)
+            .candidates
+            .iter()
+            .find_map(|c| mesh_admin::start_error(&c.data_dir))
     }
 
     /// The located endpoint, locating first if nothing is.

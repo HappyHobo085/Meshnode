@@ -408,10 +408,13 @@ pub enum ConnectionKindDto {
 
 /// The desktop app's connection: which daemon, and whether a second, separate one runs
 /// too (both the service and a per-user daemon answer).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDto {
     pub kind: ConnectionKindDto,
     pub other_running: bool,
+    /// With no daemon (`None`): why its last start was refused, from a candidate data
+    /// directory's `start-error.txt` (incompatible data, spec 8b §5.2).
+    pub start_error: Option<String>,
 }

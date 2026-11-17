@@ -46,8 +46,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::core::GUID;
 
 use super::eventlog::{self, Event, EventLog};
-use super::{Installed, SERVICE_NAME, ServiceError, ServiceStatus, io_err};
-use crate::{Daemon, MeshdConfig, logging};
+use super::{Installed, SERVICE_NAME, ServiceError, ServiceExit, ServiceStatus, io_err};
+use crate::{Daemon, DaemonError, MeshdConfig, logging};
 
 /// The service's display name.
 pub const DISPLAY_NAME: &str = "Meshnode";
@@ -292,6 +292,8 @@ fn configure_and_start(service: &Service) -> Result<(), ServiceError> {
         .update_failure_actions(failure_actions())
         .map_err(scm_err("setting the restart-on-failure actions"))?;
     // A failed start ends in Stopped with an error code rather than a crash; restart then too.
+    // Incompatible data reports NO_ERROR instead, which this flag leaves alone
+    // (`super::service_exit`).
     service
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(scm_err("setting the restart-on-failure actions"))?;
@@ -682,7 +684,11 @@ fn service_main(_arguments: Vec<OsString>) {
     // A panic in the daemon's own code ends the service as a failure (the SCM restarts it).
     let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
         ctx.runtime.block_on(async {
-            let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| e.to_string())?;
+            let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| {
+                let e = DaemonError::from(e);
+                crate::record_start_failure(&ctx.data, &e);
+                e
+            })?;
             let _log = logging::init(&ctx.data, &cfg.log_level);
             // Opening the node can take a while: show the SCM progress meanwhile.
             let start = Daemon::start(ctx.data.clone(), cfg);
@@ -703,7 +709,7 @@ fn service_main(_arguments: Vec<OsString>) {
                 Ok(d) => d,
                 Err(e) => {
                     error!("meshd failed to start: {e}");
-                    return Err(e.to_string());
+                    return Err(e);
                 }
             };
             set(ServiceState::Running, ServiceExitCode::NO_ERROR);
@@ -719,7 +725,7 @@ fn service_main(_arguments: Vec<OsString>) {
                     set_pending(ServiceState::StopPending, 1);
                 })
                 .await;
-            Ok::<(), String>(())
+            Ok::<(), DaemonError>(())
         })
     }));
 
@@ -737,12 +743,21 @@ fn service_main(_arguments: Vec<OsString>) {
             report(Event::Stopped, "Meshnode stopped.");
             set(ServiceState::Stopped, ServiceExitCode::NO_ERROR);
         }
-        Ok(Err(message)) => {
-            report(
-                Event::StartFailed,
-                &format!("Meshnode failed to start: {message}"),
-            );
-            set(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+        Ok(Err(e)) => {
+            // Incompatible data stops with NO_ERROR so the failure actions do not restart
+            // it (see `service_exit`); the reason is in the Event Log and start-error.txt.
+            let (exit, log_event) = super::service_exit(&e);
+            if log_event {
+                report(
+                    Event::StartFailed,
+                    &format!("Meshnode failed to start: {e}"),
+                );
+            }
+            let exit = match exit {
+                ServiceExit::NoError => ServiceExitCode::NO_ERROR,
+                ServiceExit::ServiceSpecific(code) => ServiceExitCode::ServiceSpecific(code),
+            };
+            set(ServiceState::Stopped, exit);
         }
     }
 }

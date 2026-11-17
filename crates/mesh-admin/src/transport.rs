@@ -66,6 +66,18 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
+/// The file in the data directory that holds why the last start was refused for
+/// incompatible data (written by the daemon, removed by its next successful start), so that
+/// clients can say why no daemon answers.
+pub const START_ERROR_FILE: &str = "start-error.txt";
+
+/// The first line of `<data_dir>/start-error.txt`, when there is one (and it is readable).
+pub fn start_error(data_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join(START_ERROR_FILE)).ok()?;
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_owned())
+}
+
 /// The admin endpoint for a data directory. Unix: `<data>/admin.sock`. Windows:
 /// `\\.\pipe\meshnode-admin` for the default data directory, else
 /// `\\.\pipe\meshnode-admin-<first 8 hex of blake3(canonical data dir)>`.

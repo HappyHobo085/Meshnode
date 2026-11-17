@@ -46,12 +46,25 @@
     }
   }
 
+  /** Why the daemon last refused to start (incompatible data), when it left that word. */
+  async function loadStartError() {
+    try {
+      const c = await api.desktop.connection();
+      if (c.startError && problem === null) {
+        problem = { title: "Meshnode refused to start", detail: c.startError, hint: null };
+      }
+    } catch {
+      // No connection info: the screen works without it.
+    }
+  }
+
   onMount(() => {
     api
       .platform()
       .then((p) => (platform = p))
       .catch(() => {});
     void locate();
+    void loadStartError();
   });
 
   async function runUser() {

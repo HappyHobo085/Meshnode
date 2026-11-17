@@ -757,6 +757,29 @@ async fn start_on_incompatible_store_is_incompatible() {
 }
 
 #[tokio::test]
+async fn incompatible_start_writes_start_error() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    let store = dir.path().join("store.redb");
+    let error_file = dir.path().join(mesh_host::paths::START_ERROR_FILE);
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION + 1).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
+    let e = r.err().expect("incompatible store refused");
+    let written = std::fs::read_to_string(&error_file).expect("start-error.txt written");
+    assert_eq!(written.trim_end(), e.to_string());
+    assert!(written.contains("store schema"), "{written}");
+    // A matching store again: the next start succeeds and removes the file.
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION).unwrap();
+    let d = start_in(dir, cfg).await;
+    assert!(
+        !error_file.exists(),
+        "start-error.txt left after a good start"
+    );
+    d.stop().await;
+}
+
+#[tokio::test]
 async fn gateway_port_in_use_fails_start_then_restarts() {
     let d = initialised("pc").await;
     let addr = d.gateway();

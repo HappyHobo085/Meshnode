@@ -51,7 +51,10 @@ build_image() {
   if ! podman image exists "$tag"; then
     ctx="$(mktemp -d)"
     printf '%s\n' "$body" >"$ctx/Containerfile"
-    podman build -q -t "$tag" "$ctx" >&2
+    if ! podman build -q -t "$tag" "$ctx" >&2; then
+      rm -rf "$ctx"
+      return 1
+    fi
     rm -rf "$ctx"
   fi
   echo "$tag"
@@ -60,9 +63,13 @@ build_image() {
 # start <image> <name> → boots systemd in a new container and waits for it
 start() {
   local image="$1" name="$2" state
-  podman run -d --name "$name" --systemd=always --network none "$image" /sbin/init >/dev/null
+  # Called as an `if` condition, where set -e is off: every command checks its own status.
+  if ! podman run -d --name "$name" --systemd=always --network none "$image" /sbin/init >/dev/null; then
+    fail "$name: podman run failed"
+    return 1
+  fi
   containers+=("$name")
-  podman exec "$name" mkdir -p /pkgs
+  podman exec "$name" mkdir -p /pkgs || { fail "$name: podman exec failed"; return 1; }
   # is-system-running fails at once until PID 1's bus is up, so ask again until it answers.
   for _ in $(seq 60); do
     state="$(podman exec "$name" timeout 120 systemctl is-system-running --wait 2>/dev/null || true)"
@@ -121,6 +128,13 @@ invocation() { q "$1" 'systemctl show -p InvocationID --value meshnode.service';
 # lifecycle <container> <old-version> <new-version> <install-old> <upgrade> <remove> <reinstall>
 lifecycle() {
   local c="$1" old_v="$2" new_v="$3" before after
+  if [ -z "$old_v" ] || [ -z "$new_v" ] || [ "$old_v" = "$new_v" ]; then
+    fail "$c: old and new packages need two different versions (got '$old_v' and '$new_v')"
+    return 0
+  fi
+  # So that "user meshnode exists" below proves the install created it.
+  check "$c" "no meshnode user or group before the install" \
+    '! getent passwd meshnode && ! getent group meshnode'
   step "$c" "install $old_v" "$4" || return 0
   check_version "$c" "$old_v"
   check_running "$c"
@@ -131,7 +145,7 @@ lifecycle() {
   check_version "$c" "$new_v"
   check_running "$c"
   after="$(invocation "$c")"
-  if [ -n "$after" ] && [ "$after" != "$before" ]; then
+  if [ -n "$before" ] && [ -n "$after" ] && [ "$after" != "$before" ]; then
     pass "$c: upgrade restarted the service"
   else
     fail "$c: upgrade did not restart the service (InvocationID '$before' → '$after')"
@@ -162,9 +176,10 @@ run=$$
 
 echo "== rpm ($FEDORA_IMAGE)"
 fedora="$(build_image "$FEDORA_IMAGE" "FROM $FEDORA_IMAGE
-RUN dnf -y install --setopt=install_weak_deps=False systemd shadow-utils webkit2gtk4.1 gtk3 && dnf clean all")"
+RUN dnf -y install --setopt=install_weak_deps=False systemd shadow-utils webkit2gtk4.1 gtk3 && dnf clean all")" ||
+  fail "building the test image from $FEDORA_IMAGE"
 c="meshnode-pkgtest-rpm-$run"
-if start "$fedora" "$c"; then
+if [ -n "$fedora" ] && start "$fedora" "$c"; then
   podman cp "$old_rpm" "$c:/pkgs/old.rpm"
   podman cp "$new_rpm" "$c:/pkgs/new.rpm"
   old_v="$(q "$c" 'rpm -qp --nosignature --queryformat %{VERSION} /pkgs/old.rpm')"
@@ -182,9 +197,10 @@ fi
 
 echo "== deb ($DEBIAN_IMAGE)"
 debian="$(build_image "$DEBIAN_IMAGE" "FROM $DEBIAN_IMAGE
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv libwebkit2gtk-4.1-0 libgtk-3-0 && rm -rf /var/lib/apt/lists/*")"
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv libwebkit2gtk-4.1-0 libgtk-3-0 && rm -rf /var/lib/apt/lists/*")" ||
+  fail "building the test image from $DEBIAN_IMAGE"
 c="meshnode-pkgtest-deb-$run"
-if start "$debian" "$c"; then
+if [ -n "$debian" ] && start "$debian" "$c"; then
   podman cp "$old_deb" "$c:/pkgs/old.deb"
   podman cp "$new_deb" "$c:/pkgs/new.deb"
   old_v="$(q "$c" 'dpkg-deb -f /pkgs/old.deb Version')"
@@ -199,15 +215,23 @@ if start "$debian" "$c"; then
       >/tmp/blocker/DEBIAN/control
     dpkg-deb -b /tmp/blocker /tmp/blocker.deb >/dev/null && dpkg -i /tmp/blocker.deb >/dev/null' || true
   echo "-- $c: install $old_v over the conflict (expected to fail)"
-  if cexec "$c" "$apt install /pkgs/old.deb >/dev/null 2>&1"; then
+  if out="$(podman exec "$c" sh -c "$apt install /pkgs/old.deb" 2>&1)"; then
     fail "$c: install over a file conflict unexpectedly succeeded"
+  elif grep -q "which is also in package meshnode-blocker" <<<"$out"; then
+    pass "$c: install over a file conflict fails on that conflict"
   else
-    pass "$c: install over a file conflict fails"
+    echo "$out"
+    fail "$c: install over a file conflict failed for another reason"
   fi
+  # The user proves preinst ran, so the abort-install path below was really taken.
+  check "$c" "preinst ran before the failed unpack (user created)" 'getent passwd meshnode'
   check "$c" "abort-install clears the install flag" '[ ! -e /run/meshnode-package-install ]'
   check "$c" "meshnode is not installed after the failed install" \
     '[ "$(dpkg-query -W -f "\${db:Status-Status}" meshnode 2>/dev/null)" != installed ]'
   step "$c" "remove the conflicting package" 'dpkg --purge meshnode-blocker >/dev/null' || true
+  step "$c" "delete the user and group the failed install created" '
+    userdel meshnode
+    if getent group meshnode >/dev/null; then groupdel meshnode; fi' || true
 
   lifecycle "$c" "$old_v" "$new_v" \
     "$apt install /pkgs/old.deb" \

@@ -8,6 +8,13 @@ set -e
 
 NAME=meshnode
 DATA=/var/lib/meshnode
+# Written by deb preinst on install and consumed by postinst (see preinst.sh).
+INSTALL_FLAG=/run/meshnode-package-install
+
+case "$1" in
+  # The install or upgrade failed before postinst could consume preinst's flag.
+  abort-install | abort-upgrade) rm -f "$INSTALL_FLAG" ;;
+esac
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload || true

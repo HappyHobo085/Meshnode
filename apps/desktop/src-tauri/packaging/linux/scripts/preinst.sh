@@ -19,7 +19,8 @@ case "$1" in
 esac
 
 if [ "$1" = install ]; then
-  : >"$INSTALL_FLAG" 2>/dev/null || true
+  # touch, not `: >file`: a failed redirection on a special builtin exits sh despite `|| true`.
+  touch "$INSTALL_FLAG" 2>/dev/null || true
 fi
 
 if [ "$action" = other ]; then

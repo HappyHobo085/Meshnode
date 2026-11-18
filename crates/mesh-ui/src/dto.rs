@@ -143,6 +143,10 @@ pub struct MemberDto {
     #[ts(type = "number")]
     pub lag: u64,
     pub accent_hue: u16,
+    /// The member's product version, once known.
+    pub version: Option<String>,
+    /// The member runs a version this node cannot sync with.
+    pub incompatible: bool,
 }
 
 impl From<MemberInfoView> for MemberDto {
@@ -160,6 +164,8 @@ impl From<MemberInfoView> for MemberDto {
             last_seen_ms: m.last_seen_ms,
             lag: m.lag,
             accent_hue: accent_hue(&m.id),
+            version: m.version,
+            incompatible: m.incompatible,
         }
     }
 }

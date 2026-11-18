@@ -444,6 +444,7 @@ impl Host {
             admin_socket: false,
             periodic: Periodic::Driven,
             power: Some(sink),
+            ..HostOptions::default()
         };
         let daemon = Daemon::start_opts(dir.to_owned(), cfg, opts)
             .await

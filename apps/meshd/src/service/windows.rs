@@ -691,7 +691,7 @@ fn service_main(_arguments: Vec<OsString>) {
             })?;
             let _log = logging::init(&ctx.data, &cfg.log_level);
             // Opening the node can take a while: show the SCM progress meanwhile.
-            let start = Daemon::start(ctx.data.clone(), cfg);
+            let start = Daemon::start_opts(ctx.data.clone(), cfg, crate::host_options());
             tokio::pin!(start);
             let mut ticks = tokio::time::interval(START_CHECKPOINT_EVERY);
             ticks.tick().await;

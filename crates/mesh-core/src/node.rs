@@ -10,8 +10,8 @@ use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
 use mesh_proto::{
-    InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, RemovalRecord, Role,
-    Scope,
+    InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, PeerVersion,
+    RemovalRecord, Role, Scope,
 };
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
@@ -37,8 +37,9 @@ use crate::membership::{
 use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
 use crate::transport::{
-    ALPN_JOIN, ALPN_SYNC, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
+    ALPN_JOIN, ALPN_SYNC, ALPN_VERSION, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
 };
+use crate::version::{VersionHandler, local_version, sync_alpn};
 
 const STORE_FILE: &str = "store.redb";
 const EVENT_CAPACITY: usize = 1024;
@@ -75,6 +76,12 @@ pub struct MemberStatus {
     pub last_seen_ms: Option<u64>,
     /// Ops this node holds that the member may lack.
     pub lag: u64,
+    /// The member's versions, once a `meshnode/version` probe succeeded (this node's own
+    /// for itself); the last known one while the member is offline.
+    pub version: Option<PeerVersion>,
+    /// `version` cannot sync with this node's (another `sync` protocol or store schema):
+    /// the member shows as "incompatible version" rather than just offline.
+    pub incompatible: bool,
 }
 
 /// What [`Node::wake`] saw.
@@ -100,6 +107,8 @@ pub struct Node {
 
 pub(crate) struct Inner {
     pub(crate) cfg: NodeConfig,
+    /// This node's own versions (what the version probe serves).
+    version: Arc<PeerVersion>,
     pub(crate) genesis: MeshGenesis,
     pub(crate) me: NodeId,
     pub(crate) endpoint: Endpoint,
@@ -154,8 +163,13 @@ impl Inner {
                     rtt_ms: None,
                     last_seen_ms: None,
                     lag: 0,
+                    version: None,
+                    incompatible: false,
                 };
-                if *id != self.me {
+                if *id == self.me {
+                    s.version = Some((*self.version).clone());
+                } else {
+                    (s.version, s.incompatible) = self.peers.version(id);
                     if let Some(rtt) = self.peers.link(id) {
                         s.online = true;
                         s.rtt_ms = rtt;
@@ -296,7 +310,8 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Extra protocols must not replace a built-in one or each other (iroh's `Router` keeps
 /// only the last handler per ALPN).
 fn check_extra_protocols(cfg: &NodeConfig) -> Result<(), NodeError> {
-    let mut seen: Vec<&[u8]> = vec![ALPN_SYNC, ALPN_JOIN, iroh_blobs::ALPN];
+    let sync = sync_alpn(cfg);
+    let mut seen: Vec<&[u8]> = vec![&sync, ALPN_SYNC, ALPN_JOIN, ALPN_VERSION, iroh_blobs::ALPN];
     for (alpn, _) in &cfg.extra_protocols {
         if seen.contains(&alpn.as_slice()) {
             return Err(NodeError::ProtocolConflict(format!(
@@ -512,6 +527,7 @@ pub(crate) async fn start(
     }
 
     check_extra_protocols(&cfg)?;
+    let version = Arc::new(local_version(&cfg));
     let endpoint = build_endpoint(&cfg, &key).await?;
     let peers = PeerManager::new(
         PeerEnv {
@@ -533,6 +549,8 @@ pub(crate) async fn start(
             )),
             on_catch_up: cfg.on_catch_up.clone(),
             pulls: pulls.clone(),
+            sync_alpn: sync_alpn(&cfg),
+            version: version.clone(),
         },
         cancel.child_token(),
     );
@@ -561,8 +579,14 @@ pub(crate) async fn start(
     .await?;
     let mut router = Router::builder(endpoint.clone())
         .accept(
-            ALPN_SYNC,
+            sync_alpn(&cfg),
             Gate::new(SyncHandler(peers.clone()), membership_rx.clone())
+                .with_provisional(peers.provisional()),
+        )
+        // Gated like `sync/1`: only members learn this node's versions.
+        .accept(
+            ALPN_VERSION,
+            Gate::new(VersionHandler::new(&version), membership_rx.clone())
                 .with_provisional(peers.provisional()),
         )
         .accept(
@@ -644,6 +668,7 @@ pub(crate) async fn start(
 
     let inner = Arc::new(Inner {
         cfg,
+        version,
         genesis,
         me,
         endpoint,

@@ -707,6 +707,8 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             lag: 0,
+            version: None,
+            incompatible: false,
         }
     }
 

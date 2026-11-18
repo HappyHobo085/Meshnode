@@ -133,6 +133,12 @@ pub fn members_text(members: &[MemberInfoView]) -> String {
         .map(|m| {
             let mut state = if m.is_self {
                 "self".to_string()
+            } else if m.incompatible {
+                m.version
+                    .as_ref()
+                    .map_or("incompatible version".to_string(), |v| {
+                        format!("incompatible version ({v})")
+                    })
             } else if m.online {
                 "online".to_string()
             } else {
@@ -315,6 +321,38 @@ mod tests {
         let q = qr_text("mesh1abcdef").unwrap();
         assert!(q.contains('\u{2588}') || q.contains('\u{2580}') || q.contains('\u{2584}'));
         assert!(q.lines().count() > 5);
+    }
+
+    #[test]
+    fn incompatible_member_state() {
+        let m = |incompatible, version: Option<&str>| MemberInfoView {
+            id: NodeId([7; 32]),
+            name: "pi".into(),
+            role: Role::Host,
+            platform: "linux".into(),
+            tags: vec![],
+            is_self: false,
+            effective: true,
+            online: false,
+            rtt_ms: None,
+            last_seen_ms: None,
+            lag: 0,
+            version: version.map(Into::into),
+            incompatible,
+        };
+        let t = members_text(&[
+            m(true, Some("0.2.0")),
+            m(true, None),
+            m(false, Some("0.1.0")),
+        ]);
+        let states: Vec<&str> = t.lines().skip(1).collect();
+        assert!(states[0].contains("incompatible version (0.2.0)"), "{t}");
+        assert!(states[1].contains("incompatible version "), "{t}");
+        assert!(!states[1].contains('('), "{t}");
+        assert!(
+            states[2].contains("offline") && !states[2].contains("incompatible"),
+            "{t}"
+        );
     }
 
     #[test]

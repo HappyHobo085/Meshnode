@@ -69,7 +69,7 @@ async fn run_foreground(data: &Path) -> Result<(), CliError> {
     std::fs::create_dir_all(data)
         .map_err(|e| CliError::failed(format!("data directory {}: {e}", data.display())))?;
     let _log = logging::init(data, &cfg.log_level);
-    let daemon = Daemon::start(data.to_path_buf(), cfg)
+    let daemon = Daemon::start_opts(data.to_path_buf(), cfg, meshd::host_options())
         .await
         .map_err(start_error)?;
     daemon.run_until(shutdown_signal()).await;

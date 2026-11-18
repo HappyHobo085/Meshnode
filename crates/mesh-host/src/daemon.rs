@@ -627,6 +627,7 @@ impl Inner {
         nc.bind_addr = self.opts.bind_addr;
         nc.timings = self.opts.timings.clone();
         nc.catch_up_on_incoming_after = self.catch_up_after(&power_state);
+        nc.product_version = self.opts.host.product_version.clone();
         if self.power.has_sink() {
             // The incoming-traffic catch-up holds the "catchup" wake lock, like a wake.
             let power = self.power.clone();

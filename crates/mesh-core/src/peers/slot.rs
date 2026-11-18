@@ -1,5 +1,7 @@
 //! The per-peer slot task: dial with backoff, take handed-over connections, keep one
-//! connection by the duplicate rule (spec §6.1) and run the `sync/1` session on it.
+//! connection by the duplicate rule (spec §6.1) and run the `sync/1` session on it. The
+//! peer's version is probed (`meshnode/version`) once per session and whenever a dial fails
+//! because the peer does not offer this node's sync ALPN (8b spec §5.4).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -7,7 +9,7 @@ use std::time::Duration;
 
 use iroh::EndpointAddr;
 use iroh::endpoint::{Connection, ConnectionError};
-use mesh_proto::NodeId;
+use mesh_proto::{NodeId, PeerVersion};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{debug, info, warn};
@@ -16,7 +18,8 @@ use super::{BoxFut, DIAL_TIMEOUT, DUPLICATE_GRACE, PeerEnv, Shared, Slot, lock};
 use crate::events::NodeEvent;
 use crate::node::NodeStatus;
 use crate::sync::{SessionCtx, SessionEnd, run_session};
-use crate::transport::{ALPN_SYNC, PROTOCOL, REMOVED, SHUTDOWN};
+use crate::transport::{PROTOCOL, REMOVED, SHUTDOWN};
+use crate::version;
 
 /// A running session and the connection it runs on.
 struct Live {
@@ -29,12 +32,20 @@ struct Live {
     since: Instant,
 }
 
+/// Why a dial failed: the error, and whether the peer refused the sync ALPN (it does not
+/// speak this node's sync protocol version).
+struct DialFailed {
+    error: String,
+    alpn_refused: bool,
+}
+
 enum Ev {
     Cancelled,
     Kick,
-    Dialed(Result<Connection, String>),
+    Dialed(Result<Connection, DialFailed>),
     Ended(SessionEnd),
     DialDue,
+    Probed(Result<PeerVersion, String>),
 }
 
 async fn opt<T>(f: &mut Option<BoxFut<T>>) -> T {
@@ -63,8 +74,10 @@ struct SlotTask {
     slot: Arc<Slot>,
     backoff: Duration,
     next_dial: Option<Instant>,
-    dialing: Option<BoxFut<Result<Connection, String>>>,
+    dialing: Option<BoxFut<Result<Connection, DialFailed>>>,
     live: Option<Live>,
+    /// A `meshnode/version` probe in flight.
+    probing: Option<BoxFut<Result<PeerVersion, String>>>,
 }
 
 pub(super) async fn run_slot(sh: Arc<Shared>, slot: Arc<Slot>) {
@@ -83,6 +96,7 @@ pub(super) async fn run_slot(sh: Arc<Shared>, slot: Arc<Slot>) {
         next_dial: Some(Instant::now()),
         dialing: None,
         live: None,
+        probing: None,
         sh,
         slot,
     };
@@ -119,6 +133,7 @@ impl SlotTask {
                 r = opt(&mut self.dialing) => Ev::Dialed(r),
                 e = session_end(&mut self.live) => Ev::Ended(e),
                 _ = until(dial_due) => Ev::DialDue,
+                r = opt(&mut self.probing) => Ev::Probed(r),
             };
             match ev {
                 Ev::Cancelled => break,
@@ -128,9 +143,14 @@ impl SlotTask {
                     self.on_dialed(r);
                 }
                 Ev::Ended(end) => self.on_ended(end),
+                Ev::Probed(r) => {
+                    self.probing = None;
+                    self.on_probed(r);
+                }
             }
         }
         self.dialing = None;
+        self.probing = None;
         // A close requested together with the cancellation (step 4: `REMOVED`) wins.
         let code = self.slot.lock().close.take().unwrap_or(SHUTDOWN);
         if let Some(l) = self.live.take() {
@@ -180,12 +200,13 @@ impl SlotTask {
         }
     }
 
-    fn dial_addr(&self) -> Option<EndpointAddr> {
+    /// `resolvable`: dial by bare id when no address record is known.
+    fn dial_addr(&self, resolvable: bool) -> Option<EndpointAddr> {
         let (addr, hint) = {
             let s = self.slot.lock();
             (s.addr.clone(), s.hint.clone())
         };
-        super::dial_target(self.slot.peer, [addr, hint], self.env().discovery)
+        super::dial_target(self.slot.peer, [addr, hint], resolvable)
     }
 
     fn start_dial(&mut self) {
@@ -194,21 +215,65 @@ impl SlotTask {
         }
         // Without an address (and no discovery) wait for one: `set_targets` / `add_hint`
         // kick the task with a backoff reset.
-        let Some(addr) = self.dial_addr() else {
+        let Some(addr) = self.dial_addr(self.env().discovery) else {
             return;
         };
         let ep = self.env().endpoint.clone();
+        let alpn = self.env().sync_alpn.clone();
         debug!(peer = %self.slot.peer.short(), "dialling");
         self.dialing = Some(Box::pin(async move {
-            match timeout(DIAL_TIMEOUT, ep.connect(addr, ALPN_SYNC)).await {
+            match timeout(DIAL_TIMEOUT, ep.connect(addr, &alpn)).await {
                 Ok(Ok(c)) => Ok(c),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("dial timed out".into()),
+                Ok(Err(e)) => Err(DialFailed {
+                    alpn_refused: version::alpn_refused(&e),
+                    error: e.to_string(),
+                }),
+                Err(_) => Err(DialFailed {
+                    error: "dial timed out".into(),
+                    alpn_refused: false,
+                }),
             }
         }));
     }
 
-    fn on_dialed(&mut self, r: Result<Connection, String>) {
+    /// Starts a `meshnode/version` probe unless one is in flight (or the peer is
+    /// partitioned, or has no address).
+    fn start_probe(&mut self) {
+        if self.probing.is_some() || self.blocked() {
+            return;
+        }
+        // A live session means the endpoint has a path to the peer.
+        let resolvable = self.env().discovery || self.live.is_some();
+        let Some(addr) = self.dial_addr(resolvable) else {
+            return;
+        };
+        let ep = self.env().endpoint.clone();
+        self.probing = Some(Box::pin(async move {
+            version::fetch(&ep, addr, DIAL_TIMEOUT).await
+        }));
+    }
+
+    fn on_probed(&mut self, r: Result<PeerVersion, String>) {
+        let peer = self.slot.peer.short();
+        match r {
+            Ok(v) => {
+                let incompatible = !self.env().version.compatible_with(&v);
+                if incompatible {
+                    info!(peer, product = %v.product, protocols = ?v.protocols,
+                        store_schema = v.store_schema, "peer runs an incompatible version");
+                } else {
+                    debug!(peer, product = %v.product, "peer version");
+                }
+                let mut s = self.slot.lock();
+                s.version = Some(v);
+                s.incompatible = incompatible;
+            }
+            // The last known version stays.
+            Err(e) => debug!(peer, error = %e, "version probe failed"),
+        }
+    }
+
+    fn on_dialed(&mut self, r: Result<Connection, DialFailed>) {
         match r {
             Ok(conn) => {
                 if self.blocked() {
@@ -219,8 +284,15 @@ impl SlotTask {
                 let me = self.env().me;
                 self.offer(conn, me);
             }
-            Err(e) => {
-                debug!(peer = %self.slot.peer.short(), error = %e, "dial failed");
+            Err(DialFailed {
+                error,
+                alpn_refused,
+            }) => {
+                debug!(peer = %self.slot.peer.short(), %error, alpn_refused, "dial failed");
+                if alpn_refused {
+                    // The peer does not speak this node's sync protocol: learn its version.
+                    self.start_probe();
+                }
                 if self.live.is_none() {
                     self.schedule_redial();
                 }
@@ -243,6 +315,7 @@ impl SlotTask {
                 self.live = Some(self.start_session(conn, by));
                 info!(peer = %peer.short(), "peer up");
                 let _ = self.env().events.send(NodeEvent::PeerUp(peer));
+                self.start_probe();
             }
             Some(cur) => {
                 // Same dialer: the peer replaced a connection it considers dead.
@@ -254,6 +327,7 @@ impl SlotTask {
                     debug!(peer = %peer.short(), "replacing the connection");
                     cur.conn.close(SHUTDOWN, b"duplicate connection");
                     self.live = Some(self.start_session(conn, by));
+                    self.start_probe();
                 } else {
                     debug!(peer = %peer.short(), "closing a duplicate connection");
                     conn.close(SHUTDOWN, b"duplicate connection");

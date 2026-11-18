@@ -17,6 +17,8 @@ use crate::membership::MembershipSnapshot;
 
 pub const ALPN_SYNC: &[u8] = b"meshnode/sync/1";
 pub const ALPN_JOIN: &[u8] = b"meshnode/join/1";
+/// The version probe (frozen, unversioned; see [`crate::version`]).
+pub use mesh_proto::ALPN_VERSION;
 
 pub const NOT_MEMBER: VarInt = VarInt::from_u32(1);
 pub const REMOVED: VarInt = VarInt::from_u32(2);

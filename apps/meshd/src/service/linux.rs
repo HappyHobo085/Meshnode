@@ -284,6 +284,17 @@ mod tests {
         );
     }
 
+    /// The deb/rpm ship this committed unit (spec §3.2); it must stay what `unit_file` writes.
+    #[test]
+    fn committed_unit_matches_unit_file() {
+        let committed = include_str!("../../../desktop/src-tauri/packaging/linux/meshnode.service");
+        assert_eq!(
+            committed,
+            unit_file(Path::new("/usr/bin/meshd"), Path::new("/var/lib/meshnode")),
+            "regenerate apps/desktop/src-tauri/packaging/linux/meshnode.service from unit_file"
+        );
+    }
+
     #[test]
     fn unit_prevents_restart_on_incompatible() {
         let unit = unit_file(

@@ -26,14 +26,36 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["deb", "rpm", "msi"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
+          "/usr/share/meshnode/packaged": "packaging/linux/packaged"
+        },
+        "preInstallScript": "packaging/linux/scripts/preinst.sh",
+        "postInstallScript": "packaging/linux/scripts/postinst.sh",
+        "preRemoveScript": "packaging/linux/scripts/prerm.sh",
+        "postRemoveScript": "packaging/linux/scripts/postrm.sh"
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
+          "/usr/share/meshnode/packaged": "packaging/linux/packaged"
+        },
+        "preInstallScript": "packaging/linux/scripts/preinst.sh",
+        "postInstallScript": "packaging/linux/scripts/postinst.sh",
+        "preRemoveScript": "packaging/linux/scripts/prerm.sh",
+        "postRemoveScript": "packaging/linux/scripts/postrm.sh"
+      }
+    }
   }
 }

@@ -37,6 +37,7 @@
     ],
     "linux": {
       "deb": {
+        "depends": ["libc6 (>= 2.39)"],
         "files": {
           "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
           "/usr/share/meshnode/packaged": "packaging/linux/packaged"
@@ -47,6 +48,7 @@
         "postRemoveScript": "packaging/linux/scripts/postrm.sh"
       },
       "rpm": {
+        "depends": ["libc.so.6(GLIBC_2.39)(64bit)"],
         "files": {
           "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
           "/usr/share/meshnode/packaged": "packaging/linux/packaged"

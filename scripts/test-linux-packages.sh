@@ -7,7 +7,7 @@
 # survives upgrade and remove. Purge is `dpkg --purge` for the deb and RPM_MANUAL_PURGE (below)
 # for the rpm. The deb run first checks that a failed install (abort-install) leaves no
 # install flag behind.
-#   rpm: registry.fedoraproject.org/fedora:41    deb: docker.io/library/debian:12
+#   rpm: registry.fedoraproject.org/fedora:41    deb: docker.io/library/debian:13
 # (override with MESHNODE_TEST_FEDORA_IMAGE / MESHNODE_TEST_DEBIAN_IMAGE)
 # Each base image gets systemd and the packages' GUI dependencies (webkit2gtk, gtk3) in a
 # local image, built once and tagged by a hash of its Containerfile; that build needs the
@@ -17,18 +17,17 @@
 #
 # "old" is any earlier build, e.g. one made after `scripts/set-version.sh 0.0.1` in a scratch
 # copy of the repo. Exits 0 when every assertion passes.
-# meshd must run on each image's glibc: a binary linked against a newer glibc than the image's
-# fails the version and "meshd runs" checks.
+# The packages need glibc >= 2.39 (they declare it), which rules out Debian 12 (2.36).
 # The single-quoted commands run in the containers' sh, which expands them there.
 # shellcheck disable=SC2016
 set -euo pipefail
 
 FEDORA_IMAGE="${MESHNODE_TEST_FEDORA_IMAGE:-registry.fedoraproject.org/fedora:41}"
-DEBIAN_IMAGE="${MESHNODE_TEST_DEBIAN_IMAGE:-docker.io/library/debian:12}"
+DEBIAN_IMAGE="${MESHNODE_TEST_DEBIAN_IMAGE:-docker.io/library/debian:13}"
 # rpm has no purge; docs/e2e-checklist.md gives the owner this exact command.
 RPM_MANUAL_PURGE='rpm -e meshnode && userdel meshnode && rm -rf /var/lib/meshnode'
 
-[ "$#" -eq 4 ] || { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ "$#" -eq 4 ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 for f in "$@"; do [ -f "$f" ] || { echo "no such package: $f" >&2; exit 2; }; done
 old_rpm="$(realpath "$1")"
 new_rpm="$(realpath "$2")"

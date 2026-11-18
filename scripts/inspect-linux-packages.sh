@@ -3,6 +3,7 @@
 #   - both carry /usr/bin/meshd, /usr/lib/systemd/system/meshnode.service (mode 0644) and the
 #     package marker /usr/share/meshnode/packaged
 #   - both are named meshnode with the version scripts/check-version.sh prints
+#   - both require glibc >= 2.39 (deb `libc6 (>= 2.39)`, rpm `libc.so.6(GLIBC_2.39)(64bit)`)
 #   - the unit inside each is byte-identical to the committed one
 #   - all four scriptlets are present, and shellcheck passes on the scriptlet sources
 # Needs rpm on the host; dpkg-deb and shellcheck run in rootless podman
@@ -39,8 +40,13 @@ expect "rpm has the unit (0644)" "$rpm_list" '^-rw-r--r-- .* /usr/lib/systemd/sy
 expect "rpm has the marker" "$rpm_list" ' /usr/share/meshnode/packaged$'
 rpm_name="$(rpm -qp --queryformat '%{NAME}' "$rpm_file")"
 rpm_version="$(rpm -qp --queryformat '%{VERSION}' "$rpm_file")"
-[ "$rpm_name" = meshnode ] && pass "rpm name meshnode" || fail "rpm name is '$rpm_name'"
-[ "$rpm_version" = "$version" ] && pass "rpm version $version" || fail "rpm version '$rpm_version' != '$version'"
+if [ "$rpm_name" = meshnode ]; then pass "rpm name meshnode"; else fail "rpm name is '$rpm_name'"; fi
+if [ "$rpm_version" = "$version" ]; then
+  pass "rpm version $version"
+else
+  fail "rpm version '$rpm_version' != '$version'"
+fi
+expect "rpm requires glibc >= 2.39" "$(rpm -qp --requires "$rpm_file")" '^libc\.so\.6\(GLIBC_2\.39\)\(64bit\)$'
 rpm_scripts="$(rpm -qp --scripts "$rpm_file")"
 echo "$rpm_scripts" | grep -E '^(pre|post)(install|uninstall) scriptlet' || true
 for s in preinstall postinstall preuninstall postuninstall; do
@@ -58,7 +64,7 @@ cp "$deb_file" "$tmp/pkg.deb"
 podman run --rm --network none -v "$tmp:/w:Z" "$DEBIAN_IMAGE" sh -euc '
   dpkg-deb -c /w/pkg.deb >/w/deb-list
   dpkg-deb -I /w/pkg.deb >/w/deb-info
-  dpkg-deb -f /w/pkg.deb Package Version >/w/deb-fields
+  dpkg-deb -f /w/pkg.deb Package Version Depends >/w/deb-fields
   mkdir /w/deb-data /w/deb-control
   dpkg-deb -x /w/pkg.deb /w/deb-data
   dpkg-deb -e /w/pkg.deb /w/deb-control
@@ -72,6 +78,7 @@ expect "deb has the marker" "$deb_list" ' (\./)?usr/share/meshnode/packaged$'
 deb_fields="$(cat "$tmp/deb-fields")"
 expect "deb name meshnode" "$deb_fields" '^Package: meshnode$'
 expect "deb version $version" "$deb_fields" "^Version: ${version//./\\.}\$"
+expect "deb depends on libc6 (>= 2.39)" "$deb_fields" '^Depends: (.*, )?libc6 \(>= 2\.39\)(,|$)'
 for s in preinst postinst prerm postrm; do
   if [ -x "$tmp/deb-control/$s" ]; then pass "deb has an executable $s"; else fail "deb lacks $s"; fi
 done

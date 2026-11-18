@@ -549,7 +549,12 @@ async fn kv_write_refused_when_removed_gives_503() {
     // Freeze B's deployer so the service is still active there when B learns of its
     // removal (left alone, the deployer would unplace it: B is no longer effective).
     b.pause_deployer(true).await;
+    // Apart, the record reaches B by hand: over a live session A's reactor may close B with
+    // `REMOVED` before the record is pushed, and B would stay `RefusedAsRemoved` (writes
+    // still allowed by design) instead of `Removed`.
+    split(&n).await;
     n.nodes[0].remove(n.id(1)).await.unwrap();
+    n.nodes[1].deliver_from(&n.nodes[0]).await.unwrap();
     wait_until("B learns of its removal", T, || {
         matches!(n.nodes[1].status(), NodeStatus::Removed { .. })
     })

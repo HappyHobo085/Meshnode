@@ -2,7 +2,13 @@
 # Builds the arm64 APK: `cargo tauri android build --target aarch64 --apk`, debug unless
 # `--release` is given. Output: src-tauri/gen/android/app/build/outputs/apk/universal/<profile>/.
 #
-# Usage: apps/android/build-apk.sh [--release]
+# Usage: apps/android/build-apk.sh [--release [--unsigned]]
+#
+# `--release` signs with the local keystore named by $MESHNODE_KEYSTORE_PROPERTIES, else
+# apps/android/keystore.properties (see keystore.properties.example); Gradle fails without it.
+# The script then checks the signature with `apksigner verify --print-certs` and prints the
+# certificate's SHA-256 digest. `--release --unsigned` (CI, which has no key) builds an unsigned
+# APK instead, through the Gradle property meshnodeUnsignedRelease=true, and skips the check.
 #
 # The page is the shared UI (apps/ui): the CLI builds it first (tauri.conf.json's
 # beforeBuildCommand, run from apps/android, hence `--prefix ../ui`) and embeds apps/ui/dist
@@ -21,11 +27,29 @@ set -euo pipefail
 
 profile=debug
 cli_flags=(--debug)
-if [ "${1:-}" = "--release" ]; then
-    profile=release
-    cli_flags=()
+unsigned=false
+for arg in "$@"; do
+    case "$arg" in
+        --release) profile=release; cli_flags=() ;;
+        --unsigned) unsigned=true ;;
+        *) echo "build-apk: unknown argument: $arg (usage: build-apk.sh [--release [--unsigned]])" >&2; exit 2 ;;
+    esac
+done
+if [ "$unsigned" = true ] && [ "$profile" != release ]; then
+    echo "build-apk: --unsigned needs --release" >&2
+    exit 2
 fi
 Profile="${profile^}"
+# Gradle reads ORG_GRADLE_PROJECT_<name> as the project property <name>; the environment reaches
+# the Gradle run the Tauri CLI starts as well as the fallback's.
+if [ "$unsigned" = true ]; then
+    export ORG_GRADLE_PROJECT_meshnodeUnsignedRelease=true
+fi
+# Gradle resolves a relative path against the app module, not the caller's directory.
+if [ -n "${MESHNODE_KEYSTORE_PROPERTIES:-}" ]; then
+    MESHNODE_KEYSTORE_PROPERTIES="$(realpath -m -- "$MESHNODE_KEYSTORE_PROPERTIES")"
+    export MESHNODE_KEYSTORE_PROPERTIES
+fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tauri_dir="$here/src-tauri"
@@ -38,8 +62,26 @@ if [ ! -d "$here/../ui/node_modules" ]; then
     echo "build-apk: installing apps/ui's npm packages" >&2
     npm --prefix "$here/../ui" ci
 fi
+# A signed release: check the signature and print the certificate digest (never a password).
+verify_release() {
+    if [ "$profile" != release ] || [ "$unsigned" = true ]; then
+        return 0
+    fi
+    local apk="$android_dir/app/build/outputs/apk/universal/release/app-universal-release.apk"
+    local apksigner
+    apksigner="$(command -v apksigner || echo "${ANDROID_HOME:-}/build-tools/36.0.0/apksigner")"
+    local certs
+    if ! certs="$("$apksigner" verify --print-certs "$apk")"; then
+        echo "build-apk: $apk does not verify" >&2
+        exit 1
+    fi
+    echo "build-apk: signed $apk"
+    grep "certificate SHA-256 digest" <<<"$certs"
+}
+
 cd "$tauri_dir"
 if cargo tauri android build "${cli_flags[@]}" --target aarch64 --apk --ci 2>&1 | tee "$log"; then
+    verify_release
     exit 0
 fi
 if ! grep -q "Failed to create a symbolic link" "$log"; then
@@ -61,3 +103,4 @@ cd "$android_dir"
 ./gradlew "assembleUniversal$Profile" \
     -PabiList=arm64-v8a -ParchList=arm64 -PtargetList=aarch64 \
     -x "rustBuildArm64$Profile" -x "rustBuildUniversal$Profile" --warn
+verify_release

@@ -121,7 +121,10 @@ impl Daemon {
         let inner = &*self.inner;
         let mut s = StatusInfo {
             state: self.state(),
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_version: match inner.opts.host.product_version.as_str() {
+                "" => env!("CARGO_PKG_VERSION").into(),
+                v => v.into(),
+            },
             data_dir: inner.data_dir.display().to_string(),
             node_id: None,
             mesh_id: None,

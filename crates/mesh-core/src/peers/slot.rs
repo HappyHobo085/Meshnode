@@ -258,15 +258,19 @@ impl SlotTask {
         match r {
             Ok(v) => {
                 let incompatible = !self.env().version.compatible_with(&v);
-                if incompatible {
+                let was = {
+                    let mut s = self.slot.lock();
+                    s.version = Some(v.clone());
+                    std::mem::replace(&mut s.incompatible, incompatible)
+                };
+                // At info only when the state changes: an incompatible peer is re-probed on
+                // every redial.
+                if incompatible && !was {
                     info!(peer, product = %v.product, protocols = ?v.protocols,
                         store_schema = v.store_schema, "peer runs an incompatible version");
                 } else {
-                    debug!(peer, product = %v.product, "peer version");
+                    debug!(peer, product = %v.product, incompatible, "peer version");
                 }
-                let mut s = self.slot.lock();
-                s.version = Some(v);
-                s.incompatible = incompatible;
             }
             // The last known version stays.
             Err(e) => debug!(peer, error = %e, "version probe failed"),
@@ -361,6 +365,9 @@ impl SlotTask {
             let mut s = self.slot.lock();
             s.live = Some(conn.clone());
             s.cmds = Some(tx);
+            // A sync session runs: the peer speaks this node's sync protocol, so a flag
+            // left from an earlier version is stale (the session's probe refreshes it).
+            s.incompatible = false;
         }
         let c = conn.clone();
         let fut = Box::pin(async move {

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Verifies the single Meshnode product version across the five files that carry it:
-#   apps/meshd/Cargo.toml, apps/{desktop,android}/src-tauri/{Cargo.toml,tauri.conf.json}
+# Verifies the single Meshnode product version across the six files that carry it:
+#   apps/meshd/Cargo.toml, crates/mesh-ffi/Cargo.toml (the Android host library), apps/{desktop,android}/src-tauri/{Cargo.toml,tauri.conf.json}
 #
-#   check-version.sh [root]    print the version and exit 0 when all five agree; otherwise
+#   check-version.sh [root]    print the version and exit 0 when all six agree; otherwise
 #                              exit 1 naming each file that differs from apps/meshd/Cargo.toml
 #   check-version.sh --self-test   exercise the check on a temp copy of the tree
 #
@@ -13,6 +13,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FILES=(
   apps/meshd/Cargo.toml
+  crates/mesh-ffi/Cargo.toml
   apps/desktop/src-tauri/Cargo.toml
   apps/desktop/src-tauri/tauri.conf.json
   apps/android/src-tauri/Cargo.toml

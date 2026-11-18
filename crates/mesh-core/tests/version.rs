@@ -159,3 +159,41 @@ async fn version_probe_refuses_non_member() {
     outsider.close().await;
     timeout(T, a.shutdown()).await.unwrap();
 }
+
+/// B, once on an incompatible build, restarts on a compatible one: A's flag clears, and A
+/// never shows B online and incompatible at once (a running sync session clears it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgraded_peer_is_compatible_again() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = pair(
+        da.path(),
+        db.path(),
+        cfg(da.path(), "a", "0.1.0"),
+        sync2_cfg(db.path(), "b", "0.2.0"),
+    )
+    .await;
+    let b_id = b.node_id();
+    wait_until("A sees B as incompatible", T, || async {
+        status_of(&a, b_id).is_some_and(|s| s.incompatible)
+    })
+    .await;
+    timeout(T, b.shutdown()).await.unwrap();
+
+    let genesis = read_genesis(da.path()).unwrap().unwrap();
+    let hints = vec![(a.node_id(), own_addr(&a).await)];
+    let b = Node::start_member_for_test(cfg(db.path(), "b", "0.1.1"), genesis, hints)
+        .await
+        .unwrap();
+    a.add_hint(b_id, addr_to_bytes(&b.endpoint_addr_for_test()));
+    wait_until("A sees B online and compatible", T, || async {
+        let s = status_of(&a, b_id).unwrap();
+        assert!(
+            !(s.online && s.incompatible),
+            "online yet incompatible: {s:?}"
+        );
+        s.online && s.version.as_ref().is_some_and(|v| v.product == "0.1.1")
+    })
+    .await;
+    timeout(T, a.shutdown()).await.unwrap();
+    timeout(T, b.shutdown()).await.unwrap();
+}

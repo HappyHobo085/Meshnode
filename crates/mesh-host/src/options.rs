@@ -12,9 +12,9 @@ pub struct HostOptions {
     pub periodic: Periodic,
     /// Wake locks for the power policy (Android); `None` takes none.
     pub power: Option<Arc<dyn WakeLockSink>>,
-    /// The product version the node reports to peers (`NodeConfig::product_version`). A
-    /// host sets its own package version, which `scripts/set-version.sh` maintains; the
-    /// default is this crate's version.
+    /// The product version the node reports to peers (`NodeConfig::product_version`) and
+    /// `Status` reports as the daemon version. A host sets its own package version, which
+    /// `scripts/set-version.sh` maintains; empty by default (peers then see no version).
     pub product_version: String,
 }
 
@@ -24,7 +24,7 @@ impl Default for HostOptions {
             admin_socket: true,
             periodic: Periodic::Timers,
             power: None,
-            product_version: env!("CARGO_PKG_VERSION").into(),
+            product_version: String::new(),
         }
     }
 }

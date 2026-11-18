@@ -444,7 +444,8 @@ impl Host {
             admin_socket: false,
             periodic: Periodic::Driven,
             power: Some(sink),
-            ..HostOptions::default()
+            // mesh-ffi's version is the product version (scripts/set-version.sh bumps it).
+            product_version: env!("CARGO_PKG_VERSION").into(),
         };
         let daemon = Daemon::start_opts(dir.to_owned(), cfg, opts)
             .await

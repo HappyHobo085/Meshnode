@@ -101,6 +101,57 @@ pub fn service_exit(err: &DaemonError) -> (ServiceExit, bool) {
     }
 }
 
+/// Whether `service install|uninstall` may proceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageGate {
+    Allow,
+    /// The system package owns the service; use the package manager.
+    Refuse,
+}
+
+/// Package-managed installs (the deb/rpm, the MSI) own the service: `meshd service
+/// install|uninstall` is refused while the package's marker file exists, unless a package
+/// script passes the hidden `--from-package`.
+pub fn is_package_managed(marker_exists: bool, from_package: bool) -> PackageGate {
+    if marker_exists && !from_package {
+        PackageGate::Refuse
+    } else {
+        PackageGate::Allow
+    }
+}
+
+/// The file the package drops to mark the install as package-managed: Linux
+/// `/usr/share/meshnode/packaged`, Windows `<install_dir>\packaged`; `None` elsewhere.
+pub fn package_marker() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from("/usr/share/meshnode/packaged"))
+    }
+    #[cfg(windows)]
+    {
+        windows::install_dir().ok().map(|d| d.join("packaged"))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// Records `admin.windows_user_sid` for the pipe's admin user: an SID already in `cfg`
+/// stays (an upgrade never overwrites it), otherwise `resolve` supplies one. Returns
+/// whether `cfg` changed.
+pub fn apply_admin_sid(
+    cfg: &mut crate::MeshdConfig,
+    resolve: impl FnOnce() -> Result<String, ServiceError>,
+) -> Result<bool, ServiceError> {
+    if cfg.admin.windows_user_sid.is_some() {
+        return Ok(false);
+    }
+    let sid = resolve()?;
+    cfg.set("admin.windows_user_sid", &sid)?;
+    Ok(true)
+}
+
 /// Who may change services, as §7's messages name them.
 #[cfg(windows)]
 const PRIVILEGED: &str = "Administrator";
@@ -156,7 +207,7 @@ mod platform {
 
     use super::{ServiceError, ServiceStatus};
 
-    pub fn install(_data: &Path) -> Result<(), ServiceError> {
+    pub fn install(_data: &Path, _admin_user: Option<&str>) -> Result<(), ServiceError> {
         Err(ServiceError::Unsupported)
     }
     pub fn installed() -> Result<super::Installed, ServiceError> {
@@ -186,13 +237,21 @@ pub fn default_data_dir() -> PathBuf {
     mesh_admin::default_data_dir()
 }
 
-/// Installs the service for the data directory `data` and starts it.
-pub fn install(data: &Path) -> Result<(), ServiceError> {
+/// Installs the service for the data directory `data` and starts it. On Windows
+/// `admin_user` (an account name, as the MSI passes `[LogonUser]`) is the user the admin
+/// pipe admits; without it that is the installing user.
+pub fn install(data: &Path, admin_user: Option<&str>) -> Result<(), ServiceError> {
     require_privileges("install")?;
+    #[cfg(not(windows))]
+    if admin_user.is_some() {
+        return Err(ServiceError::Failed(
+            "--admin-user is only supported on Windows".into(),
+        ));
+    }
     // The service is started elsewhere; a relative directory would mean nothing there.
     let data =
         std::path::absolute(data).map_err(io_err(format!("resolving {}", data.display())))?;
-    platform::install(&data)
+    platform::install(&data, admin_user)
 }
 
 /// What is installed, as read back from the service's registration (the systemd unit, the
@@ -411,6 +470,39 @@ mod tests {
             service_exit(&other),
             (ServiceExit::ServiceSpecific(1), true)
         );
+    }
+
+    #[test]
+    fn package_marker_gates_install() {
+        assert_eq!(is_package_managed(true, false), PackageGate::Refuse);
+        assert_eq!(is_package_managed(true, true), PackageGate::Allow);
+        assert_eq!(is_package_managed(false, false), PackageGate::Allow);
+        assert_eq!(is_package_managed(false, true), PackageGate::Allow);
+    }
+
+    #[test]
+    fn admin_user_kept_on_upgrade() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let mut cfg = crate::MeshdConfig::default();
+        cfg.set("admin.windows_user_sid", sid).unwrap();
+        let changed = apply_admin_sid(&mut cfg, || panic!("must not resolve")).unwrap();
+        assert!(!changed);
+        assert_eq!(cfg.admin.windows_user_sid.as_deref(), Some(sid));
+
+        let mut fresh = crate::MeshdConfig::default();
+        let changed = apply_admin_sid(&mut fresh, || Ok("S-1-5-21-9-9-9-1002".into())).unwrap();
+        assert!(changed);
+        assert_eq!(
+            fresh.admin.windows_user_sid.as_deref(),
+            Some("S-1-5-21-9-9-9-1002")
+        );
+        let err = apply_admin_sid(&mut crate::MeshdConfig::default(), || {
+            Err(ServiceError::Failed(
+                "cannot resolve the installing user x".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
     }
 
     fn parse_fixed(_: &str) -> Option<PathBuf> {

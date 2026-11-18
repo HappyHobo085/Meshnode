@@ -69,7 +69,7 @@ fn install_without_privileges_refused() {
         "root"
     };
     let checks: [(&str, Result<(), ServiceError>); 4] = [
-        ("install", service::install(data.path())),
+        ("install", service::install(data.path(), None)),
         (
             "uninstall",
             service::uninstall(Some(data.path()), false).map(drop),

@@ -147,12 +147,23 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum ServiceCmd {
     /// Install the service for the data directory (--data) and start it.
-    Install,
+    Install {
+        /// Used only by package scripts: install although a system package owns the service.
+        #[arg(long, hide = true)]
+        from_package: bool,
+        /// Used only by the Windows installer: the account (`DOMAIN\user` or `user`) the
+        /// admin pipe admits.
+        #[arg(long, hide = true, requires = "from_package", value_name = "ACCOUNT")]
+        admin_user: Option<String>,
+    },
     /// Stop and remove the service; the data directory is kept unless --purge-data.
     Uninstall {
         /// Also delete the data directory.
         #[arg(long)]
         purge_data: bool,
+        /// Used only by package scripts: uninstall although a system package owns the service.
+        #[arg(long, hide = true)]
+        from_package: bool,
     },
     /// Start the installed service.
     Start,

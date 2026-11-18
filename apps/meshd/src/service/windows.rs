@@ -33,9 +33,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-    TokenUser,
+    GetTokenInformation, LookupAccountNameW, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE, SidTypeUser,
+    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -46,7 +46,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::core::GUID;
 
 use super::eventlog::{self, Event, EventLog};
-use super::{Installed, SERVICE_NAME, ServiceError, ServiceExit, ServiceStatus, io_err};
+use super::{
+    Installed, SERVICE_NAME, ServiceError, ServiceExit, ServiceStatus, apply_admin_sid, io_err,
+};
 use crate::{Daemon, DaemonError, MeshdConfig, logging};
 
 /// The service's display name.
@@ -246,20 +248,35 @@ fn open(manager: &ServiceManager, access: ServiceAccess) -> Result<Option<Servic
     }
 }
 
-pub fn install(data: &Path) -> Result<(), ServiceError> {
+pub fn install(data: &Path, admin_user: Option<&str>) -> Result<(), ServiceError> {
     let scm = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     if open(&scm, ServiceAccess::QUERY_STATUS)?.is_some() {
         return Err(ServiceError::AlreadyInstalled);
     }
     let exe = install_binary()?;
     protect_data_dir(data)?;
-    // The admin pipe also admits the installing user (spec §5.2).
+    // The admin pipe also admits the installing user (spec §5.2): the account the MSI names,
+    // else the one this process runs as. An SID already recorded (an upgrade) stays.
     let mut cfg = MeshdConfig::load_or_default(data)?;
-    let sid = current_user_sid().map_err(io_err("reading the installing user's SID"))?;
+    let recorded = match admin_user {
+        Some(account) => apply_admin_sid(&mut cfg, || {
+            account_sid(account).map_err(|_| {
+                ServiceError::Failed(format!("cannot resolve the installing user {account}"))
+            })
+        })
+        .map(drop),
+        None => apply_admin_sid(&mut cfg, || {
+            current_user_sid().map_err(io_err("reading the installing user's SID"))
+        })
+        .map(drop),
+    };
     // Only an account SID is accepted; anything else is skipped, so the pipe stays closed
-    // to the installing user (the CLI then needs an elevated shell).
-    if let Err(e) = cfg.set("admin.windows_user_sid", &sid) {
-        eprintln!("warning: the installing user's SID {sid} is not recorded: {e}");
+    // to the installing user (the CLI then needs an elevated shell). An account the MSI
+    // named that cannot be resolved fails the install instead.
+    match (recorded, admin_user) {
+        (Ok(()), _) => {}
+        (Err(e), Some(_)) => return Err(e),
+        (Err(e), None) => eprintln!("warning: the installing user is not recorded: {e}"),
     }
     cfg.save(data)?;
     eventlog::register().map_err(io_err("registering the Meshnode Event Log source"))?;
@@ -818,6 +835,57 @@ pub fn current_user_sid() -> io::Result<String> {
         // SAFETY: the call above filled `buf` with a TOKEN_USER whose SID points into `buf`.
         sid_string(unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid })
     })
+}
+
+/// The string SID of the user account `account` (`DOMAIN\\user`, `user` or a UPN), by
+/// `LookupAccountNameW`. Only a user account resolves; a group or alias is an error.
+pub fn account_sid(account: &str) -> io::Result<String> {
+    let name = wide(account);
+    let mut sid_len = 0u32;
+    let mut domain_len = 0u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a size query: null buffers with zero lengths; `name` is NUL-terminated and
+    // the out pointers are valid. The local system is searched (null system name).
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if sid_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `u64` elements keep the SID buffer aligned.
+    let mut sid = vec![0u64; (sid_len as usize).div_ceil(8)];
+    let mut domain = vec![0u16; domain_len.max(1) as usize];
+    // SAFETY: the buffers hold the sizes the first call reported (the lengths are passed
+    // in); `name` and the out pointers are valid.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if kind != SidTypeUser {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{account} is not a user account"),
+        ));
+    }
+    sid_string(sid.as_mut_ptr().cast())
 }
 
 /// Runs `f` with this process's token, open for querying.

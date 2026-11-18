@@ -217,11 +217,35 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 /// default), uninstall checks it against the installed one.
 fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> {
     use meshd::service;
+    service_with(requested, cmd, service::package_marker().as_deref())
+}
+
+/// The refusal for `service install|uninstall` while a system package owns the service.
+const PACKAGE_MANAGED: &str = "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead";
+
+/// [`service`] with the package marker's path given.
+fn service_with(
+    requested: Option<PathBuf>,
+    cmd: ServiceCmd,
+    marker: Option<&Path>,
+) -> Result<(), CliError> {
+    use meshd::service;
     let failed = |e: service::ServiceError| CliError::failed(e.to_string());
+    let gate = |from_package| match service::is_package_managed(
+        marker.is_some_and(Path::exists),
+        from_package,
+    ) {
+        service::PackageGate::Allow => Ok(()),
+        service::PackageGate::Refuse => Err(CliError::failed(PACKAGE_MANAGED)),
+    };
     match cmd {
-        ServiceCmd::Install => {
+        ServiceCmd::Install {
+            from_package,
+            admin_user,
+        } => {
+            gate(from_package)?;
             let data = requested.unwrap_or_else(service::default_data_dir);
-            service::install(&data).map_err(failed)?;
+            service::install(&data, admin_user.as_deref()).map_err(failed)?;
             say!(
                 "Installed and started the meshnode service (data directory {}).",
                 data.display()
@@ -231,7 +255,11 @@ fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> 
                 say!("Log in again to use meshd's commands without sudo (group meshnode).");
             }
         }
-        ServiceCmd::Uninstall { purge_data } => {
+        ServiceCmd::Uninstall {
+            purge_data,
+            from_package,
+        } => {
+            gate(from_package)?;
             match service::uninstall(requested.as_deref(), purge_data).map_err(failed)? {
                 Some(purged) => say!(
                     "Removed the meshnode service and deleted {}.",
@@ -690,6 +718,31 @@ mod tests {
     use mesh_proto::Role;
 
     use super::*;
+
+    #[test]
+    fn install_refused_when_package_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("packaged");
+        std::fs::write(&marker, b"").unwrap();
+        let data = dir.path().join("data");
+        let install = || ServiceCmd::Install {
+            from_package: false,
+            admin_user: None,
+        };
+        let uninstall = || ServiceCmd::Uninstall {
+            purge_data: true,
+            from_package: false,
+        };
+        for cmd in [install(), uninstall()] {
+            let err = service_with(Some(data.clone()), cmd, Some(&marker)).unwrap_err();
+            assert_eq!(
+                err.message,
+                "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead"
+            );
+            assert_eq!(err.code, 1);
+        }
+        assert!(!data.exists(), "nothing is written");
+    }
 
     fn member(first: u8, second: u8, name: &str) -> MemberInfoView {
         let mut id = [0u8; 32];

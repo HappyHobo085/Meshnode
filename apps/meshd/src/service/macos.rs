@@ -117,7 +117,7 @@ mod installer {
         Ok(output("launchctl", &["print", &target()])?.status.success())
     }
 
-    pub fn install(data: &Path) -> Result<(), ServiceError> {
+    pub fn install(data: &Path, _admin_user: Option<&str>) -> Result<(), ServiceError> {
         if is_installed() {
             return Err(ServiceError::AlreadyInstalled);
         }

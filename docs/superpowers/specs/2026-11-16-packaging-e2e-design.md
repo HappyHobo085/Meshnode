@@ -269,3 +269,85 @@ migrations, mixed-version compatibility, macOS packaging).
 Everything marked *builder's call* or *designer's guess* above; the exact Tauri bundler configuration; the
 versionCode formula; the peer-version mechanism within §5.4's constraints; the packaging-check tooling; plan
 granularity. Anything that would change an owner decision in §1 goes back to the owner.
+
+## 11. As built (differences from this design)
+
+Where this section and the text above disagree, this section is what was built. Master spec §2, §10, §13,
+§14 and §15 carry the same changes. The MSI (plan Task 8) and CI (Task 11) are not built yet; the MSI text
+in the docs is written from §3.3 and marked "(confirmed in Task 8)".
+
+### 11.1 Versioning (§2)
+- Six files carry the version: `apps/meshd/Cargo.toml` (the source), `crates/mesh-ffi/Cargo.toml` (so the
+  Android node reports the product version), and `apps/{desktop,android}/src-tauri/{Cargo.toml,
+  tauri.conf.json}`. `scripts/set-version.sh <x.y.z> [root]` writes them; `scripts/check-version.sh [root]`
+  fails naming each file that differs.
+- **versionCode** is derived by Tauri, not by us: `major*1000000 + minor*1000 + patch`. `set-version.sh`
+  enforces minor and patch ≤ 999, major ≤ 2100 and not `0.0.0`. A release build fails when
+  `tauri.properties` lacks the versionCode or versionName (debug keeps Gradle's defaults).
+
+### 11.2 Linux packages (§3.2)
+- Built by the Tauri bundler through `scripts/build-desktop-packages.sh`. `meshd` is an external binary
+  passed with `--config` (not in `tauri.conf.json`: tauri-build would then need a staged `meshd` for every
+  plain `cargo build` of the desktop app). The packaging files are staged with explicit modes because the
+  FAT32 checkout reports every file as 0755. Artifacts: `Meshnode-<v>-1.x86_64.rpm`, `Meshnode_<v>_amd64.deb`;
+  package name `meshnode`; marker `/usr/share/meshnode/packaged`.
+- **Upgrade order:** the scriptlets do not stop the unit before the files are replaced; postinst runs
+  `systemctl try-restart` (Debian's `dh_installsystemd` default). dpkg and rpm replace files by rename, so
+  the old daemon keeps its inode until the restart. End state as designed: new binary running, unit
+  enabled, data and user untouched.
+- deb: postinst gets `configure <old>` both on upgrade and on a reinstall after `remove`, so preinst marks a
+  real install in `/run/meshnode-package-install`, which postinst consumes (`enable --now`).
+- **Minimum glibc 2.39** (Debian 13+, Ubuntu 24.04+, Fedora 40+): Rust std in the packaged binaries uses
+  `pidfd_spawnp`. Declared as `libc6 (>= 2.39)` (deb) and `libc.so.6(GLIBC_2.39)(64bit)` (rpm; the bundler's
+  rpm `depends` take no version, the soname capability is equivalent).
+- The packages are unsigned; Fedora's rpm needs `--nosignature` (`rpm -i/-U`). rpm purge is manual:
+  `rpm -e meshnode && userdel meshnode && rm -rf /var/lib/meshnode`. `userdel` keeps the `meshnode` group
+  while it has members (the owner, after joining it), so the checklist adds `groupdel meshnode` for that case.
+- The container lifecycle test runs **real systemd** (no stub, no limitation): Fedora 41 for the rpm,
+  Debian 13 for the deb (Debian 12's glibc 2.36 is now refused at install).
+
+### 11.3 Service install and the MSI (§3.3)
+- `meshd service install --from-package [--admin-user <ACCOUNT>]` and `meshd service uninstall
+  --from-package` are hidden flags for package scripts; `--admin-user` requires `--from-package` and is
+  Windows-only. Without `--from-package`, install and uninstall refuse while the package marker exists:
+  "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead".
+- An existing `admin.windows_user_sid` is kept on every install, the manual reinstall included; the account
+  lookup accepts only a user SID. Changing it later: `meshd config set admin.windows_user_sid <SID>`, then a
+  service restart.
+
+### 11.4 Android signing (§4)
+- `apps/android/build-apk.sh --release` reads `MESHNODE_KEYSTORE_PROPERTIES`, else
+  `apps/android/keystore.properties` (template `keystore.properties.example`; `storeFile` may be absolute,
+  `~/…` or relative to the properties file). The "no key" failure is raised when the release build runs
+  (task `:app:checkMeshnodeRelease`), not at Gradle configuration, so debug builds and tests need no key.
+- CI's opt-out is `--release --unsigned`, which sets the Gradle property `meshnodeUnsignedRelease=true`.
+- Gradle's configuration cache (on in `gradle.properties`) stores the signing passwords in its encrypted
+  cache under `gen/android/.gradle/`.
+
+### 11.5 Version mismatch (§5)
+- `meshd run` exits **4** on incompatible data; the unit has `RestartPreventExitStatus=4`. The reason is
+  written to `<data>/start-error.txt` (removed by the next successful start, or by any other start
+  failure). `meshd status` keeps exit 3 and prints `not running: <reason>`; the desktop app's no-daemon
+  screen shows "Meshnode refused to start".
+- **Windows:** the service stops with exit 0 after the Event Log entry, because the failure actions apply to
+  any non-zero exit. `start-error.txt` is made readable by Authenticated Users so a non-elevated `meshd
+  status` and the app can read it (uncompiled on Windows until Task 8).
+- **Android:** `FfiError::Incompatible` sets a persisted flag; boot, alarm, watchdog, sticky restart,
+  swipe-away and package-replaced do not start the service while it is set; opening the app or Start clears it.
+- **§5.3:** no version field was added to the state files. An unparsable `meshd.toml` (it refuses unknown
+  keys) counts as incompatible; so do unreadable or unknown `role.json`, `mesh.json` and `invites.json`.
+- **§5.4 mechanism:** a gated probe on the unversioned, frozen ALPN `meshnode/version`; the reply is JSON
+  `PeerVersion { product, protocols, store_schema }` that later versions extend with fields. Compatible
+  means the same `sync` `/N` and store schema; a peer that refuses our ALPNs is detected from the TLS
+  `no_application_protocol` alert. It shows as "incompatible version (x)" in `meshd members` (`meshd
+  status` has no member list) and on the UI's device card.
+- **Gap:** no dev command bumps an existing store's schema (`mesh_store::test_hooks::set_schema` is
+  test-only). The manual check triggers the same refusal through an unknown `meshd.toml` key.
+- macOS (dropped): launchd's `KeepAlive` would still restart on exit 4.
+
+### 11.6 Fixes outside the plan
+Before the packaging work, flaky or failing workspace tests were fixed so the workspace is reliably green
+(plan Tasks 0b–0g). Three were product fixes: `set_info`/`set_tags_of` wait until the member list shows
+the change (0b); a peer with a live session is dialled by its bare id (0c); the data-dir lock is released
+on drop, so a child process's copy of the descriptor no longer keeps it after shutdown, which restarts on
+upgrade depend on (0d). The rest were test-only.

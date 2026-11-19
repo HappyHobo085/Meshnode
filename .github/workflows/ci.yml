@@ -6,6 +6,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo: the debug target dirs otherwise fill the runner's disk (and the rust-cache
+  # upload pushes desktop-ui past its timeout). Panic messages keep their file:line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   test:
@@ -15,6 +18,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # The hosted image's preinstalled .NET, GHC, Android SDK and CodeQL are unused here and
+      # leave too little disk for the Rust target dirs.
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -102,6 +110,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools  # the default also asks for "tools", which the SDK repository no longer has
       - run: sdkmanager "ndk;${NDK_VERSION}"
       - run: echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
       - run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
@@ -205,8 +215,13 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
+      # The hosted image's preinstalled .NET, GHC, Android SDK and CodeQL are unused here and
+      # leave too little disk for the Rust target dirs.
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -325,6 +340,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools  # the default also asks for "tools", which the SDK repository no longer has
       - uses: actions/setup-node@v4
         with:
           node-version: "24"

@@ -41,7 +41,12 @@ beforeEach(() => {
   api.status.mockRejectedValue(UNREACHABLE);
   api.members.mockResolvedValue([]);
   api.services.mockResolvedValue([]);
-  api.desktop.connection.mockResolvedValue({ kind: "none", otherRunning: false, startError: null });
+  api.desktop.connection.mockResolvedValue({
+    kind: "none",
+    otherRunning: false,
+    startError: null,
+    noAccess: false,
+  });
   api.desktop.locateMeshd.mockResolvedValue("C:/Program Files/Meshnode/meshd.exe");
   status.set(null);
   banner.set({ kind: "unreachable", error: UNREACHABLE });
@@ -59,7 +64,9 @@ it("no_daemon_actions", async () => {
   api.desktop.daemonRunUser.mockImplementation(
     () =>
       new Promise(
-        (r) => (started = () => r({ kind: "user", otherRunning: false, startError: null })),
+        (r) =>
+          (started = () =>
+            r({ kind: "user", otherRunning: false, startError: null, noAccess: false })),
       ),
   );
   await mount();
@@ -154,7 +161,12 @@ it("no_daemon_locate_cancel_is_quiet", async () => {
 it("no_daemon_shows_why_the_last_start_was_refused", async () => {
   const startError =
     "data was written by an incompatible Meshnode version (store schema 2, this build reads 1); install a matching version";
-  api.desktop.connection.mockResolvedValue({ kind: "none", otherRunning: false, startError });
+  api.desktop.connection.mockResolvedValue({
+    kind: "none",
+    otherRunning: false,
+    startError,
+    noAccess: false,
+  });
   await mount();
   const alert = screen.getByRole("alert");
   expect(alert).toHaveTextContent("Meshnode refused to start");
@@ -173,8 +185,25 @@ it("no_daemon_rereads_the_start_error_on_each_poll", async () => {
     kind: "none",
     otherRunning: false,
     startError: "data was written by an incompatible Meshnode version",
+    noAccess: false,
   });
   banner.set({ kind: "unreachable", error: UNREACHABLE });
   for (let i = 0; i < 3; i++) await tick();
   expect(screen.getByRole("alert")).toHaveTextContent("Meshnode refused to start");
+});
+
+it("no_daemon_without_access_to_the_service_says_to_join_the_group", async () => {
+  api.platform.mockResolvedValue("desktop-linux");
+  api.desktop.connection.mockResolvedValue({
+    kind: "none",
+    otherRunning: false,
+    startError: null,
+    noAccess: true,
+  });
+  await mount();
+  const alert = screen.getByRole("alert");
+  expect(alert).not.toHaveTextContent("refused to start");
+  expect(alert).toHaveTextContent("meshnode group");
+  expect(alert).toHaveTextContent("sudo usermod -aG meshnode $USER");
+  expect(alert).toHaveTextContent("log in again");
 });

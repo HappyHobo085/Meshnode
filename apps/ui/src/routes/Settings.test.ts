@@ -61,6 +61,7 @@ beforeEach(() => {
     kind: "system",
     otherRunning: false,
     startError: null,
+    noAccess: false,
   });
   api.android.powerPolicyGet.mockResolvedValue("balanced");
   api.android.powerPolicySet.mockResolvedValue(undefined);
@@ -342,6 +343,7 @@ it("settings_shows_the_second_node_notice_when_both_run", async () => {
     kind: "system",
     otherRunning: true,
     startError: null,
+    noAccess: false,
   });
   await mount();
   expect(screen.getByText(/second, separate node is running as you/)).toBeInTheDocument();

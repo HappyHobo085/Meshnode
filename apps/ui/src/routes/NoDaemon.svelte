@@ -48,15 +48,25 @@
 
   /** Why the daemon last refused to start (incompatible data), when it left that word. */
   let startError: string | null = $state(null);
-  /** An action's problem first; otherwise the daemon's own refusal. */
+  /** The service is installed but this account may not reach it (Linux: not in the group). */
+  let noAccess = $state(false);
+  /** An action's problem first; otherwise the daemon's own refusal; otherwise no access. */
   const shown: Problem | null = $derived(
     problem ??
-      (startError ? { title: "Meshnode refused to start", detail: startError, hint: null } : null),
+      (startError
+        ? { title: "Meshnode refused to start", detail: startError, hint: null }
+        : noAccess
+          ? {
+              title: "This account can't reach the Meshnode service",
+              detail: "The service is installed, but your account isn't in the meshnode group yet.",
+              hint: "Join it once with sudo usermod -aG meshnode $USER, then log in again.",
+            }
+          : null),
   );
 
   async function loadStartError() {
     try {
-      startError = (await api.desktop.connection()).startError;
+      ({ startError, noAccess } = await api.desktop.connection());
     } catch {
       // No connection info: the screen works without it.
     }

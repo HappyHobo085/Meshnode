@@ -47,6 +47,7 @@ beforeEach(() => {
     kind: "system",
     otherRunning: false,
     startError: null,
+    noAccess: false,
   });
   api.desktop.locateMeshd.mockResolvedValue("meshd.exe");
   api.desktop.defaultDeviceName.mockResolvedValue("DESK");
@@ -98,6 +99,7 @@ it("app_shows_the_second_node_notice_once", async () => {
     kind: "system",
     otherRunning: true,
     startError: null,
+    noAccess: false,
   });
   app = render(App);
   await settle();

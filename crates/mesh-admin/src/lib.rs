@@ -29,8 +29,8 @@ pub use server::{
     AdminBackend, AdminServer, MAX_CONNECTIONS, RequestIo, ServerTimeouts, UploadError,
 };
 pub use transport::{
-    Access, AdminIo, AdminStream, Endpoint, START_ERROR_FILE, connect_raw, default_data_dir,
-    endpoint_for, start_error,
+    Access, AdminIo, AdminStream, Endpoint, START_ERROR_FILE, access_denied, connect_raw,
+    default_data_dir, endpoint_for, start_error,
 };
 
 #[derive(Debug, thiserror::Error)]

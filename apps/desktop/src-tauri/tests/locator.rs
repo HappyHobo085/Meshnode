@@ -121,6 +121,28 @@ async fn connection_without_daemon_carries_the_start_error() {
     );
 }
 
+/// The system service's data directory is there but this user may not search it (Linux:
+/// not in the `meshnode` group): the connection says so, and reports no start error.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_without_access_to_the_service_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, user) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let system = root.path().join("meshnode");
+    std::fs::create_dir(&system).unwrap();
+    let transport = RelocatingTransport::new(locator(&system, user.path()));
+    transport.relocate().await;
+    assert!(!transport.connection().no_access);
+    std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores the mode: the case cannot be made.
+    let denied = std::fs::read_dir(&system).is_err();
+    let c = transport.connection();
+    std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(c.kind, ConnectionKindDto::None);
+    assert_eq!(c.no_access, denied);
+    assert_eq!(c.start_error, None);
+}
+
 /// A command through the desktop `Ui` after its daemon went away: the first attempt fails
 /// with `DaemonUnreachable`, the transport locates once more and retries.
 #[tokio::test(flavor = "multi_thread")]

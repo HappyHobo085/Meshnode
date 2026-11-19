@@ -275,6 +275,7 @@ jobs:
         working-directory: apps/ui
       - run: cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
       - name: Build the current packages
+        shell: bash  # -eo pipefail: a failed build must fail the step, not only the grep after tee
         run: |
           scripts/check-version.sh
           scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/new.txt"
@@ -282,6 +283,7 @@ jobs:
           grep '\.rpm$' "$RUNNER_TEMP/new.txt" > "$RUNNER_TEMP/new.rpm.txt"
       # The upgrade test needs an older build: 0.0.1 from this commit in a scratch worktree.
       - name: Build the 0.0.1 packages
+        shell: bash  # -eo pipefail: a failed build must fail the step, not only the grep after tee
         run: |
           OLD="$RUNNER_TEMP/meshnode-old"
           git worktree add "$OLD" HEAD

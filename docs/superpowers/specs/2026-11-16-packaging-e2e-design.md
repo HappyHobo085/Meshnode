@@ -329,7 +329,9 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
 - `meshd run` exits **4** on incompatible data; the unit has `RestartPreventExitStatus=4`. The reason is
   written to `<data>/start-error.txt` (removed by the next successful start, or by any other start
   failure). `meshd status` keeps exit 3 and prints `not running: <reason>`; the desktop app's no-daemon
-  screen shows "Meshnode refused to start".
+  screen shows "Meshnode refused to start". On Unix a permission error reading the file means "unknown",
+  not a refusal: a Linux user outside the `meshnode` group cannot search `/var/lib/meshnode`, so the
+  screen tells them to join the group and log in again instead (`ConnectionDto.noAccess`).
 - **Windows:** the service stops with exit 0 after the Event Log entry, because the failure actions apply to
   any non-zero exit. `start-error.txt` is made readable by Authenticated Users so a non-elevated `meshd
   status` and the app can read it (uncompiled on Windows until Task 8).

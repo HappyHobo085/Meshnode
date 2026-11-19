@@ -1088,15 +1088,29 @@ impl Node {
         if timeout(STOP_TIMEOUT, inner.blobs.shutdown()).await.is_err() {
             warn!("blob store shutdown timed out");
         }
-        let store = Arc::downgrade(inner.store.raw());
+        let mut store = inner.store.raw().clone();
         drop(inner);
-        // A blocking store call still in flight holds the store open until it returns.
+        // A blocking store call still in flight (its caller was dropped) holds the store open
+        // until it returns. Wait to hold the last reference and close the store here: the
+        // file lock is released only once the database's drop has finished, and a strong
+        // count of 0 seen from a `Weak` would not wait for a drop running on another thread.
         let deadline = Instant::now() + RELEASE_TIMEOUT;
-        while store.strong_count() > 0 && Instant::now() < deadline {
+        loop {
+            match Arc::try_unwrap(store) {
+                Ok(s) => {
+                    // Closing flushes the file: off the async runtime.
+                    if tokio::task::spawn_blocking(move || drop(s)).await.is_err() {
+                        warn!("closing the store failed");
+                    }
+                    return;
+                }
+                Err(s) if Instant::now() < deadline => store = s,
+                Err(_) => {
+                    warn!("store still in use after shutdown");
+                    return;
+                }
+            }
             sleep(Duration::from_millis(10)).await;
-        }
-        if store.strong_count() > 0 {
-            warn!("store still in use after shutdown");
         }
     }
 }

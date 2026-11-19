@@ -44,6 +44,9 @@ Profile="${profile^}"
 # the Gradle run the Tauri CLI starts as well as the fallback's.
 if [ "$unsigned" = true ]; then
     export ORG_GRADLE_PROJECT_meshnodeUnsignedRelease=true
+else
+    # An inherited value must not turn a signed build into an unsigned one.
+    unset ORG_GRADLE_PROJECT_meshnodeUnsignedRelease
 fi
 # Gradle resolves a relative path against the app module, not the caller's directory.
 if [ -n "${MESHNODE_KEYSTORE_PROPERTIES:-}" ]; then

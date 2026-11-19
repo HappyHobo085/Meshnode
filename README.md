@@ -24,7 +24,7 @@ Package `meshnode`: the desktop app, `/usr/bin/meshd` and the systemd unit `mesh
 | Remove (keeps data and user) | `sudo rpm -e meshnode` | `sudo apt-get remove meshnode` |
 | Purge (deletes data and user) | `sudo sh -c 'rpm -e meshnode && userdel meshnode && rm -rf /var/lib/meshnode'` | `sudo dpkg --purge meshnode` |
 
-Install enables and starts the service; upgrade restarts it; data, user and enablement are kept. To use the app and `meshd` without sudo, join the group once and log in again: `sudo usermod -aG meshnode $USER`. While the package is installed, `meshd service install` and `uninstall` refuse; use the package manager.
+Install enables and starts the service; upgrade restarts it if it is enabled (also after a refused start); data, user and enablement are kept. To use the app and `meshd` without sudo, join the group once and log in again: `sudo usermod -aG meshnode $USER`. While the package is installed, `meshd service install` and `uninstall` refuse; use the package manager.
 
 ### Windows (MSI)
 

@@ -206,4 +206,8 @@ it("no_daemon_without_access_to_the_service_says_to_join_the_group", async () =>
   expect(alert).toHaveTextContent("meshnode group");
   expect(alert).toHaveTextContent("sudo usermod -aG meshnode $USER");
   expect(alert).toHaveTextContent("log in again");
+  // Running or installing here would make a second node beside the service.
+  expect(screen.queryByRole("button", { name: "Run without installing" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Install as a service" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Locate meshd…" })).toBeNull();
 });

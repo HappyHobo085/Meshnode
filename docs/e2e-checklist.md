@@ -48,31 +48,34 @@ Then edit `apps/android/keystore.properties` and set `storePassword` and `keyPas
 
 The repo is on FAT32, so keep the cargo target directory off it: `export CARGO_TARGET_DIR=~/.cache/meshnode-target`. `apps/android/build-apk.sh` needs `JAVA_HOME` (JDK 17), `ANDROID_HOME` and `NDK_HOME` (NDK 27.2); see its header.
 
-The upgrade check (part A) needs an older build. Build 0.0.1 first from the same commit, then restore the tree and build the release:
+The upgrade check (part A) needs an older build. Build 0.0.1 from the same commit in a scratch worktree, so the main checkout is never edited, then build the release in the main checkout:
 
 ```
+REPO=/mnt/storage/AI_Apps/Meshnode
+OLD="${TMPDIR:-/tmp}/meshnode-old"
+cd "$REPO"
+git worktree add "$OLD" HEAD
+cd "$OLD"
 scripts/set-version.sh 0.0.1
 cargo update -w --offline
 cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+ln -s "$REPO/apps/ui/node_modules" apps/ui/node_modules
 scripts/build-desktop-packages.sh       # prints the 0.0.1 .deb and .rpm paths
-apps/android/build-apk.sh --release     # prints "certificate SHA-256 digest: ..."
+MESHNODE_KEYSTORE_PROPERTIES="$REPO/apps/android/keystore.properties" apps/android/build-apk.sh --release
 cp apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk ~/meshnode-0.0.1.apk
+cd "$REPO"
+git worktree remove --force "$OLD"
 
-git restore Cargo.lock apps/meshd/Cargo.toml crates/mesh-ffi/Cargo.toml \
-  apps/desktop/src-tauri/Cargo.toml apps/desktop/src-tauri/Cargo.lock apps/desktop/src-tauri/tauri.conf.json \
-  apps/android/src-tauri/Cargo.toml apps/android/src-tauri/Cargo.lock apps/android/src-tauri/tauri.conf.json
-scripts/check-version.sh                # must print the release version (0.1.0)
-git status --short                      # no modified tracked files
-
+scripts/check-version.sh                # prints the release version (0.1.0)
 scripts/build-desktop-packages.sh
 apps/android/build-apk.sh --release
 ```
 
-(`cargo update` refreshes the lockfiles for the new version; `scripts/build-desktop-packages.sh` builds `meshd` with `--locked`. The Android build updates its own lockfile.) Record both certificate digests in `e2e-results.md` (Build); they must be equal. The rpm files are `$CARGO_TARGET_DIR/release/bundle/rpm/Meshnode-0.0.1-1.x86_64.rpm` and `Meshnode-0.1.0-1.x86_64.rpm`. The release APK is `apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
+Notes: `cargo update` refreshes the worktree's lockfiles for 0.0.1 (`scripts/build-desktop-packages.sh` builds `meshd` with `--locked`); the Android build updates its own. The worktree has no `node_modules` and no `keystore.properties` (both untracked), hence the symlink and `MESHNODE_KEYSTORE_PROPERTIES`. `--force` drops the uncommitted 0.0.1 change with the worktree; nothing of it reaches the main checkout. `build-apk.sh --release` prints a `certificate SHA-256 digest` line each time: record both in `e2e-results.md` (Build); they must be equal. The rpm files are `$CARGO_TARGET_DIR/release/bundle/rpm/Meshnode-0.0.1-1.x86_64.rpm` and `Meshnode-0.1.0-1.x86_64.rpm`. The release APK is `apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
 
 Optional, no root: `scripts/inspect-linux-packages.sh <rpm> <deb>` checks the packages' contents.
 
-**MSI (on the owner's Windows install, from Git Bash):** the same old-then-new sequence with `scripts/build-desktop-packages.sh`, which builds the MSI on Windows. The output is `<target dir>\release\bundle\msi\Meshnode_<version>_x64_en-US.msi` (file name confirmed in Task 8). Copy both MSIs to the laptop.
+**MSI (on the owner's Windows install, from Git Bash):** the same worktree sequence (without the APK lines), with `REPO` set to the Windows checkout; `scripts/build-desktop-packages.sh` builds the MSI on Windows (confirmed in Task 8). The output is `<target dir>\release\bundle\msi\Meshnode_<version>_x64_en-US.msi` (file name confirmed in Task 8). Copy both MSIs to the laptop.
 
 ### 0.4 Admin access on the desktop
 

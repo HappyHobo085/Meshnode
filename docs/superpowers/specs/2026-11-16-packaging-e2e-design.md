@@ -341,8 +341,9 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
   means the same `sync` `/N` and store schema; a peer that refuses our ALPNs is detected from the TLS
   `no_application_protocol` alert. It shows as "incompatible version (x)" in `meshd members` (`meshd
   status` has no member list) and on the UI's device card.
-- **Gap:** no dev command bumps an existing store's schema (`mesh_store::test_hooks::set_schema` is
-  test-only). The manual check triggers the same refusal through an unknown `meshd.toml` key.
+- **Dev tool:** `crates/mesh-store/examples/set_schema.rs` (`required-features = ["test-hooks"]`) rewrites
+  a stopped node's store schema for the manual check; it refuses a missing store and a store another
+  process holds open (redb's lock). An unknown `meshd.toml` key exercises the same refusal path without it.
 - macOS (dropped): launchd's `KeepAlive` would still restart on exit 4.
 
 ### 11.6 Fixes outside the plan

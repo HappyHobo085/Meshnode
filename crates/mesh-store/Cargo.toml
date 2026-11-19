@@ -21,6 +21,11 @@ tokio.workspace = true
 # production builds; the crate's own tests enable it through the dev-dependency below.
 test-hooks = []
 
+[[example]]
+# Dev-only: rewrites a stopped node's store schema (docs/manual-checks/sub-spec-8b.md §4).
+name = "set_schema"
+required-features = ["test-hooks"]
+
 [dev-dependencies]
 mesh-store = { path = ".", features = ["test-hooks"] }
 tempfile.workspace = true

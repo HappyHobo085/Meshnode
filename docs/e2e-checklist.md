@@ -30,7 +30,16 @@ The first release starts from fresh data on every device (8b spec §1). Later re
   pgrep -a meshd                # expect: no output
   ```
   If a unit exists from a dev install, remove it with that build: `sudo meshd service uninstall --purge-data`.
+
+  No leftover data or user from a dev install:
+  ```
+  sudo ls /var/lib/meshnode     # expect: "No such file or directory"
+  getent passwd meshnode        # expect: no output
+  ```
+  If either is found while no package is installed (`rpm -q meshnode` says "not installed"), it is old dev data. Leftover data would make A1's **Create a new mesh** fail (the node is already initialised). Delete it (fresh start; it holds an old node identity): `sudo rm -rf /var/lib/meshnode`, then `sudo userdel meshnode`, and `sudo groupdel meshnode` if `getent group meshnode` still prints a line.
 - **Laptop.** No service from a dev install: `sc query meshnode` must say the service does not exist. Otherwise, from an elevated prompt, `meshd service uninstall --purge-data` with that build.
+
+  No leftover data: `dir "%ProgramData%\meshnode"` must say "File Not Found" (confirmed in Task 8). If the folder exists, delete it from an elevated prompt: `rmdir /s /q "%ProgramData%\meshnode"`. Otherwise the install keeps its old `admin.windows_user_sid` and its old node, and A2's checks fail.
 
 ### 0.2 Android release keystore (once, keep forever)
 
@@ -53,25 +62,27 @@ The upgrade check (part A) needs an older build. Build 0.0.1 from the same commi
 ```
 REPO=/mnt/storage/AI_Apps/Meshnode
 OLD="${TMPDIR:-/tmp}/meshnode-old"
-cd "$REPO"
-git worktree add "$OLD" HEAD
-cd "$OLD"
-scripts/set-version.sh 0.0.1
-cargo update -w --offline
-cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
-ln -s "$REPO/apps/ui/node_modules" apps/ui/node_modules
-scripts/build-desktop-packages.sh       # prints the 0.0.1 .deb and .rpm paths
-MESHNODE_KEYSTORE_PROPERTIES="$REPO/apps/android/keystore.properties" apps/android/build-apk.sh --release
-cp apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk ~/meshnode-0.0.1.apk
-cd "$REPO"
-git worktree remove --force "$OLD"
+(
+  set -e                                # any failure stops here, before anything runs in the main checkout
+  cd "$REPO"
+  git worktree add "$OLD" HEAD
+  cd "$OLD"
+  scripts/set-version.sh 0.0.1
+  cargo update -w --offline
+  cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+  ln -s "$REPO/apps/ui/node_modules" apps/ui/node_modules
+  scripts/build-desktop-packages.sh     # prints the 0.0.1 .deb and .rpm paths
+  MESHNODE_KEYSTORE_PROPERTIES="$REPO/apps/android/keystore.properties" apps/android/build-apk.sh --release
+  cp apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk ~/meshnode-0.0.1.apk
+)
+cd "$REPO" && git worktree remove --force "$OLD"
 
 scripts/check-version.sh                # prints the release version (0.1.0)
 scripts/build-desktop-packages.sh
 apps/android/build-apk.sh --release
 ```
 
-Notes: `cargo update` refreshes the worktree's lockfiles for 0.0.1 (`scripts/build-desktop-packages.sh` builds `meshd` with `--locked`); the Android build updates its own. The worktree has no `node_modules` and no `keystore.properties` (both untracked), hence the symlink and `MESHNODE_KEYSTORE_PROPERTIES`. `--force` drops the uncommitted 0.0.1 change with the worktree; nothing of it reaches the main checkout. `build-apk.sh --release` prints a `certificate SHA-256 digest` line each time: record both in `e2e-results.md` (Build); they must be equal. The rpm files are `$CARGO_TARGET_DIR/release/bundle/rpm/Meshnode-0.0.1-1.x86_64.rpm` and `Meshnode-0.1.0-1.x86_64.rpm`. The release APK is `apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
+Notes: `cargo update` refreshes the worktree's lockfiles for 0.0.1 (`scripts/build-desktop-packages.sh` builds `meshd` with `--locked`); the Android build updates its own. The worktree has no `node_modules` and no `keystore.properties` (both untracked), hence the symlink and `MESHNODE_KEYSTORE_PROPERTIES`. The subshell runs with `set -e`, so a failed `git worktree add` or `cd` stops it before anything touches the main checkout; if it fails part-way, fix the cause and run the `git worktree remove` line before retrying. `--force` drops the uncommitted 0.0.1 change with the worktree; nothing of it reaches the main checkout. `build-apk.sh --release` prints a `certificate SHA-256 digest` line each time: record both in `e2e-results.md` (Build); they must be equal. The rpm files are `$CARGO_TARGET_DIR/release/bundle/rpm/Meshnode-0.0.1-1.x86_64.rpm` and `Meshnode-0.1.0-1.x86_64.rpm`. The release APK is `apps/android/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
 
 Optional, no root: `scripts/inspect-linux-packages.sh <rpm> <deb>` checks the packages' contents.
 

@@ -24,7 +24,13 @@ words, and never crash-loops on it.
    then governs.
 4. **Wire protocols.** Any breaking change to a protocol bumps the `/N` of its ALPN:
    `meshnode/sync/1`, `meshnode/join/1`, `meshnode/httpfwd/1`. The signing domains
-   `meshnode/op/1` and `meshnode/mesh/1` follow the same rule.
+   `meshnode/op/1` and `meshnode/mesh/1` follow the same rule. The local admin protocol (CLI and
+   desktop app to `meshd`) has no ALPN: any change to its wire types
+   (`crates/mesh-admin/src/proto.rs`) bumps `mesh_admin::PROTOCOL_VERSION`, so a mismatched
+   client gets "cli X, daemon Y" from the `Hello` exchange instead of a decode error. Admin
+   frames are postcard, which is positional: adding a field, even with `#[serde(default)]`,
+   changes the encoding and needs the bump. `Hello` and its `DaemonState` keep their encoding
+   forever, since the version check runs on them.
 5. **`meshnode/version` is frozen.** The version probe's ALPN has no `/N` and is never bumped.
    Its payload is JSON (`mesh_proto::PeerVersion`: product version, each protocol's `/N`, the
    store schema); later versions add fields and older readers ignore them. A peer whose `sync`

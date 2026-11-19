@@ -396,7 +396,12 @@ async fn sign_out_propagates() {
         c.connection_count() == 0
     })
     .await;
-    assert_eq!(c.status(), NodeStatus::Removed { by: ic });
+    // A and B can close with `REMOVED` before C's own rescan applies the record (seen on a
+    // slow Windows runner); C then shows `RefusedAsRemoved` until that rescan runs.
+    wait_until("C shows its own sign-out", T, || async {
+        c.status() == NodeStatus::Removed { by: ic }
+    })
+    .await;
     assert!(matches!(
         c.store().set(NS, "k", b"x".to_vec()).await,
         Err(NodeError::Removed)

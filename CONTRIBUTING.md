@@ -17,11 +17,12 @@ words, and never crash-loops on it.
    schema, older or newer, is refused (`meshd run` exits 4; the reason goes to
    `<data>/start-error.txt`).
 3. **Other state files** (`meshd.toml`, `role.json`, `mesh.json`, `invites.json`) carry no version
-   field. Unreadable or unknown content is refused the same way, naming the file. `meshd.toml`
-   refuses unknown keys, so a new key there is detected by older builds. The JSON files ignore
-   unknown fields: a breaking change to one of them must change or remove an existing field
-   (so older builds fail to parse it), or first add a version field that this release rule
-   then governs.
+   field. Unparsable or unknown content is refused the same way, naming the file, and so is a
+   `meshd.toml` value this build does not accept, naming the key (a file that cannot be read at
+   all is an ordinary start failure). `meshd.toml` refuses unknown keys, so a new key there is
+   detected by older builds. The JSON files ignore unknown fields: a breaking change to one of
+   them must change or remove an existing field (so older builds fail to parse it), or first
+   add a version field that this release rule then governs.
 4. **Wire protocols.** Any breaking change to a protocol bumps the `/N` of its ALPN:
    `meshnode/sync/1`, `meshnode/join/1`, `meshnode/httpfwd/1`. The signing domains
    `meshnode/op/1` and `meshnode/mesh/1` follow the same rule. The local admin protocol (CLI and

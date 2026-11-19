@@ -11,7 +11,7 @@ use mesh_admin::{
     LocalStateView, StatusInfo,
 };
 use mesh_host::config::GatewaySection;
-use mesh_host::{Daemon, HostConfig, TestOptions};
+use mesh_host::{ConfigError, Daemon, DaemonError, HostConfig, TestOptions};
 use mesh_proto::{Limits, Placement, Role};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -754,6 +754,30 @@ async fn start_on_incompatible_store_is_incompatible() {
     let e = r.err().expect("incompatible store refused");
     assert!(e.is_incompatible(), "{e:?}");
     assert!(e.to_string().contains("store schema"), "{e}");
+}
+
+/// A `meshd.toml` this build cannot take (an unknown key, or a value a newer build may
+/// accept) is a refusal like incompatible data; failing to read it is not.
+#[test]
+fn unloadable_config_is_incompatible_but_unreadable_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |text: &str| {
+        std::fs::write(dir.path().join(mesh_host::config::CONFIG_FILE), text).unwrap();
+        DaemonError::from(HostConfig::load_or_default(dir.path()).unwrap_err())
+    };
+    let unknown = load("not_a_key = 1\n");
+    assert!(unknown.is_incompatible(), "{unknown:?}");
+    let invalid = load("log_level = \"verbose\"\n");
+    assert!(
+        matches!(invalid, DaemonError::Config(ConfigError::Invalid { .. })),
+        "{invalid:?}"
+    );
+    assert!(invalid.is_incompatible(), "{invalid:?}");
+    let io = DaemonError::Config(ConfigError::Io {
+        path: dir.path().join(mesh_host::config::CONFIG_FILE),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    });
+    assert!(!io.is_incompatible(), "{io:?}");
 }
 
 #[tokio::test]

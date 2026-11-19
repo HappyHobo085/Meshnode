@@ -335,7 +335,9 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
 - **Android:** `FfiError::Incompatible` sets a persisted flag; boot, alarm, watchdog, sticky restart,
   swipe-away and package-replaced do not start the service while it is set; opening the app or Start clears it.
 - **§5.3:** no version field was added to the state files. An unparsable `meshd.toml` (it refuses unknown
-  keys) counts as incompatible; so do unreadable or unknown `role.json`, `mesh.json` and `invites.json`.
+  keys) or one with a value this build does not accept counts as incompatible; so do unparsable or unknown
+  `role.json`, `mesh.json` and `invites.json`. An I/O error reading any of them is an ordinary start failure
+  (exit 1).
 - **§5.4 mechanism:** a gated probe on the unversioned, frozen ALPN `meshnode/version`; the reply is JSON
   `PeerVersion { product, protocols, store_schema }` that later versions extend with fields. Compatible
   means the same `sync` `/N` and store schema; a peer that refuses our ALPNs is detected from the TLS

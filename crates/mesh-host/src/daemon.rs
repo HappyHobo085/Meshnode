@@ -67,12 +67,14 @@ pub enum DaemonError {
 
 impl DaemonError {
     /// True when the data (or `meshd.toml`) was written by an incompatible Meshnode
-    /// version or is invalid for this one: the daemon must refuse, not retry.
+    /// version or is invalid for this one: the daemon must refuse, not retry. In
+    /// `meshd.toml` that is an unparsable file or unknown key (`Parse`) and a value this build
+    /// does not accept (`Invalid`, e.g. one a newer build added); failing to read it is not.
     pub fn is_incompatible(&self) -> bool {
         matches!(
             self,
             DaemonError::Node(NodeError::Incompatible { .. })
-                | DaemonError::Config(ConfigError::Parse { .. })
+                | DaemonError::Config(ConfigError::Parse { .. } | ConfigError::Invalid { .. })
         )
     }
 }

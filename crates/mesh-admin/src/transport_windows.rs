@@ -362,6 +362,18 @@ mod tests {
         unsafe { take_local_wide(text) }
     }
 
+    /// How SDDL writes a local account's SID: the machine's built-in Administrator (RID 500,
+    /// the account CI runners use) and Guest (RID 501) print as the aliases `LA` and `LG`.
+    fn sddl_token(sid: &str) -> &str {
+        if sid.starts_with("S-1-5-21-") && sid.ends_with("-500") {
+            "LA"
+        } else if sid.starts_with("S-1-5-21-") && sid.ends_with("-501") {
+            "LG"
+        } else {
+            sid
+        }
+    }
+
     fn pipe_name(tag: &str) -> String {
         format!(r"\\.\pipe\meshnode-admin-test-{tag}-{}", std::process::id())
     }
@@ -382,7 +394,10 @@ mod tests {
         let client = ClientOptions::new().open(&name).unwrap();
         let dacl = dacl_of(&client);
         assert!(dacl.starts_with("D:P"), "{dacl}");
-        assert!(dacl.contains(&format!(";;;{own})")), "{dacl}");
+        assert!(
+            dacl.contains(&format!(";;;{})", sddl_token(&own))),
+            "{dacl}"
+        );
         assert!(dacl.contains(";;;BA)"), "{dacl}");
         assert!(dacl.contains(";;;S-1-5-21-1-2-3-1001)"), "{dacl}");
         assert_eq!(dacl.matches("(A;").count(), 3, "{dacl}");

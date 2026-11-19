@@ -2,8 +2,9 @@
 # meshnode postinst (deb postinst, rpm %post); spec §3.2. One script serves both formats:
 #   rpm: $1 = 1 install, 2+ upgrade
 #   deb: $1 = configure [old-version] | abort-upgrade | abort-remove | abort-deconfigure ...
-# First install: enable and start meshnode.service. Upgrade: restart it if it is running
-# (the unit stays as enabled or disabled as it was).
+# First install: enable and start meshnode.service. Upgrade: restart it if it is enabled,
+# also when it is stopped or failed (a start refused with exit 4 must come back on the
+# matching version); the unit stays as enabled or disabled as it was.
 set -e
 
 UNIT=meshnode.service
@@ -35,8 +36,8 @@ if [ -d /run/systemd/system ]; then
   systemctl daemon-reload || true
   if [ "$action" = install ]; then
     systemctl enable --now "$UNIT"
-  else
-    systemctl try-restart "$UNIT" || true
+  elif systemctl is-enabled --quiet "$UNIT"; then
+    systemctl restart "$UNIT" || true
   fi
 elif [ "$action" = install ]; then
   # systemd is not running (a container or chroot): enable for the next boot only.

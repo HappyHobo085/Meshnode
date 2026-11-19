@@ -292,9 +292,10 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
   FAT32 checkout reports every file as 0755. Artifacts: `Meshnode-<v>-1.x86_64.rpm`, `Meshnode_<v>_amd64.deb`;
   package name `meshnode`; marker `/usr/share/meshnode/packaged`.
 - **Upgrade order:** the scriptlets do not stop the unit before the files are replaced; postinst runs
-  `systemctl try-restart` (Debian's `dh_installsystemd` default). dpkg and rpm replace files by rename, so
-  the old daemon keeps its inode until the restart. End state as designed: new binary running, unit
-  enabled, data and user untouched.
+  `systemctl restart` when the unit is enabled (as Debian's `dh_installsystemd` does), so a unit the old
+  version left failed with exit 4 comes back on the new one; a disabled unit is left alone. dpkg and rpm
+  replace files by rename, so a running old daemon keeps its inode until the restart. End state as
+  designed: new binary running, unit enabled, data and user untouched.
 - deb: postinst gets `configure <old>` both on upgrade and on a reinstall after `remove`, so preinst marks a
   real install in `/run/meshnode-package-install`, which postinst consumes (`enable --now`).
 - **Minimum glibc 2.39** (Debian 13+, Ubuntu 24.04+, Fedora 40+): Rust std in the packaged binaries uses

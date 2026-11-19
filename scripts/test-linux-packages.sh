@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Container lifecycle test for the meshnode rpm and deb (spec §3.2, §7): in rootless podman,
 # with systemd running as PID 1 in each container, it runs
-#   install old → upgrade to new → remove → reinstall → purge
+#   install old → refuse (exit 4) → upgrade to new → upgrade in place → remove → reinstall → purge
 # and asserts the meshnode user, /usr/bin/meshd's version, that the unit is enabled and meshd
-# runs (no restart loop), that upgrade restarts the service, and that /var/lib/meshnode
-# survives upgrade and remove. Purge is `dpkg --purge` for the deb and RPM_MANUAL_PURGE (below)
+# runs (no restart loop), that an upgrade starts a unit the old version left failed with exit
+# 4 (unknown key in meshd.toml, removed before the upgrade) and clears start-error.txt, that
+# an upgrade restarts a running service, and that /var/lib/meshnode survives upgrade and
+# remove. Purge is `dpkg --purge` for the deb and RPM_MANUAL_PURGE (below)
 # for the rpm. The deb run first checks that a failed install (abort-install) leaves no
 # install flag behind.
 #   rpm: registry.fedoraproject.org/fedora:41    deb: docker.io/library/debian:13
@@ -125,7 +127,26 @@ check_running() { # <container>: user, unit enabled, meshd running
 
 invocation() { q "$1" 'systemctl show -p InvocationID --value meshnode.service'; }
 
+# The old daemon refuses meshd.toml (an unknown key: exit 4, no restart) and leaves its
+# start-error.txt; the key is then taken out again, and the unit stays failed.
+REFUSE_START='
+  cd /var/lib/meshnode
+  if [ -e meshd.toml ]; then cp -p meshd.toml /root/meshd.toml.orig; fi
+  echo "not_a_meshnode_key = 1" >>meshd.toml
+  chmod 0644 meshd.toml
+  systemctl restart meshnode.service || true
+  i=0
+  until [ "$(systemctl show -p ActiveState --value meshnode.service)" = failed ]; do
+    i=$((i + 1)); [ "$i" -le 20 ] || exit 1; sleep 0.5
+  done
+  [ "$(systemctl show -p ExecMainStatus --value meshnode.service)" = 4 ] || exit 1
+  [ -s start-error.txt ] || exit 1
+  if [ -e /root/meshd.toml.orig ]; then mv /root/meshd.toml.orig meshd.toml; else rm meshd.toml; fi
+  sleep 2
+  [ "$(systemctl show -p ActiveState --value meshnode.service)" = failed ]'
+
 # lifecycle <container> <old-version> <new-version> <install-old> <upgrade> <remove> <reinstall>
+#           <upgrade-in-place>
 lifecycle() {
   local c="$1" old_v="$2" new_v="$3" before after
   if [ -z "$old_v" ] || [ -z "$new_v" ] || [ "$old_v" = "$new_v" ]; then
@@ -139,18 +160,25 @@ lifecycle() {
   check_version "$c" "$old_v"
   check_running "$c"
   step "$c" "write the sentinel" 'echo sentinel >/var/lib/meshnode/sentinel' || return 0
-  before="$(invocation "$c")"
+  step "$c" "$old_v refuses an unknown meshd.toml key (exit 4, unit failed)" "$REFUSE_START" ||
+    return 0
 
   step "$c" "upgrade to $new_v" "$5" || return 0
   check_version "$c" "$new_v"
   check_running "$c"
+  check "$c" "the upgrade started the failed unit and cleared start-error.txt" \
+    '[ ! -e /var/lib/meshnode/start-error.txt ]'
+  check "$c" "sentinel survives the upgrade" '[ -f /var/lib/meshnode/sentinel ]'
+
+  before="$(invocation "$c")"
+  step "$c" "upgrade $new_v in place" "$8" || return 0
+  check_running "$c"
   after="$(invocation "$c")"
   if [ -n "$before" ] && [ -n "$after" ] && [ "$after" != "$before" ]; then
-    pass "$c: upgrade restarted the service"
+    pass "$c: upgrade restarted the running service"
   else
-    fail "$c: upgrade did not restart the service (InvocationID '$before' → '$after')"
+    fail "$c: upgrade did not restart the running service (InvocationID '$before' → '$after')"
   fi
-  check "$c" "sentinel survives the upgrade" '[ -f /var/lib/meshnode/sentinel ]'
 
   step "$c" "remove (remove keeps data)" "$6" || return 0
   check "$c" "binary gone after remove" '[ ! -e /usr/bin/meshd ]'
@@ -189,7 +217,8 @@ if [ -n "$fedora" ] && start "$fedora" "$c"; then
     'rpm -i --nosignature /pkgs/old.rpm' \
     'rpm -U --nosignature /pkgs/new.rpm' \
     'rpm -e meshnode' \
-    'rpm -i --nosignature /pkgs/new.rpm'
+    'rpm -i --nosignature /pkgs/new.rpm' \
+    'rpm -U --replacepkgs --nosignature /pkgs/new.rpm'
   if step "$c" "manual purge: $RPM_MANUAL_PURGE" "$RPM_MANUAL_PURGE"; then
     check_purged "$c"
   fi
@@ -237,7 +266,8 @@ if [ -n "$debian" ] && start "$debian" "$c"; then
     "$apt install /pkgs/old.deb" \
     "$apt install /pkgs/new.deb" \
     "$apt remove meshnode" \
-    "$apt install /pkgs/new.deb"
+    "$apt install /pkgs/new.deb" \
+    'dpkg -i /pkgs/new.deb'
   if step "$c" "purge (purge deletes data)" 'dpkg --purge meshnode'; then
     check_purged "$c"
   fi

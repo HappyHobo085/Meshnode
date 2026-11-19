@@ -334,6 +334,9 @@ jobs:
       TAURI_CLI_VERSION: "2.12.4"
       NDK_VERSION: "27.2.12479018"
     steps:
+      # The release build fills the disk; .NET, GHC and CodeQL are unused (the Android SDK stays).
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:

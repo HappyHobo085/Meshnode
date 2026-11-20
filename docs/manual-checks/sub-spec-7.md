@@ -26,7 +26,7 @@ The limit flags matter. Without them a service gets the daemon's defaults: 64 MB
 
 Or deploy in the desktop app: Services, Deploy, choose the `.wasm`, name it `sync`. The Deploy form has no limit fields; it deploys with the defaults above, including the 10 s timeout. So after it finishes, open `sync` in Services, and under **Limits** set **Memory (MB)** to `64`, **Request timeout (s)** to `30` and **Largest request (MiB)** to `8`, then press **Save limits**.
 
-The name must be `sync`: the default port mapping `7801 -> sync` is what makes `http://127.0.0.1:7801` work. Check the limits with `meshd services`: the `sync` row must show `64 MB / 30000 ms / 8388608 B`.
+`http://127.0.0.1:7801` works only with a port mapping, and nodes have none by default: on each node run `meshd config set gateway.ports 7801=sync` (the phone: Settings, Port mappings) and restart it. Without the mapping, Aegis can use `http://sync.mesh.localhost:7777`. Check the limits with `meshd services`: the `sync` row must show `64 MB / 30000 ms / 8388608 B`.
 
 The Meshnode desktop app, `meshd` and the Android app are built as in `docs/manual-checks/sub-spec-6.md`. The phone must run the Meshnode APK (package `net.meshnode.app`) so that Aegis can find it.
 

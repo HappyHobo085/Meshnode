@@ -21,7 +21,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         GatewayConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
-            ports: BTreeMap::from([(7801, "sync".to_string())]),
+            ports: BTreeMap::new(),
         }
     }
 }

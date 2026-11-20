@@ -336,7 +336,7 @@ async fn non_loopback_listen_rejected() {
         GatewayConfig::default().listen.to_string(),
         "127.0.0.1:7777"
     );
-    assert_eq!(GatewayConfig::default().ports.get(&7801).unwrap(), "sync");
+    assert!(GatewayConfig::default().ports.is_empty());
     mesh.shutdown().await;
 }
 

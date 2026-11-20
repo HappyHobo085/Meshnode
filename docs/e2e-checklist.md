@@ -168,6 +168,7 @@ Build and deploy the Aegis sync service on the desktop (needs `rustup target add
 scripts/build-services.sh               # prints the path of aegis_sync.wasm
 meshd deploy wasm sync <path to aegis_sync.wasm> --memory-mb 64 --timeout-ms 30000 --max-body 8388608
 ```
+Nodes have no port mappings by default. On **each** node map port 7801 to it, then restart that node: `meshd config set gateway.ports 7801=sync` on the desktop (and the laptop), and on the phone Settings, Port mappings, `7801` → `sync`.
 `site` is already deployed (A1). Also deploy a site **from the phone**: Services, Deploy, pick a folder, name `site2`.
 
 Pass:

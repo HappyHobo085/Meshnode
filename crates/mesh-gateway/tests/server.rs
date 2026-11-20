@@ -267,39 +267,50 @@ async fn oversized_body_413() {
     .await
     .unwrap();
     let (mut rd, mut wr) = s.into_split();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
     let writer = tokio::spawn(async move {
         let chunk = vec![b'x'; 1024 * 1024];
         for _ in 0..65 {
-            if wr.write_all(b"100000\r\n").await.is_err()
-                || wr.write_all(&chunk).await.is_err()
-                || wr.write_all(b"\r\n").await.is_err()
-            {
-                return;
-            }
+            wr.write_all(b"100000\r\n").await?;
+            wr.write_all(&chunk).await?;
+            wr.write_all(b"\r\n").await?;
         }
-        let _ = wr.write_all(b"0\r\n\r\n").await;
-        // Keep the write half open until the reader is done.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        wr.write_all(b"0\r\n\r\n").await?;
+        // Once the client has seen the server's close, the server must still be reading
+        // (lingering), not gone: a closed socket answers these writes with a reset.
+        let _ = closed_rx.await;
+        wr.write_all(b"late").await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        wr.write_all(b"late").await
     });
+    // Read to the end: the server must close cleanly (FIN), not reset. A reset sent while
+    // the client was still writing can discard the 413 before the client reads it
+    // (Windows does).
     let mut buf = Vec::new();
-    let _ = timeout(T, async {
+    let end = timeout(T, async {
         let mut tmp = [0u8; 1024];
         loop {
             match rd.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
+                Ok(0) => return Ok(()),
+                Err(e) => return Err(e),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         }
     })
-    .await;
-    writer.abort();
+    .await
+    .expect("the server did not close the connection");
+    let _ = closed_tx.send(());
+    let written = timeout(T, writer)
+        .await
+        .expect("the writer stalled")
+        .unwrap();
     let head = String::from_utf8_lossy(&buf);
     assert!(head.starts_with("HTTP/1.1 413"), "got {head:?}");
+    assert!(end.is_ok(), "connection reset after the 413: {end:?}");
+    assert!(
+        written.is_ok(),
+        "connection reset while the client was still sending: {written:?}"
+    );
     // The server is still fine.
     let r = request(a, "GET", "counter.mesh.localhost", "/").await;
     assert_eq!(r.status, 200);

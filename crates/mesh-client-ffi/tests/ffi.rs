@@ -296,6 +296,12 @@ async fn ffi_request_roundtrip() {
     assert_eq!(st.id.len(), 64);
     assert!(st.online_hosts >= 1);
     assert!(!st.removed);
+    // The client's own member record arrives by sync, possibly after the requests above
+    // (seen on a slow Windows runner).
+    wait_until("self listed", || {
+        c.members().unwrap().iter().any(|m| m.id == st.id)
+    })
+    .await;
     let me = c
         .members()
         .unwrap()

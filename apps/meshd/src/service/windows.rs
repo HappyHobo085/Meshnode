@@ -1086,6 +1086,18 @@ mod tests {
         (format!("O:{me}{dacl}(A;OICI;FA;;;{me})"), me)
     }
 
+    /// How SDDL writes a local account's SID: the machine's built-in Administrator (RID 500,
+    /// the account CI runners use) and Guest (RID 501) print as the aliases `LA` and `LG`.
+    fn sddl_token(sid: &str) -> &str {
+        if sid.starts_with("S-1-5-21-") && sid.ends_with("-500") {
+            "LA"
+        } else if sid.starts_with("S-1-5-21-") && sid.ends_with("-501") {
+            "LG"
+        } else {
+            sid
+        }
+    }
+
     #[test]
     fn data_dir_sddl_sets_owner_and_protected_dacl() {
         assert!(DATA_DIR_SDDL.starts_with("O:BAD:P"));
@@ -1098,7 +1110,10 @@ mod tests {
         let (sddl, me) = test_sddl();
         prepare_data_dir(&sub, &sddl).unwrap();
         let got = security_sddl(&sub);
-        assert!(got.starts_with(&format!("O:{me}D:P")), "{got}");
+        assert!(
+            got.starts_with(&format!("O:{}D:P", sddl_token(&me))),
+            "{got}"
+        );
         for ace in ["(A;OICI;FA;;;LS)", "(A;OICI;FA;;;BA)"] {
             assert!(got.contains(ace), "{got}");
         }
@@ -1122,7 +1137,7 @@ mod tests {
 
         prepare_data_dir(&sub, &sddl).unwrap();
         let got = security_sddl(&child);
-        assert!(got.starts_with(&format!("O:{me}")), "{got}");
+        assert!(got.starts_with(&format!("O:{}", sddl_token(&me))), "{got}");
         assert!(!got.contains(";;;WD)"), "{got}");
         assert!(!got.contains("D:P"), "the child inherits again: {got}");
         for ace in ["(A;ID;FA;;;LS)", "(A;ID;FA;;;BA)"] {

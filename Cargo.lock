@@ -2827,6 +2827,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-blobs",
+ "libc",
  "mesh-core",
  "mesh-hlc",
  "mesh-proto",

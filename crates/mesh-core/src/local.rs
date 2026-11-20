@@ -37,9 +37,7 @@ fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> 
         if replace {
             std::fs::rename(from, to)?;
         } else {
-            // A hard link fails if `to` exists, unlike a rename.
-            std::fs::hard_link(from, to)?;
-            std::fs::remove_file(from)?;
+            rename_noreplace(from, to)?;
         }
         // The rename is durable only once the directory entry is.
         #[cfg(unix)]
@@ -48,6 +46,43 @@ fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> 
             std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
         }
         Ok(())
+    }
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists.
+#[cfg(all(not(windows), not(target_os = "android")))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // A hard link fails if `to` exists, unlike a rename.
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists. Android's SELinux
+/// policy refuses hard links in an app's data directory (EACCES), so this is
+/// `renameat2(RENAME_NOREPLACE)`, as a raw syscall: bionic's wrapper needs API 30.
+#[cfg(target_os = "android")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

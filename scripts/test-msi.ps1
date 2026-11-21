@@ -46,16 +46,15 @@ function Invoke-Com($obj, [string]$name, [string]$kind, [object[]]$argv) {
     $obj.GetType().InvokeMember($name, [System.Reflection.BindingFlags]$kind, $null, $obj, $argv)
 }
 $installer = New-Object -ComObject WindowsInstaller.Installer
-# The installed products with Meshnode's UpgradeCode, as "productcode=version".
+# The installed products with Meshnode's UpgradeCode, as "productcode=version". Emits one
+# string per product (nothing when none): callers collect them with @(Get-Products).
 function Get-Products {
     # PowerShell enumerates the returned StringList: product codes, or nothing.
     $codes = @(Invoke-Com $installer 'RelatedProducts' 'GetProperty' @($upgradeCode) | Where-Object { $_ })
-    $out = @()
     foreach ($c in $codes) {
         $code = [string]$c
-        $out += "$code=$(Invoke-Com $installer 'ProductInfo' 'GetProperty' @($code, 'VersionString'))"
+        "$code=$(Invoke-Com $installer 'ProductInfo' 'GetProperty' @($code, 'VersionString'))"
     }
-    return , $out
 }
 function Get-MsiVersion([string]$msi) {
     $db = Invoke-Com $installer 'OpenDatabase' 'InvokeMethod' @($msi, 0)
@@ -106,11 +105,21 @@ function Get-Events([datetime]$since) {
     return @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Meshnode'; StartTime = $since } -ErrorAction SilentlyContinue |
         Sort-Object TimeCreated, RecordId | ForEach-Object { $_.Message })
 }
-# Exactly one installed product with the UpgradeCode, at this version.
+# Whether `products` (Get-Products' strings) is exactly one product, at this version.
+function Test-OneProduct([string[]]$products, [string]$version) {
+    return ($products.Count -eq 1 -and $products[0] -match "^\{[0-9A-F-]+\}=$([regex]::Escape($version))$")
+}
+# The check must be able to fail: a side-by-side install, a wrong version, nothing.
+foreach ($case in @(
+        @(@('{A1B2C3D4-0000-0000-0000-000000000001}=0.1.0'), $true),
+        @(@('{A1B2C3D4-0000-0000-0000-000000000001}=0.0.1', '{A1B2C3D4-0000-0000-0000-000000000002}=0.1.0'), $false),
+        @(@('{A1B2C3D4-0000-0000-0000-000000000001}=0.0.1'), $false),
+        @(@(), $false))) {
+    if ((Test-OneProduct $case[0] '0.1.0') -ne $case[1]) { throw "Test-OneProduct self-check failed for ($($case[0] -join ', '))" }
+}
 function Check-OneProduct([string]$version) {
     $products = @(Get-Products)
-    Check "one product installed, $version ($($products -join ', '))" `
-        ($products.Count -eq 1 -and $products[0] -match "^\{[0-9A-F-]+\}=$([regex]::Escape($version))$")
+    Check "one product installed, $version ($($products -join ', '))" (Test-OneProduct $products $version)
 }
 function Log-Has([string]$log, [string]$text) { return [bool](Select-String -Path $log -SimpleMatch $text -Quiet) }
 
@@ -121,7 +130,7 @@ $old = (Resolve-Path $OldMsi).Path
 $new = (Resolve-Path $NewMsi).Path
 $oldVersion = Get-MsiVersion $old
 $newVersion = Get-MsiVersion $new
-if ((Get-Products).Count -gt 0) { throw "Meshnode is installed ($((Get-Products) -join ', ')); uninstall it first" }
+if (@(Get-Products).Count -gt 0) { throw "Meshnode is installed ($(@(Get-Products) -join ', ')); uninstall it first" }
 if ($null -ne (Get-Service meshnode -ErrorAction SilentlyContinue)) { throw 'a meshnode service exists (a dev install?); remove it first' }
 if (Test-Path $data) { throw "$data exists; this test needs a fresh node (delete it first)" }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
@@ -172,6 +181,7 @@ $started = @(for ($i = 0; $i -lt $events.Count; $i++) { if ($events[$i] -like 'M
 Check "Event Log: Meshnode stopped., then Meshnode started ($($events -join ' | '))" ($stopped -ge 0 -and @($started | Where-Object { $_ -gt $stopped }).Count -ge 1)
 Check "the node is kept ($(Get-NodeId))" ((Get-NodeId) -eq $nodeId)
 Check 'the admin SID is unchanged' ((Get-AdminSid) -eq $mySid)
+Check 'the old product''s removal ran meshd service stop (MSI log)' (Log-Has (Join-Path $LogDir '2-upgrade.log') 'Stopped the meshnode service.')
 Check 'the old product was removed without uninstalling the service' (-not (Log-Has (Join-Path $LogDir '2-upgrade.log') 'Removed the meshnode service'))
 
 # --- downgrade --------------------------------------------------------------------------------
@@ -185,10 +195,13 @@ Check 'the service was not touched (same process)' ((Get-ServiceProcessId) -eq $
 
 # --- uninstall ------------------------------------------------------------------------------
 function Test-Uninstall([string]$log) {
-    $product = (@(Get-Products)[0] -split '=')[0]
+    $products = @(Get-Products)
+    if ($products.Count -ne 1) { Fail "exactly one product to uninstall ($($products -join ', '))"; return }
+    $product = ($products[0] -split '=')[0]
     $code = Invoke-Msiexec '/x' $product $log
     Check "uninstall exits 0 (got $code)" ($code -eq 0)
-    Check 'no product installed' ((Get-Products).Count -eq 0)
+    Check 'no product installed' (@(Get-Products).Count -eq 0)
+    Check 'meshd removed the service and kept the data (MSI log)' (Log-Has $log 'Removed the meshnode service; its data directory was kept.')
     Check 'the service is gone' ($null -eq (Get-Service meshnode -ErrorAction SilentlyContinue))
     Check "$installDir is gone" (-not (Test-Path $installDir))
     Check "$data is kept (node.key, meshd.toml)" ((Test-Path (Join-Path $data 'node.key')) -and (Test-Path (Join-Path $data 'meshd.toml')))

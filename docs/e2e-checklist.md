@@ -120,7 +120,7 @@ Pass:
 Then found the mesh: start **Meshnode** from the app menu and choose **Create a new mesh** (or `meshd init --name desktop`). Deploy a test site: make a folder with an `index.html`, then `meshd deploy static site <folder>`.
 
 **A2. Laptop MSI, install 0.0.1.** Run the 0.0.1 MSI (0.5). Pass:
-- The service runs: `meshd service status` prints `meshnode service: installed, running` (no elevation needed). `meshd.exe` is in `C:\Program Files\Meshnode\`, which the MSI does not put on `PATH`: use `"C:\Program Files\Meshnode\meshd.exe"` (or add the folder to your `PATH`).
+- The service runs: `meshd service status` prints `meshnode service: installed, running` (no elevation needed; not yet verified for a non-administrator: the service grants status queries to interactive users). `meshd.exe` is in `C:\Program Files\Meshnode\`, which the MSI does not put on `PATH`: use `"C:\Program Files\Meshnode\meshd.exe"` (or add the folder to your `PATH`).
 - The Meshnode app opens and connects **without elevation**.
 - `meshd config get admin.windows_user_sid` equals the SID that `whoami /user` prints.
 - From an elevated prompt, `meshd service install` is refused with the package message.

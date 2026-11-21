@@ -7,7 +7,7 @@
 #     service's binary path assume it)
 #   - the service custom actions run `meshd service ... --from-package` deferred and without
 #     impersonation (as LocalSystem), with the admin user taken from [%USERDOMAIN]\[LogonUser],
-#     and are scheduled with their conditions (install; stop + start around an upgrade;
+#     and are scheduled with their conditions (install; stop + start around an upgrade, each with a rollback, start last;
 #     uninstall, which keeps %ProgramData%\meshnode)
 #   - a newer installed version blocks a downgrade with a message
 #
@@ -102,6 +102,7 @@ $expected = [ordered]@{
     MeshnodeServiceUninstall       = @("$exe service uninstall --from-package", $false, 'MESHNODE_SERVICE AND REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE')
     MeshnodeServiceInstallRollback = @("$exe service uninstall --from-package", $true, 'NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"')
     MeshnodeServiceInstall         = @("$exe service install --from-package --admin-user `"[MESHNODE_ADMIN_USER]`"", $false, 'NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"')
+    MeshnodeServiceStartRollback   = @("$exe service stop", $true, 'MESHNODE_SERVICE AND NOT REMOVE~="ALL"')
     MeshnodeServiceStart           = @("$exe service start", $false, 'MESHNODE_SERVICE AND NOT REMOVE~="ALL"')
 }
 foreach ($id in $expected.Keys) {
@@ -117,6 +118,10 @@ foreach ($id in $expected.Keys) {
     Check "$id runs: $cmd" ($null -ne $setter -and @($setter | Where-Object { $_.Target -eq $cmd }).Count -eq 1)
     $seq = $sequence[$id]
     Check "$id is scheduled when: $cond" ($null -ne $seq -and $seq.Condition -eq $cond)
+    # An unscheduled setter would leave the CustomActionData empty.
+    $setSeq = if ($null -ne $setter) { $sequence[@($setter)[0].Action] } else { $null }
+    Check "$id's command line is set before it runs" `
+        ($null -ne $seq -and $null -ne $setSeq -and [int]$setSeq.Sequence -lt [int]$seq.Sequence)
 }
 foreach ($id in 'MeshnodeServiceInstall', 'MeshnodeServiceUninstall') {
     $setter = $actions.Values | Where-Object { ([int]$_.Type -band 0x3F) -eq 51 -and $_.Source -eq $id }
@@ -133,11 +138,24 @@ Check 'install and start run after InstallFiles' `
     ((Seq 'MeshnodeServiceInstallRollback') -gt (Seq 'InstallFiles') -and (Seq 'InstallFiles') -gt 0 -and `
      (Seq 'MeshnodeServiceInstall') -gt (Seq 'MeshnodeServiceInstallRollback') -and `
      (Seq 'MeshnodeServiceStart') -gt (Seq 'InstallFiles') -and (Seq 'MeshnodeServiceStart') -lt (Seq 'InstallFinalize'))
+# Start is the last step before InstallFinalize (little can fail after it), and its rollback
+# (stop the new binary) is scheduled before it.
+Check 'start runs after the registration steps, just before InstallFinalize, after its rollback' `
+    ((Seq 'MeshnodeServiceStart') -gt (Seq 'PublishProduct') -and (Seq 'PublishProduct') -gt 0 -and `
+     (Seq 'MeshnodeServiceStartRollback') -gt (Seq 'PublishProduct') -and `
+     (Seq 'MeshnodeServiceStartRollback') -lt (Seq 'MeshnodeServiceStart'))
 
 # The admin user: the launching user, domain-qualified, set in both sequences unless given.
 $adminSetters = $actions.Values | Where-Object { ([int]$_.Type -band 0x3F) -eq 51 -and $_.Source -eq 'MESHNODE_ADMIN_USER' }
 Check "MESHNODE_ADMIN_USER is set to $adminValue" `
     ($null -ne $adminSetters -and @($adminSetters | Where-Object { $_.Target -eq $adminValue }).Count -ge 1)
+$uiSequence = @{}
+foreach ($r in Get-Rows 'InstallUISequence' @('Action', 'Condition', 'Sequence')) { $uiSequence[$r.Action] = $r }
+$adminSetter = if ($null -ne $adminSetters) { @($adminSetters)[0].Action } else { '' }
+Check 'MESHNODE_ADMIN_USER is set in both sequences, unless given, before the deferred install is scheduled' `
+    ($null -ne $adminSetters -and $sequence.ContainsKey($adminSetter) -and $uiSequence.ContainsKey($adminSetter) -and `
+     $sequence[$adminSetter].Condition -eq 'NOT MESHNODE_ADMIN_USER' -and $uiSequence[$adminSetter].Condition -eq 'NOT MESHNODE_ADMIN_USER' -and `
+     [int]$sequence[$adminSetter].Sequence -lt (Seq 'SetMeshnodeServiceInstall'))
 $secure = if ($props.ContainsKey('SecureCustomProperties')) { $props['SecureCustomProperties'] -split ';' } else { @() }
 Check 'MESHNODE_ADMIN_USER and MESHNODE_SERVICE are secure (passed to the server)' `
     (($secure -contains 'MESHNODE_ADMIN_USER') -and ($secure -contains 'MESHNODE_SERVICE'))

@@ -322,7 +322,9 @@ VM, not yet on the owner's laptop (`docs/manual-checks/sub-spec-8b.md` §2).
   deferred, non-impersonated `WixQuietExec64` actions running the installed `meshd.exe` (output in the MSI
   log): install → `service install --from-package --admin-user "<USERDOMAIN>\<LogonUser>"`; the old
   product's removal during an upgrade → `service stop` (Tauri's MajorUpgrade removes the old product first);
-  the new product when the service already exists → `service start`; uninstall → `service uninstall
+  the new product when the service already exists → `service start` (just before InstallFinalize; its
+  rollback stops it, so a failed upgrade ends on the old binary; `meshd service stop` waits out a pending
+  start, which the SCM would refuse to stop); uninstall → `service uninstall
   --from-package`. The admin user is the launching user, domain-qualified; the SID is resolved by `meshd` in
   the deferred phase, and an account that cannot be resolved fails the install. A downgrade is refused by
   the template's launch condition: "A newer version of Meshnode is already installed."

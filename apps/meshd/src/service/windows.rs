@@ -530,6 +530,20 @@ fn stop_and_wait(service: &Service) -> Result<(), ServiceError> {
             .map_err(scm_err("querying the meshnode service"))
     };
     let mut state = query()?;
+    // A stop request is refused (ERROR_SERVICE_CANNOT_ACCEPT_CTRL) while the service is still
+    // starting, e.g. when an MSI rollback stops the service its upgrade just started: wait
+    // for the start to end first.
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while state == ServiceState::StartPending {
+        if Instant::now() >= deadline {
+            return Err(ServiceError::Failed(format!(
+                "the meshnode service did not finish starting within {} s",
+                STOP_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(POLL);
+        state = query()?;
+    }
     if state == ServiceState::Stopped {
         return Ok(());
     }

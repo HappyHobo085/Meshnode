@@ -69,8 +69,13 @@
     <SetProperty Id="MeshnodeServiceInstall" Value="&quot;[INSTALLDIR]meshd.exe&quot; service install --from-package --admin-user &quot;[MESHNODE_ADMIN_USER]&quot;" Before="MeshnodeServiceInstall" Sequence="execute" />
     <CustomAction Id="MeshnodeServiceInstall" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="check" />
 
-    <!-- Upgrade (the service exists): start it with the new files. A failed start does not
-         undo the upgrade, as the deb/rpm postinst's `systemctl restart || true`. -->
+    <!-- Upgrade (the service exists): start it with the new files, as the last step before
+         InstallFinalize, so that as little as possible can fail after it. A failed start does
+         not undo the upgrade, as the deb/rpm postinst's `systemctl restart || true`. If the
+         upgrade fails or is cancelled after it, the rollback stops the new binary first; the
+         old product's StopRollback then starts the service on the restored old files. -->
+    <SetProperty Id="MeshnodeServiceStartRollback" Value="&quot;[INSTALLDIR]meshd.exe&quot; service stop" Before="MeshnodeServiceStartRollback" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceStartRollback" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="rollback" Impersonate="no" Return="ignore" />
     <SetProperty Id="MeshnodeServiceStart" Value="&quot;[INSTALLDIR]meshd.exe&quot; service start" Before="MeshnodeServiceStart" Sequence="execute" />
     <CustomAction Id="MeshnodeServiceStart" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="ignore" />
 
@@ -80,7 +85,8 @@
       <Custom Action="MeshnodeServiceUninstall" After="MeshnodeServiceStop"><![CDATA[MESHNODE_SERVICE AND REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]></Custom>
       <Custom Action="MeshnodeServiceInstallRollback" After="InstallFiles"><![CDATA[NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
       <Custom Action="MeshnodeServiceInstall" After="MeshnodeServiceInstallRollback"><![CDATA[NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
-      <Custom Action="MeshnodeServiceStart" After="MeshnodeServiceInstall"><![CDATA[MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+      <Custom Action="MeshnodeServiceStartRollback" Before="MeshnodeServiceStart"><![CDATA[MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+      <Custom Action="MeshnodeServiceStart" Before="InstallFinalize"><![CDATA[MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
     </InstallExecuteSequence>
   </Fragment>
 </Wix>

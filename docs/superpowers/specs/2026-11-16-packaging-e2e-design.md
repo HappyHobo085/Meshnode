@@ -273,8 +273,8 @@ granularity. Anything that would change an owner decision in §1 goes back to th
 ## 11. As built (differences from this design)
 
 Where this section and the text above disagree, this section is what was built. Master spec §2, §10, §13,
-§14 and §15 carry the same changes. The MSI (plan Task 8) and CI (Task 11) are not built yet; the MSI text
-in the docs is written from §3.3 and marked "(confirmed in Task 8)".
+§14 and §15 carry the same changes. The MSI (plan Task 8) was built and its lifecycle tested in a Windows 11
+VM, not yet on the owner's laptop (`docs/manual-checks/sub-spec-8b.md` §2).
 
 ### 11.1 Versioning (§2)
 - Six files carry the version: `apps/meshd/Cargo.toml` (the source), `crates/mesh-ffi/Cargo.toml` (so the
@@ -315,6 +315,17 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
 - An existing `admin.windows_user_sid` is kept on every install, the manual reinstall included; the account
   lookup accepts only a user SID. Changing it later: `meshd config set admin.windows_user_sid <SID>`, then a
   service restart.
+- The MSI is Tauri's WiX template plus one fragment, `apps/desktop/src-tauri/packaging/windows/service.wxs`
+  (`bundle.windows.wix`: fixed `upgradeCode`, `fragmentPaths`, `componentRefs`; `allowDowngrades: false`).
+  It installs into `C:\Program Files\Meshnode` (pinned: no directory dialog, `INSTALLDIR` overridden) with
+  the marker `packaged`; `meshd.exe` is registered there in place, not on `PATH`. The service steps are
+  deferred, non-impersonated `WixQuietExec64` actions running the installed `meshd.exe` (output in the MSI
+  log): install → `service install --from-package --admin-user "<USERDOMAIN>\<LogonUser>"`; the old
+  product's removal during an upgrade → `service stop` (Tauri's MajorUpgrade removes the old product first);
+  the new product when the service already exists → `service start`; uninstall → `service uninstall
+  --from-package`. The admin user is the launching user, domain-qualified; the SID is resolved by `meshd` in
+  the deferred phase, and an account that cannot be resolved fails the install. A downgrade is refused by
+  the template's launch condition: "A newer version of Meshnode is already installed."
 
 ### 11.4 Android signing (§4)
 - `apps/android/build-apk.sh --release` reads `MESHNODE_KEYSTORE_PROPERTIES`, else
@@ -334,7 +345,8 @@ in the docs is written from §3.3 and marked "(confirmed in Task 8)".
   screen tells them to join the group and log in again instead (`ConnectionDto.noAccess`).
 - **Windows:** the service stops with exit 0 after the Event Log entry, because the failure actions apply to
   any non-zero exit. `start-error.txt` is made readable by Authenticated Users so a non-elevated `meshd
-  status` and the app can read it (uncompiled on Windows until Task 8).
+  status` and the app can read it (checked in Task 8 as a standard user, as is a stopped service with no
+  `start-error.txt`: "not found", not "access denied").
 - **Android:** `FfiError::Incompatible` sets a persisted flag; boot, alarm, watchdog, sticky restart,
   swipe-away and package-replaced do not start the service while it is set; opening the app or Start clears it.
 - **§5.3:** no version field was added to the state files. An unparsable `meshd.toml` (it refuses unknown

@@ -8,7 +8,7 @@ The build agent ran none of this. It never installed a package on this PC, ran a
 - `apps/android/build-apk.sh --release` without a keystore (fails with "Release signing: … not found") and `--release --unsigned` (an unsigned APK).
 - The automated incompatible-data and peer-version tests (§4, §5), and the `set_schema` example against a throwaway node (§4).
 
-**The MSI is not built yet** (Task 8, on the owner's Windows install). Everything MSI-specific below is written from the spec and is marked "(confirmed in Task 8)" where Task 8 must check it.
+The MSI was built and exercised in a disposable Windows 11 Pro VM (Task 8), never on the owner's laptop. There, elevated over SSH: `scripts/inspect-msi.ps1` on the 0.1.0 MSI; `scripts/test-msi.ps1` with a 0.0.1 and a 0.1.0 MSI (install, refusal, upgrade in place, downgrade refused, uninstall, reinstall, purge; all silent, `msiexec /qn`); §4.2 with the installed MSI, including the standard-user reads. Not covered there: the installer's dialogs (no interactive desktop over SSH), SmartScreen, a UAC prompt, and the desktop app.
 
 ## 1. Container test limitation
 
@@ -16,14 +16,16 @@ None. The lifecycle test runs real systemd as PID 1 in each container (`podman r
 
 ## 2. Windows MSI on the laptop
 
-Build on the owner's Windows install (checklist 0.3). Inspect the MSI's tables first: `scripts/inspect-msi.ps1 <msi>` (written in Task 8; confirmed in Task 8). Pass: the fixed UpgradeCode, ProductVersion equal to `scripts/check-version.sh`, and the custom actions with `--from-package`.
+Build on the owner's Windows install (checklist 0.3). Inspect the MSI's tables first, from PowerShell: `powershell -ExecutionPolicy Bypass -File scripts\inspect-msi.ps1 <msi>`. Pass: it ends with `all checks passed` (the fixed UpgradeCode, ProductVersion equal to `scripts/check-version.sh`, `meshd.exe` and the marker in the pinned `C:\Program Files\Meshnode`, the service custom actions with `--from-package`, the downgrade block).
+
+On a disposable Windows machine (not the laptop: it installs, uninstalls and finally deletes `%ProgramData%\meshnode`), elevated: `powershell -ExecutionPolicy Bypass -File scripts\test-msi.ps1 <old.msi> <new.msi> -Purge` runs the whole lifecycle silently and ends with `all checks passed`. Optional; the laptop steps below are the check.
 
 Then on the laptop:
 
 1. **Install** (checklist A2). Pass: SmartScreen shows **More info → Run anyway**; after the UAC prompt the service runs; the Meshnode app opens and every screen works **without elevation**; `meshd config get admin.windows_user_sid` equals the SID from `whoami /user`, not SYSTEM (`S-1-5-18`).
 2. **Refusal.** From an elevated prompt: `meshd service install` and `meshd service uninstall` both print "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead". The app's **Install as system service** shows the same refusal.
 3. **Upgrade in place** (checklist A4): run the newer MSI. Pass: the service is stopped before the files are replaced and running again after (Event Log, source `Meshnode`: "Meshnode stopped." then "Meshnode started …"); `%ProgramData%\meshnode` is untouched (same node id in `meshd status`); the admin SID is unchanged.
-4. **Downgrade**: run the older MSI after the newer one. Pass: refused with a message (confirmed in Task 8).
+4. **Downgrade**: run the older MSI after the newer one. Pass: refused with "A newer version of Meshnode is already installed." (silently, `msiexec /i <old.msi> /qn` exits 1603 with that line in its `/l*v` log); the newer version stays installed and its service keeps running.
 5. **Uninstall** (checklist Z3). Pass: the service is gone (`sc query meshnode`), `C:\Program Files\Meshnode` is gone, `%ProgramData%\meshnode` stays. Purge from an elevated prompt: `rmdir /s /q "%ProgramData%\meshnode"`.
 
 **Changing the admin user later.** As the current admin user: `meshd config set admin.windows_user_sid <SID>` (a user SID, `S-1-5-21-…` or `S-1-12-1-…`; `whoami /user` prints yours). It prints "Saved. Restart meshd for this to take effect."; then, elevated, `meshd service stop` and `meshd service start`.
@@ -76,7 +78,7 @@ Pass: active again; `meshd status` shows the same `Node:` id; `/var/lib/meshnode
 
 ### 4.2 Windows (installed MSI): service, Event Log, `meshd status`, desktop app
 
-Build the example on the owner's Windows install (`cargo build -p mesh-store --features test-hooks --example set_schema`, giving `<target dir>\debug\examples\set_schema.exe`) and copy it to the laptop (confirmed in Task 8). The laptop is a client, but it has a store too. Elevated prompt:
+Build the example on the owner's Windows install (`cargo build -p mesh-store --features test-hooks --example set_schema`, giving `<target dir>\debug\examples\set_schema.exe`; `target\debug\examples\set_schema.exe` without `CARGO_TARGET_DIR`) and copy it to the laptop. The laptop is a client, but it has a store too. Elevated prompt:
 ```
 meshd service stop
 copy "%ProgramData%\meshnode\store.redb" "%ProgramData%\meshnode\store.redb.bak"
@@ -87,6 +89,7 @@ Pass:
 - The service ends **stopped** and stays stopped (`meshd service status` a minute later: `installed, stopped`). It stops with exit 0 on purpose: the failure actions would restart any non-zero exit.
 - Event Viewer, Windows Logs, Application, source `Meshnode`: "Meshnode failed to start: …store schema 2, this build reads 1…".
 - As the installing user, **not elevated**: `meshd status` prints `not running: …` (it reads `%ProgramData%\meshnode\start-error.txt`, which standard users may read), and the desktop app shows "Meshnode refused to start".
+- **Stopped, no refusal** (M2): restore first (below), then `meshd service stop` and check that `%ProgramData%\meshnode\start-error.txt` does not exist. As a **standard user** (not an administrator; another account is fine), `meshd status` prints `meshd is not running (start it with "meshd run" or "meshd service install")` and exits 3, and the desktop app shows its not-running screen, **not** "Meshnode refused to start" or "start error unreadable". A standard user cannot list `%ProgramData%\meshnode`, but opening the missing file still reports "not found". Then `meshd service start` (elevated).
 
 Restore (elevated): `set_schema.exe "%ProgramData%\meshnode" 1`, `meshd service start`, then `del "%ProgramData%\meshnode\store.redb.bak"`. Pass: running again.
 
@@ -138,4 +141,5 @@ The owner cannot trigger this without a special build: 0.0.1 and 0.1.0 from the 
 | | S23 | 3.5 wrong key refused (optional) | | |
 | | PC | 4.1 incompatible, Linux | | |
 | | Laptop | 4.2 incompatible, Windows | | |
+| | Laptop | 4.2 stopped, no refusal (standard user) | | |
 | | S23 | 4.3 incompatible, Android | | |

@@ -28,7 +28,7 @@ Install enables and starts the service; upgrade restarts it if it is enabled (al
 
 ### Windows (MSI)
 
-Built on Windows from Git Bash with `scripts/build-desktop-packages.sh` (MSI details confirmed in Task 8). Unsigned: at the SmartScreen prompt choose **More info → Run anyway**. The user who runs the installer gets admin access without elevation. Uninstall keeps `%ProgramData%\meshnode`.
+Built on Windows from Git Bash with `scripts/build-desktop-packages.sh`, giving `<target dir>\release\bundle\msi\Meshnode_<version>_x64_en-US.msi` (the target dir is `CARGO_TARGET_DIR`, else `apps\desktop\src-tauri\target`); `scripts/inspect-msi.ps1 <msi>` checks its tables and `scripts/test-msi.ps1 <old.msi> <new.msi>` runs the install/upgrade/uninstall lifecycle on a disposable machine. Unsigned: at the SmartScreen prompt choose **More info → Run anyway**. It installs into `C:\Program Files\Meshnode` (fixed; `meshd.exe` is not put on `PATH`) and installs and starts the `meshnode` service. The user who runs the installer gets admin access without elevation. An upgrade stops the service, replaces the files and starts it again, keeping the data; an older MSI over a newer one is refused ("A newer version of Meshnode is already installed."). Uninstall removes the service and keeps `%ProgramData%\meshnode`. While it is installed, `meshd service install` and `uninstall` refuse.
 
 ### Android (APK)
 

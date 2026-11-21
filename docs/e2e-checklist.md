@@ -39,7 +39,7 @@ The first release starts from fresh data on every device (8b spec §1). Later re
   If either is found while no package is installed (`rpm -q meshnode` says "not installed"), it is old dev data. Leftover data would make A1's **Create a new mesh** fail (the node is already initialised). Delete it (fresh start; it holds an old node identity): `sudo rm -rf /var/lib/meshnode`, then `sudo userdel meshnode`, and `sudo groupdel meshnode` if `getent group meshnode` still prints a line.
 - **Laptop.** No service from a dev install: `sc query meshnode` must say the service does not exist. Otherwise, from an elevated prompt, `meshd service uninstall --purge-data` with that build.
 
-  No leftover data: `dir "%ProgramData%\meshnode"` must say "File Not Found" (confirmed in Task 8). If the folder exists, delete it from an elevated prompt: `rmdir /s /q "%ProgramData%\meshnode"`. Otherwise the install keeps its old `admin.windows_user_sid` and its old node, and A2's checks fail.
+  No leftover data: `dir "%ProgramData%\meshnode"` must say "File Not Found". If the folder exists, delete it from an elevated prompt: `rmdir /s /q "%ProgramData%\meshnode"`. Otherwise the install keeps its old `admin.windows_user_sid` and its old node, and A2's checks fail.
 
 ### 0.2 Android release keystore (once, keep forever)
 
@@ -86,7 +86,7 @@ Notes: `cargo update` refreshes the worktree's lockfiles for 0.0.1 (`scripts/bui
 
 Optional, no root: `scripts/inspect-linux-packages.sh <rpm> <deb>` checks the packages' contents.
 
-**MSI (on the owner's Windows install, from Git Bash):** the same worktree sequence (without the APK lines), with `REPO` set to the Windows checkout; `scripts/build-desktop-packages.sh` builds the MSI on Windows (confirmed in Task 8). The output is `<target dir>\release\bundle\msi\Meshnode_<version>_x64_en-US.msi` (file name confirmed in Task 8). Copy both MSIs to the laptop.
+**MSI (on the owner's Windows install, from Git Bash):** the same worktree sequence (without the APK lines), with `REPO` set to the Windows checkout (as `/c/...`), two changes: set the target dir in `C:/...` form, which both Git Bash and cargo read, e.g. `export CARGO_TARGET_DIR="$(cygpath -m "$HOME")/meshnode-target"`; and replace the `ln -s` line with `(cd apps/ui && npm ci)` (Git Bash's `ln -s` copies). `scripts/build-desktop-packages.sh` then builds the MSI and prints its path: `$CARGO_TARGET_DIR/release/bundle/msi/Meshnode_<version>_x64_en-US.msi` (without `CARGO_TARGET_DIR`: `apps\desktop\src-tauri\target\release\bundle\msi\`). Copy both MSIs to the laptop.
 
 ### 0.4 Admin access on the desktop
 
@@ -120,7 +120,7 @@ Pass:
 Then found the mesh: start **Meshnode** from the app menu and choose **Create a new mesh** (or `meshd init --name desktop`). Deploy a test site: make a folder with an `index.html`, then `meshd deploy static site <folder>`.
 
 **A2. Laptop MSI, install 0.0.1.** Run the 0.0.1 MSI (0.5). Pass:
-- The service runs: `meshd service status` prints `meshnode service: installed, running` (no elevation needed). `meshd.exe` is under `C:\Program Files\Meshnode\`; if `meshd` is not on `PATH`, use that full path (both confirmed in Task 8).
+- The service runs: `meshd service status` prints `meshnode service: installed, running` (no elevation needed). `meshd.exe` is in `C:\Program Files\Meshnode\`, which the MSI does not put on `PATH`: use `"C:\Program Files\Meshnode\meshd.exe"` (or add the folder to your `PATH`).
 - The Meshnode app opens and connects **without elevation**.
 - `meshd config get admin.windows_user_sid` equals the SID that `whoami /user` prints.
 - From an elevated prompt, `meshd service install` is refused with the package message.
@@ -139,7 +139,7 @@ Pass:
 - Phone: `adb shell dumpsys package net.meshnode.app | grep versionName` prints `versionName=0.1.0`. The service restarted by itself (the notification is back without opening the app), and within 60 s `meshd members` on the desktop shows it online.
 - Laptop: the service runs, the app still connects without elevation, and `meshd config get admin.windows_user_sid` is unchanged.
 - Everywhere: the same node ids in `meshd members` (no new members) and `site` still in `meshd services`.
-- Laptop, MSI downgrade: running the 0.0.1 MSI again is refused with a message (confirmed in Task 8).
+- Laptop, MSI downgrade: running the 0.0.1 MSI again is refused with "A newer version of Meshnode is already installed."; 0.1.0 stays installed and running.
 
 **A5. Phone fresh start for criterion 2.** The phone joined on 0.0.1; criterion 2 needs a fresh pairing on the release. Remove it (desktop app Home, the phone's card, **Remove device…**, or `meshd remove <phone id prefix>`), then `adb uninstall net.meshnode.app` (deletes its data) and `adb install <release APK>`. The removed identity stays listed in `meshd members` as `(not effective)`; that is expected.
 

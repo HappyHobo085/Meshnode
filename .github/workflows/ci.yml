@@ -265,7 +265,6 @@ jobs:
   # remove -> reinstall -> purge lifecycle runs in rootless podman containers with systemd
   # (debian:13 and fedora:41, the script's defaults). The packages need glibc >= 2.39, which
   # ubuntu-latest (24.04) has. The first run builds the test images (slow, network).
-  # The Windows MSI job (build + scripts/inspect-msi.ps1) is added with the MSI scripts.
   linux-packages:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -324,6 +323,71 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: meshnode-linux-packages
+          path: ${{ runner.temp }}/out/*
+
+  # Sub-spec 8b: the Windows MSI, the same way: the current version and 0.0.1 (a scratch
+  # worktree, never committed), its tables inspected (scripts/inspect-msi.ps1), then the
+  # install -> upgrade -> downgrade refused -> uninstall -> reinstall lifecycle
+  # (scripts/test-msi.ps1) on the runner itself: it is disposable and elevated. Git Bash runs
+  # the build script; Tauri downloads WiX on the first build.
+  windows-msi:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TAURI_CLI_VERSION: "2.12.4"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+        working-directory: apps/ui
+      - run: cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
+      # One target dir for both builds (dependencies compiled once), as a C:/... path that
+      # Git Bash globs and cargo reads alike.
+      - run: echo "CARGO_TARGET_DIR=$(cygpath -m "$GITHUB_WORKSPACE")/target" >> "$GITHUB_ENV"
+      - name: Build the current MSI
+        run: |
+          scripts/check-version.sh
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/new.txt"
+          cygpath -w "$(grep '\.msi$' "$RUNNER_TEMP/new.txt")" > "$RUNNER_TEMP/new.msi.txt"
+      - name: Build the 0.0.1 MSI
+        run: |
+          OLD="$RUNNER_TEMP/meshnode-old"
+          git worktree add "$OLD" HEAD
+          cd "$OLD"
+          scripts/set-version.sh 0.0.1
+          cargo update -w --offline
+          cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+          (cd apps/ui && npm ci)
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/old.txt"
+          cygpath -w "$(grep '\.msi$' "$RUNNER_TEMP/old.txt")" > "$RUNNER_TEMP/old.msi.txt"
+      - name: Inspect the MSI
+        shell: pwsh
+        run: scripts/inspect-msi.ps1 (Get-Content "$env:RUNNER_TEMP/new.msi.txt")
+      - name: Lifecycle test (install, upgrade, downgrade refused, uninstall, reinstall)
+        shell: pwsh
+        run: scripts/test-msi.ps1 (Get-Content "$env:RUNNER_TEMP/old.msi.txt") (Get-Content "$env:RUNNER_TEMP/new.msi.txt") -LogDir "$env:RUNNER_TEMP/msi-logs" -Purge
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: meshnode-msi-logs
+          path: ${{ runner.temp }}/msi-logs/*
+      - name: Collect the current MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory "$env:RUNNER_TEMP/out" | Out-Null
+          Copy-Item (Get-Content "$env:RUNNER_TEMP/new.msi.txt") "$env:RUNNER_TEMP/out/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshnode-msi
           path: ${{ runner.temp }}/out/*
 
   android-apk:

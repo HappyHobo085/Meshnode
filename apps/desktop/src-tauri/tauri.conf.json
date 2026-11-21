@@ -35,6 +35,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "windows": {
+      "allowDowngrades": false,
+      "wix": {
+        "upgradeCode": "1123e229-ab63-4446-9683-3f337ecd48e3",
+        "fragmentPaths": ["packaging/windows/service.wxs"],
+        "componentRefs": ["MeshnodePackageMarker"]
+      }
+    },
     "linux": {
       "deb": {
         "depends": ["libc6 (>= 2.39)"],

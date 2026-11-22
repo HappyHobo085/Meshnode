@@ -34,6 +34,8 @@ mod removal;
 mod svc_local;
 mod sync;
 mod tables;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 
 pub use apply::{
     Acceptor, Change, ChangeKind, DeferReason, Outcome, PENDING_TTL_MS, ReadView, RejectReason,
@@ -45,6 +47,7 @@ pub use read::RegEntry;
 pub use removal::{CUTOFF_EXEMPT_SET, RemovalReport};
 pub use svc_local::{LOCAL_MAX_KEY, LOCAL_MAX_KEYS, LOCAL_MAX_VALUE};
 pub use sync::SyncItem;
+pub use tables::SCHEMA_VERSION;
 
 use ed25519_dalek::SigningKey;
 use mesh_hlc::{Clock, Hlc, SystemClock, WallClock};
@@ -52,7 +55,7 @@ use mesh_proto::{MeshId, NodeId, Scope};
 use redb::{Database, ReadableTable};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, RwLock};
-use tables::{META, SCHEMA_VERSION, meta};
+use tables::{META, meta};
 
 /// The replicated store. All methods take `&self`; writers are serialized internally.
 /// Every method blocks (and writing methods fsync): see the crate docs for using it
@@ -100,7 +103,8 @@ where
 impl<W: WallClock> Store<W> {
     /// Opens (creating if new) the store at `path` for `mesh`, owned by `key`.
     ///
-    /// Errors: `WrongMesh` if the file belongs to another mesh; `Corrupt { table: "meta" }`
+    /// Errors: `IncompatibleSchema` if the file was written under another schema version;
+    /// `WrongMesh` if the file belongs to another mesh; `Corrupt { table: "meta" }`
     /// if it belongs to another node or its metadata is malformed; `Io` if the file is
     /// already open (by this or another process) or cannot be opened.
     pub fn open(path: &Path, mesh: MeshId, key: SigningKey, wall: W) -> Result<Self, StoreError>
@@ -140,10 +144,10 @@ impl<W: WallClock> Store<W> {
                     }
                     let schema = meta_u64_req(&m, meta::SCHEMA)?;
                     if schema != SCHEMA_VERSION {
-                        return Err(StoreError::corrupt(
-                            "meta",
-                            format!("unsupported schema version {schema}"),
-                        ));
+                        return Err(StoreError::IncompatibleSchema {
+                            found: schema,
+                            supported: SCHEMA_VERSION,
+                        });
                     }
                     if meta_u64_req(&m, meta::NEXT_SEQ)? == 0 {
                         return Err(StoreError::corrupt("meta", "next_seq is 0"));

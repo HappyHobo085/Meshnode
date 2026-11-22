@@ -37,9 +37,7 @@ fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> 
         if replace {
             std::fs::rename(from, to)?;
         } else {
-            // A hard link fails if `to` exists, unlike a rename.
-            std::fs::hard_link(from, to)?;
-            std::fs::remove_file(from)?;
+            rename_noreplace(from, to)?;
         }
         // The rename is durable only once the directory entry is.
         #[cfg(unix)]
@@ -48,6 +46,43 @@ fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> 
             std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
         }
         Ok(())
+    }
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists.
+#[cfg(all(not(windows), not(target_os = "android")))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // A hard link fails if `to` exists, unlike a rename.
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists. Android's SELinux
+/// policy refuses hard links in an app's data directory (EACCES), so this is
+/// `renameat2(RENAME_NOREPLACE)`, as a raw syscall: bionic's wrapper needs API 30.
+#[cfg(target_os = "android")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -91,6 +126,14 @@ fn write_durably(
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Windows: lets every signed-in user read `path` (Authenticated Users, read only), on top
+/// of what it inherits from its directory. For non-secret status files such as
+/// `start-error.txt` in the service's private data directory.
+#[cfg(windows)]
+pub fn grant_read_to_authenticated_users(path: &Path) -> std::io::Result<()> {
+    crate::winfs::grant_read_to_authenticated_users(path)
 }
 
 /// Write `bytes` to `path` via a temp file in the same directory, fsync, then a durable
@@ -149,6 +192,13 @@ fn hex32(s: &str) -> Result<[u8; 32], NodeError> {
         .map_err(|_| bad_file("expected 32 bytes".into()))
 }
 
+fn incompatible_file(file: &str, detail: String) -> NodeError {
+    NodeError::Incompatible {
+        file: file.into(),
+        detail,
+    }
+}
+
 fn bad_file(msg: String) -> NodeError {
     NodeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
 }
@@ -160,10 +210,12 @@ pub fn read_genesis(dir: &Path) -> Result<Option<MeshGenesis>, NodeError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let f: GenesisFile = serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+    let incompatible = |detail: String| incompatible_file(GENESIS_FILE, detail);
+    let f: GenesisFile = serde_json::from_slice(&bytes).map_err(|e| incompatible(e.to_string()))?;
+    let hex = |s: &str| hex32(s).map_err(|_| incompatible("not a 32-byte hex id".into()));
     Ok(Some(MeshGenesis {
-        founder: NodeId(hex32(&f.founder)?),
-        nonce: hex32(&f.nonce)?,
+        founder: NodeId(hex(&f.founder)?),
+        nonce: hex(&f.nonce)?,
     }))
 }
 
@@ -214,11 +266,15 @@ pub fn read_own_role(dir: &Path) -> Result<Option<Role>, NodeError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let f: RoleFile = serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+    let f: RoleFile =
+        serde_json::from_slice(&bytes).map_err(|e| incompatible_file(ROLE_FILE, e.to_string()))?;
     match f.joined_as.as_str() {
         "host" => Ok(Some(Role::Host)),
         "client" => Ok(Some(Role::Client)),
-        other => Err(bad_file(format!("unknown role `{other}` in {ROLE_FILE}"))),
+        other => Err(incompatible_file(
+            ROLE_FILE,
+            format!("unknown role `{other}`"),
+        )),
     }
 }
 
@@ -256,13 +312,15 @@ impl Invites {
         let mut map = BTreeMap::new();
         match std::fs::read(&path) {
             Ok(bytes) => {
+                let bad = |detail: String| incompatible_file(INVITES_FILE, detail);
+                let hex = |s: &str| hex32(s).map_err(|_| bad("not a 32-byte hex id".into()));
                 let rows: BTreeMap<String, InviteRow> =
-                    serde_json::from_slice(&bytes).map_err(|e| bad_file(e.to_string()))?;
+                    serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
                 for (k, r) in rows {
-                    let redeemed_by = r.redeemed_by.as_deref().map(hex32).transpose()?.map(NodeId);
+                    let redeemed_by = r.redeemed_by.as_deref().map(hex).transpose()?.map(NodeId);
                     let role = if r.host { Role::Host } else { Role::Client };
                     map.insert(
-                        hex32(&k)?,
+                        hex(&k)?,
                         InviteEntry {
                             role,
                             expires_ms: r.expires_ms,

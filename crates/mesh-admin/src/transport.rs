@@ -66,6 +66,44 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
+/// The file in the data directory that holds why the last start was refused for
+/// incompatible data (written by the daemon, removed by its next successful start), so that
+/// clients can say why no daemon answers.
+pub const START_ERROR_FILE: &str = "start-error.txt";
+
+/// The first line of `<data_dir>/start-error.txt`, when there is one. A file that exists
+/// but cannot be read is reported as `(start error unreadable: <error>)` rather than
+/// hidden, except on Unix when permission is denied: there that is what a user outside the
+/// data directory's group always gets, file or not, so whether the daemon refused is
+/// unknown and nothing is reported (see [`access_denied`]).
+pub fn start_error(data_dir: &Path) -> Option<String> {
+    let text = match std::fs::read_to_string(data_dir.join(START_ERROR_FILE)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        #[cfg(unix)]
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(e) => return Some(format!("(start error unreadable: {e})")),
+    };
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_owned())
+}
+
+/// Whether this user is denied access to the data directory's admin endpoint (Linux: the
+/// service's directory is `0750 meshnode:meshnode` and the user is not, or not yet, in the
+/// group). Always `false` on Windows.
+pub fn access_denied(data_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(data_dir.join("admin.sock"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        false
+    }
+}
+
 /// The admin endpoint for a data directory. Unix: `<data>/admin.sock`. Windows:
 /// `\\.\pipe\meshnode-admin` for the default data directory, else
 /// `\\.\pipe\meshnode-admin-<first 8 hex of blake3(canonical data dir)>`.
@@ -123,5 +161,47 @@ pub(crate) fn bind(endpoint: &Endpoint, access: &Access) -> Result<Listener, Adm
         Endpoint::Socket(path) => Listener::bind(path, access),
         #[cfg(windows)]
         Endpoint::Pipe(name) => Listener::bind(name, access),
+    }
+}
+
+#[cfg(test)]
+mod start_error_tests {
+    use super::*;
+
+    #[test]
+    fn start_error_reads_the_first_line_and_reports_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(start_error(dir.path()), None);
+        std::fs::write(dir.path().join(START_ERROR_FILE), "why\nmore\n").unwrap();
+        assert_eq!(start_error(dir.path()).as_deref(), Some("why"));
+        // Not readable as a file: said, not swallowed.
+        std::fs::remove_file(dir.path().join(START_ERROR_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(START_ERROR_FILE)).unwrap();
+        let shown = start_error(dir.path()).unwrap();
+        assert!(shown.starts_with("(start error unreadable: "), "{shown}");
+    }
+
+    /// A data directory this user may not search (Linux: not in the `meshnode` group):
+    /// whether the daemon refused is unknown, so nothing is reported.
+    #[cfg(unix)]
+    #[test]
+    fn start_error_in_a_directory_without_access_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join(START_ERROR_FILE), "why\n").unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores the mode: the case cannot be made.
+        let denied = std::fs::metadata(data.join(START_ERROR_FILE))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let (shown, no_access) = (start_error(&data), access_denied(&data));
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            assert_eq!(shown, None);
+            assert!(no_access);
+        }
+        assert!(!access_denied(&data));
+        assert!(!access_denied(&dir.path().join("missing")));
     }
 }

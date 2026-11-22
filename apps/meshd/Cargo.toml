@@ -60,4 +60,5 @@ test-hooks = ["mesh-host/test-hooks"]
 [dev-dependencies]
 meshd = { path = ".", features = ["test-hooks"] }
 mesh-runtime = { path = "../../crates/mesh-runtime", features = ["test-hooks"] }
+mesh-store = { path = "../../crates/mesh-store", features = ["test-hooks"] }
 tempfile.workspace = true

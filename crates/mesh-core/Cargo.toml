@@ -25,6 +25,9 @@ blake3.workspace = true
 n0-future = "0.3"
 tokio-util.workspace = true
 
+[target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

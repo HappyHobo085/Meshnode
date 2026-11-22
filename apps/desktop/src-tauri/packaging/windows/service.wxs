@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The meshnode service in the MSI (spec §3.3), added to Tauri's WiX template as a fragment
+  (bundle.windows.wix.fragmentPaths; the component reference pulls in the whole fragment).
+  The MSI's own lifecycle matches the deb/rpm (packaging/linux/scripts):
+    install    meshd service install -from-package -admin-user DOMAIN\user: registers the
+               installed meshd.exe in place, secures %ProgramData%\meshnode, starts it
+    upgrade    the old package's removal stops the service before its files go; the new
+               package starts it again once its files are in place (data kept)
+    downgrade  refused by the template's MajorUpgrade (allowDowngrades: false)
+    uninstall  meshd service uninstall -from-package (stops and removes the service and
+               keeps %ProgramData%\meshnode)
+  Tauri's MajorUpgrade is scheduled afterInstallInitialize: an upgrade first runs the old
+  product's complete removal (with UPGRADINGPRODUCTCODE set), then installs the new files.
+  Every service action is deferred and not impersonated (LocalSystem), and runs meshd through
+  WixQuietExec64 (WixUtilExtension, linked by Tauri), which logs meshd's output in the MSI
+  log; its command line is the action's CustomActionData, formatted by a SetProperty in the
+  immediate phase. (Double dashes cannot appear in an XML comment, so the flags above are
+  written with one.)
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- The marker that makes `meshd service install|uninstall` refuse without -from-package
+         (meshd::service::package_marker: <Program Files>\Meshnode\packaged). -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MeshnodePackageMarker" Guid="256D5C97-1716-40F5-8F40-6B672421F3ED">
+        <File Id="MeshnodePackaged" Name="packaged" Source="$(sys.SOURCEFILEDIR)packaged" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- The install directory is fixed: the marker path and the service's binary path are
+         <Program Files>\Meshnode. This overrides the template's remembered INSTALLDIR and one
+         given on the command line, in both sequences; the UI skips the directory dialog. -->
+    <SetDirectory Id="INSTALLDIR" Value="[ProgramFiles64Folder]Meshnode\" Sequence="both" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="3">1</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="3">NOT Installed</Publish>
+    </UI>
+
+    <!-- Set when the service is registered, read before anything is removed (AppSearch runs
+         before RemoveExistingProducts): an upgrade then starts the existing service instead
+         of installing it. -->
+    <Property Id="MESHNODE_SERVICE" Secure="yes">
+      <RegistrySearch Id="MeshnodeServiceImagePath" Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\meshnode"
+                      Name="ImagePath" Type="raw" Win64="yes" />
+    </Property>
+
+    <!-- The user who launched the installer (not the LocalSystem the deferred actions run as),
+         domain-qualified so that the lookup cannot pick a same-named domain account. Set in
+         the UI sequence (the client, as that user) and again in the execute sequence when the
+         UI did not run (/qn); an administrator can pass MESHNODE_ADMIN_USER instead. -->
+    <Property Id="MESHNODE_ADMIN_USER" Secure="yes" />
+    <SetProperty Id="MESHNODE_ADMIN_USER" Value="[%USERDOMAIN]\[LogonUser]" Before="CostInitialize" Sequence="both">NOT MESHNODE_ADMIN_USER</SetProperty>
+
+    <!-- Stop before the files are replaced (the old product's removal during an upgrade); a
+         rollback starts it again. -->
+    <SetProperty Id="MeshnodeServiceStopRollback" Value="&quot;[INSTALLDIR]meshd.exe&quot; service start" Before="MeshnodeServiceStopRollback" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceStopRollback" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="rollback" Impersonate="no" Return="ignore" />
+    <SetProperty Id="MeshnodeServiceStop" Value="&quot;[INSTALLDIR]meshd.exe&quot; service stop" Before="MeshnodeServiceStop" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceStop" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- Uninstall (not an upgrade): remove the service; the data directory stays. -->
+    <SetProperty Id="MeshnodeServiceUninstall" Value="&quot;[INSTALLDIR]meshd.exe&quot; service uninstall --from-package" Before="MeshnodeServiceUninstall" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceUninstall" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- Install (no service yet): register and start it; a rollback removes it again. -->
+    <SetProperty Id="MeshnodeServiceInstallRollback" Value="&quot;[INSTALLDIR]meshd.exe&quot; service uninstall --from-package" Before="MeshnodeServiceInstallRollback" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceInstallRollback" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="rollback" Impersonate="no" Return="ignore" />
+    <SetProperty Id="MeshnodeServiceInstall" Value="&quot;[INSTALLDIR]meshd.exe&quot; service install --from-package --admin-user &quot;[MESHNODE_ADMIN_USER]&quot;" Before="MeshnodeServiceInstall" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceInstall" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- Upgrade (the service exists): start it with the new files, as the last step before
+         InstallFinalize, so that as little as possible can fail after it. A failed start does
+         not undo the upgrade, as the deb/rpm postinst's `systemctl restart || true`. If the
+         upgrade fails or is cancelled after it, the rollback stops the new binary first; the
+         old product's StopRollback then starts the service on the restored old files. -->
+    <SetProperty Id="MeshnodeServiceStartRollback" Value="&quot;[INSTALLDIR]meshd.exe&quot; service stop" Before="MeshnodeServiceStartRollback" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceStartRollback" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="rollback" Impersonate="no" Return="ignore" />
+    <SetProperty Id="MeshnodeServiceStart" Value="&quot;[INSTALLDIR]meshd.exe&quot; service start" Before="MeshnodeServiceStart" Sequence="execute" />
+    <CustomAction Id="MeshnodeServiceStart" BinaryKey="WixCA" DllEntry="WixQuietExec64" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="MeshnodeServiceStopRollback" Before="MeshnodeServiceStop"><![CDATA[MESHNODE_SERVICE AND Installed AND (UPGRADINGPRODUCTCODE OR NOT REMOVE~="ALL")]]></Custom>
+      <Custom Action="MeshnodeServiceStop" Before="RemoveFiles"><![CDATA[MESHNODE_SERVICE AND Installed AND (UPGRADINGPRODUCTCODE OR NOT REMOVE~="ALL")]]></Custom>
+      <Custom Action="MeshnodeServiceUninstall" After="MeshnodeServiceStop"><![CDATA[MESHNODE_SERVICE AND REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]></Custom>
+      <Custom Action="MeshnodeServiceInstallRollback" After="InstallFiles"><![CDATA[NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+      <Custom Action="MeshnodeServiceInstall" After="MeshnodeServiceInstallRollback"><![CDATA[NOT MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+      <Custom Action="MeshnodeServiceStartRollback" Before="MeshnodeServiceStart"><![CDATA[MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+      <Custom Action="MeshnodeServiceStart" Before="InstallFinalize"><![CDATA[MESHNODE_SERVICE AND NOT REMOVE~="ALL"]]></Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

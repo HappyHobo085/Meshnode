@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 mesh-hlc = { path = "../mesh-hlc" }
 serde.workspace = true
+serde_json.workspace = true
 postcard.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true

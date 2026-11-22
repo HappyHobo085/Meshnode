@@ -101,6 +101,48 @@ async fn locator_none_when_nothing_answers() {
     );
 }
 
+/// No daemon answers, and one candidate's last start was refused: the connection names why.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_without_daemon_carries_the_start_error() {
+    let (system, user) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let transport = RelocatingTransport::new(locator(system.path(), user.path()));
+    transport.relocate().await;
+    assert_eq!(transport.connection().start_error, None);
+    std::fs::write(
+        user.path().join(mesh_admin::START_ERROR_FILE),
+        "data was written by an incompatible Meshnode version\nmore\n",
+    )
+    .unwrap();
+    let c = transport.connection();
+    assert_eq!(c.kind, ConnectionKindDto::None);
+    assert_eq!(
+        c.start_error.as_deref(),
+        Some("data was written by an incompatible Meshnode version")
+    );
+}
+
+/// The system service's data directory is there but this user may not search it (Linux:
+/// not in the `meshnode` group): the connection says so, and reports no start error.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_without_access_to_the_service_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, user) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let system = root.path().join("meshnode");
+    std::fs::create_dir(&system).unwrap();
+    let transport = RelocatingTransport::new(locator(&system, user.path()));
+    transport.relocate().await;
+    assert!(!transport.connection().no_access);
+    std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores the mode: the case cannot be made.
+    let denied = std::fs::read_dir(&system).is_err();
+    let c = transport.connection();
+    std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(c.kind, ConnectionKindDto::None);
+    assert_eq!(c.no_access, denied);
+    assert_eq!(c.start_error, None);
+}
+
 /// A command through the desktop `Ui` after its daemon went away: the first attempt fails
 /// with `DaemonUnreachable`, the transport locates once more and retries.
 #[tokio::test(flavor = "multi_thread")]

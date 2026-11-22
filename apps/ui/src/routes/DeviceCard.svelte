@@ -26,8 +26,15 @@
   const platform = $derived(platformOf(member.platform));
   const shownTags = $derived(expanded ? member.tags : member.tags.slice(0, FOLD));
   const hidden = $derived(member.tags.length - shownTags.length);
+  // A member on a version this device cannot sync with: said so instead of "Offline".
+  const incompatible = $derived(
+    member.incompatible && !member.isSelf
+      ? `Incompatible version${member.version ? ` (${member.version})` : ""}`
+      : null,
+  );
+  const stateWord = $derived(incompatible ?? (member.online ? "Online" : "Offline"));
   const seen = $derived(
-    member.online
+    member.online || incompatible
       ? null
       : member.lastSeenMs === null
         ? "not seen yet"
@@ -90,8 +97,8 @@
     <Monogram name={member.name} hue={member.accentHue} online={member.online} />
     <div class="who">
       <h3 class="name truncate" title={member.name}>{member.name}</h3>
-      <p class={["state", { online: member.online }]}>
-        <span class="state-word">{member.online ? "Online" : "Offline"}{seen ? "," : ""}</span>
+      <p class={["state", { online: member.online, incompatible }]}>
+        <span class="state-word">{stateWord}{seen ? "," : ""}</span>
         {#if seen}<span class="seen">{seen}</span>{/if}
       </p>
     </div>
@@ -213,6 +220,10 @@
   }
   .state.online .state-word {
     color: var(--ok);
+    font-weight: var(--fw-medium);
+  }
+  .state.incompatible .state-word {
+    color: var(--warn);
     font-weight: var(--fw-medium);
   }
   .self {

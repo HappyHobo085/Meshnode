@@ -19,6 +19,7 @@ mod rebootstrap;
 pub mod sync;
 #[doc(hidden)]
 pub mod transport;
+pub mod version;
 #[cfg(windows)]
 mod winfs;
 
@@ -31,6 +32,9 @@ pub use events::NodeEvent;
 pub use iroh::endpoint::Connection;
 pub use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler};
 pub use maint::MaintJob;
+/// A member's versions (see [`NodeHandle::members`]).
+pub use mesh_proto::PeerVersion;
 /// Store types that appear in this crate's API (store errors and change events).
 pub use mesh_store::{Change, ChangeKind, StoreError};
 pub use node::{MemberStatus, Node, NodeHandle, NodeStatus, WakeOutcome};
+pub use version::CurrentVersion;

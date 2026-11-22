@@ -1,6 +1,8 @@
 //! Node configuration and timings.
 
 use std::any::Any;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,6 +104,15 @@ pub struct NodeConfig {
     /// peers completed a round or disconnected, after at most 60 s, or at shutdown.
     /// `None` (the default): nothing is called.
     pub on_catch_up: Option<CatchUpHook>,
+    /// The product version this node reports to peers over `meshnode/version` (set by the
+    /// host from the product version; empty by default).
+    pub product_version: String,
+    /// Test hook: serve and dial this ALPN for sync instead of `meshnode/sync/1`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub sync_alpn_override: Option<Vec<u8>>,
+    /// Test hook: the protocol versions reported to peers instead of the ALPN constants'.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub protocols_override: Option<BTreeMap<String, u32>>,
 }
 
 impl NodeConfig {
@@ -119,6 +130,11 @@ impl NodeConfig {
             extra_protocols: Vec::new(),
             catch_up_on_incoming_after: None,
             on_catch_up: None,
+            product_version: String::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            sync_alpn_override: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            protocols_override: None,
         }
     }
 }

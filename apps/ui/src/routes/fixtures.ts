@@ -13,6 +13,8 @@ export function member(over: Partial<MemberDto> & { id: string; name: string }):
     lastSeenMs: null,
     lag: 0,
     accentHue: 200,
+    version: null,
+    incompatible: false,
     ...over,
   };
 }

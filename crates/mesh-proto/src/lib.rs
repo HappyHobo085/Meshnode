@@ -7,6 +7,7 @@ mod op;
 mod service;
 mod sync;
 mod ticket;
+mod version;
 
 pub use httpfwd::{
     ALPN_HTTPFWD, ForwardRequest, ForwardResponse, HTTPFWD_MAX_FRAME, MAX_HEADER_BYTES,
@@ -23,6 +24,7 @@ pub use sync::{
     Freshness, MAX_BATCH_BYTES, MAX_BATCH_OPS, Scope, SyncMsg, VersionVector, batch_ops,
 };
 pub use ticket::InviteTicket;
+pub use version::{ALPN_VERSION, PeerVersion, VERSION_MAX_BYTES, alpn_version};
 
 use serde::{Serialize, de::DeserializeOwned};
 

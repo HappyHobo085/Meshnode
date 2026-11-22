@@ -82,6 +82,7 @@ fn phone() -> (HostOptions, Arc<Rec>) {
         admin_socket: false,
         periodic: Periodic::Driven,
         power: Some(sink),
+        ..HostOptions::default()
     };
     (host, rec)
 }

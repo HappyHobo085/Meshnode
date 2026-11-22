@@ -8,7 +8,9 @@ use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use mesh_core::{NodeHandle, NodeStatus};
 use mesh_forward::{ForwardError, RemoteForwarder};
-use mesh_proto::{NodeId, Role, Scope};
+#[cfg(any(test, feature = "test-hooks"))]
+use mesh_proto::NodeId;
+use mesh_proto::{Role, Scope};
 use mesh_services::{LocalState, Services};
 
 pub use mesh_forward::{PingError, PingTiming, ping};

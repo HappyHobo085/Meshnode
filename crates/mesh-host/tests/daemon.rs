@@ -11,7 +11,7 @@ use mesh_admin::{
     LocalStateView, StatusInfo,
 };
 use mesh_host::config::GatewaySection;
-use mesh_host::{Daemon, HostConfig, TestOptions};
+use mesh_host::{ConfigError, Daemon, DaemonError, HostConfig, TestOptions};
 use mesh_proto::{Limits, Placement, Role};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -114,11 +114,33 @@ async fn uninitialised() -> D {
     start_in(tempfile::tempdir().unwrap(), test_config()).await
 }
 
+/// Starts a daemon with `make_cfg()` in a fresh data dir and runs Init. Init binds the
+/// gateway itself and, when the port is taken, leaves the node running with an error, so
+/// a `free_port` pick lost to a parallel test cannot be retried in place: stop that daemon
+/// and start over with a fresh config (up to 3 attempts in all).
+async fn init_with(name: &str, make_cfg: impl Fn() -> HostConfig) -> D {
+    let mut attempt = 1;
+    loop {
+        let d = start_in(tempfile::tempdir().unwrap(), make_cfg()).await;
+        let r = d.req(AdminRequest::Init { name: name.into() }).await;
+        match &r {
+            AdminResponse::Ok => return d,
+            AdminResponse::Error { code, message }
+                if *code == ErrorCode::Internal
+                    && message.contains("the gateway did not start")
+                    && attempt < 3 =>
+            {
+                eprintln!("init: {message}; retrying on a fresh port");
+                attempt += 1;
+                d.stop().await;
+            }
+            other => panic!("init: {other:?}"),
+        }
+    }
+}
+
 async fn initialised(name: &str) -> D {
-    let d = uninitialised().await;
-    let r = d.req(AdminRequest::Init { name: name.into() }).await;
-    assert_eq!(r, AdminResponse::Ok);
-    d
+    init_with(name, test_config).await
 }
 
 fn assert_error(r: &AdminResponse, want: ErrorCode) {
@@ -312,14 +334,14 @@ async fn join_through_daemon() {
 
 #[tokio::test]
 async fn every_request_against_real_daemon() {
-    let mut cfg = test_config();
-    let mapped = free_port();
-    cfg.gateway.ports = BTreeMap::from([(mapped, "counter".to_string())]);
-    let d = start_in(tempfile::tempdir().unwrap(), cfg).await;
-    assert_eq!(
-        d.req(AdminRequest::Init { name: "pc".into() }).await,
-        AdminResponse::Ok
-    );
+    let d = init_with("pc", || {
+        let mut cfg = test_config();
+        cfg.gateway.ports = BTreeMap::from([(free_port(), "counter".to_string())]);
+        cfg
+    })
+    .await;
+    // The retry may have picked a different mapped port: read it back.
+    let mapped = d.status().await.ports[0].0;
     let me = d.status().await.node_id.unwrap();
     assert_eq!(
         d.status().await.ports,
@@ -716,6 +738,91 @@ async fn second_daemon_on_same_data_dir_refused() {
     // The first one is unaffected.
     assert_eq!(d.status().await.state, DaemonState::Running);
     d.stop().await;
+}
+
+#[tokio::test]
+async fn start_on_incompatible_store_is_incompatible() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    mesh_store::test_hooks::set_schema(
+        &dir.path().join("store.redb"),
+        mesh_store::SCHEMA_VERSION + 1,
+    )
+    .unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg, TestOptions::fast()).await;
+    let e = r.err().expect("incompatible store refused");
+    assert!(e.is_incompatible(), "{e:?}");
+    assert!(e.to_string().contains("store schema"), "{e}");
+}
+
+/// A `meshd.toml` this build cannot take (an unknown key, or a value a newer build may
+/// accept) is a refusal like incompatible data; failing to read it is not.
+#[test]
+fn unloadable_config_is_incompatible_but_unreadable_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |text: &str| {
+        std::fs::write(dir.path().join(mesh_host::config::CONFIG_FILE), text).unwrap();
+        DaemonError::from(HostConfig::load_or_default(dir.path()).unwrap_err())
+    };
+    let unknown = load("not_a_key = 1\n");
+    assert!(unknown.is_incompatible(), "{unknown:?}");
+    let invalid = load("log_level = \"verbose\"\n");
+    assert!(
+        matches!(invalid, DaemonError::Config(ConfigError::Invalid { .. })),
+        "{invalid:?}"
+    );
+    assert!(invalid.is_incompatible(), "{invalid:?}");
+    let io = DaemonError::Config(ConfigError::Io {
+        path: dir.path().join(mesh_host::config::CONFIG_FILE),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    });
+    assert!(!io.is_incompatible(), "{io:?}");
+}
+
+#[tokio::test]
+async fn incompatible_start_writes_start_error() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    let store = dir.path().join("store.redb");
+    let error_file = dir.path().join(mesh_host::paths::START_ERROR_FILE);
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION + 1).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
+    let e = r.err().expect("incompatible store refused");
+    let written = std::fs::read_to_string(&error_file).expect("start-error.txt written");
+    assert_eq!(written.trim_end(), e.to_string());
+    assert!(written.contains("store schema"), "{written}");
+    // A matching store again: the next start succeeds and removes the file.
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION).unwrap();
+    let d = start_in(dir, cfg).await;
+    assert!(
+        !error_file.exists(),
+        "start-error.txt left after a good start"
+    );
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn other_start_failure_removes_a_stale_start_error() {
+    let d = initialised("pc").await;
+    let cfg = HostConfig::load_or_default(d.data()).unwrap();
+    let dir = d.stop().await;
+    let store = dir.path().join("store.redb");
+    let error_file = dir.path().join(mesh_host::paths::START_ERROR_FILE);
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION + 1).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg.clone(), TestOptions::fast()).await;
+    assert!(r.err().expect("refused").is_incompatible());
+    assert!(error_file.exists(), "start-error.txt written");
+    // The store is fixed, but the gateway port is taken: a different failure, so the old
+    // reason must not stay behind.
+    mesh_store::test_hooks::set_schema(&store, mesh_store::SCHEMA_VERSION).unwrap();
+    let blocker = std::net::TcpListener::bind(cfg.gateway.listen).unwrap();
+    let r = Daemon::start_with(dir.path().to_path_buf(), cfg, TestOptions::fast()).await;
+    let e = r.err().expect("start refused while the port is taken");
+    assert!(!e.is_incompatible(), "{e:?}");
+    assert!(!error_file.exists(), "stale start-error.txt left behind");
+    drop(blocker);
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@ package net.meshnode.app
 
 import net.meshnode.app.RestartPolicy.Trigger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -42,7 +43,7 @@ class RestartPolicyTest {
       assertEquals(
         "trigger=$trigger userStopped=$userStopped running=$running",
         expected,
-        RestartPolicy.shouldStart(trigger, userStopped, running),
+        RestartPolicy.shouldStart(trigger, userStopped, false, running),
       )
     }
   }
@@ -67,5 +68,27 @@ class RestartPolicyTest {
     for (t in Trigger.entries) {
       assertEquals(t == Trigger.USER_START, RestartPolicy.clearsUserStopped(t))
     }
+  }
+
+  @Test
+  fun noAutoRestartAfterIncompatible() {
+    val automatic = listOf(
+      Trigger.BOOT,
+      Trigger.PACKAGE_REPLACED,
+      Trigger.TASK_REMOVED_ALARM,
+      Trigger.WATCHDOG,
+    )
+    for (t in automatic) {
+      assertFalse("$t", RestartPolicy.shouldStart(t, false, true, false))
+      assertFalse("$t clears", RestartPolicy.clearsRefusedIncompatible(t))
+    }
+    assertTrue(RestartPolicy.shouldStart(Trigger.APP_OPEN, false, true, false))
+    assertTrue(RestartPolicy.shouldStart(Trigger.USER_START, false, true, false))
+    // A user stop still wins over opening the app; running never starts again.
+    assertFalse(RestartPolicy.shouldStart(Trigger.APP_OPEN, true, true, false))
+    assertFalse(RestartPolicy.shouldStart(Trigger.APP_OPEN, false, true, true))
+    assertTrue(RestartPolicy.clearsRefusedIncompatible(Trigger.USER_START))
+    assertTrue(RestartPolicy.clearsRefusedIncompatible(Trigger.APP_OPEN))
+    assertFalse(RestartPolicy.clearsRefusedIncompatible(Trigger.BOOT))
   }
 }

@@ -17,7 +17,8 @@ use crate::output::{say, say_raw};
 use crate::{local, output};
 
 /// A failed command: the message for stderr and the process exit code (1 daemon-reported
-/// or other failure, 2 usage, 3 daemon not running).
+/// or other failure, 2 usage, 3 daemon not running, 4 data from an incompatible Meshnode
+/// version: the systemd unit does not restart on it).
 #[derive(Debug)]
 pub struct CliError {
     pub code: u8,
@@ -35,6 +36,14 @@ impl CliError {
     pub fn usage(message: impl Into<String>) -> Self {
         CliError {
             code: 2,
+            message: message.into(),
+        }
+    }
+
+    /// `meshd run` refused data written by an incompatible version (spec 8b §5.2).
+    pub fn incompatible(message: impl Into<String>) -> Self {
+        CliError {
+            code: 4,
             message: message.into(),
         }
     }
@@ -95,7 +104,9 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Status { json } => {
-            let r = call(&data, AdminRequest::Status).await?;
+            let r = call(&data, AdminRequest::Status)
+                .await
+                .map_err(|e| not_running_reason(e, &data))?;
             let AdminResponse::Status(s) = r else {
                 return Err(unexpected(&r));
             };
@@ -206,11 +217,35 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 /// default), uninstall checks it against the installed one.
 fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> {
     use meshd::service;
+    service_with(requested, cmd, service::package_marker().as_deref())
+}
+
+/// The refusal for `service install|uninstall` while a system package owns the service.
+const PACKAGE_MANAGED: &str = "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead";
+
+/// [`service`] with the package marker's path given.
+fn service_with(
+    requested: Option<PathBuf>,
+    cmd: ServiceCmd,
+    marker: Option<&Path>,
+) -> Result<(), CliError> {
+    use meshd::service;
     let failed = |e: service::ServiceError| CliError::failed(e.to_string());
+    let gate = |from_package| match service::is_package_managed(
+        marker.is_some_and(Path::exists),
+        from_package,
+    ) {
+        service::PackageGate::Allow => Ok(()),
+        service::PackageGate::Refuse => Err(CliError::failed(PACKAGE_MANAGED)),
+    };
     match cmd {
-        ServiceCmd::Install => {
+        ServiceCmd::Install {
+            from_package,
+            admin_user,
+        } => {
+            gate(from_package)?;
             let data = requested.unwrap_or_else(service::default_data_dir);
-            service::install(&data).map_err(failed)?;
+            service::install(&data, admin_user.as_deref()).map_err(failed)?;
             say!(
                 "Installed and started the meshnode service (data directory {}).",
                 data.display()
@@ -220,7 +255,11 @@ fn service(requested: Option<PathBuf>, cmd: ServiceCmd) -> Result<(), CliError> 
                 say!("Log in again to use meshd's commands without sudo (group meshnode).");
             }
         }
-        ServiceCmd::Uninstall { purge_data } => {
+        ServiceCmd::Uninstall {
+            purge_data,
+            from_package,
+        } => {
+            gate(from_package)?;
             match service::uninstall(requested.as_deref(), purge_data).map_err(failed)? {
                 Some(purged) => say!(
                     "Removed the meshnode service and deleted {}.",
@@ -280,6 +319,17 @@ fn service_status_json(status: meshd::service::ServiceStatus, data_dir: Option<&
 }
 
 // --- talking to the daemon ---------------------------------------------------------------
+
+/// No daemon answers and its last start was refused (`start-error.txt`): say why.
+fn not_running_reason(e: CliError, data: &Path) -> CliError {
+    match meshd::paths::start_error(data) {
+        Some(reason) if e.code == 3 => CliError {
+            code: 3,
+            message: format!("not running: {reason}"),
+        },
+        _ => e,
+    }
+}
 
 async fn connect(data: &Path) -> Result<AdminClient, CliError> {
     Ok(AdminClient::connect(&endpoint_for(data)).await?)
@@ -669,6 +719,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn install_refused_when_package_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("packaged");
+        std::fs::write(&marker, b"").unwrap();
+        let data = dir.path().join("data");
+        let install = || ServiceCmd::Install {
+            from_package: false,
+            admin_user: None,
+        };
+        let uninstall = || ServiceCmd::Uninstall {
+            purge_data: true,
+            from_package: false,
+        };
+        for cmd in [install(), uninstall()] {
+            let err = service_with(Some(data.clone()), cmd, Some(&marker)).unwrap_err();
+            assert_eq!(
+                err.message,
+                "Meshnode is installed by the system package; use your package manager (or the Windows installer) instead"
+            );
+            assert_eq!(err.code, 1);
+        }
+        assert!(!data.exists(), "nothing is written");
+    }
+
     fn member(first: u8, second: u8, name: &str) -> MemberInfoView {
         let mut id = [0u8; 32];
         id[0] = first;
@@ -685,12 +760,14 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             lag: 0,
+            version: None,
+            incompatible: false,
         }
     }
 
-    /// The deploy command `docs/manual-checks/sub-spec-7.md` and spec 7 §5.3 give for the Aegis
-    /// sync service sets 64 MB, 30 s and 8 MiB; without the flags the timeout is the daemon's
-    /// 10 s default.
+    /// The deploy command for the Aegis sync service (spec 7 §5.3; the service now lives in the
+    /// Aegis repo, `sync-server/wasm`) sets 64 MB, 30 s and 8 MiB; without the flags the timeout
+    /// is the daemon's 10 s default.
     #[test]
     fn deploy_wasm_limit_flags_set_the_documented_sync_limits() {
         use clap::Parser;

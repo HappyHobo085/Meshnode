@@ -952,3 +952,54 @@ mod catch_up {
         timeout(T, a.shutdown()).await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_info_is_visible_in_members_immediately() {
+    let d = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(d.path(), "a").0).await.unwrap();
+    a.set_info(Some("d2".into()), Some(vec!["lab".into()]))
+        .await
+        .unwrap();
+    let me = a.node_id();
+    let members = a.members();
+    let info = members
+        .iter()
+        .find(|m| m.id == me)
+        .and_then(|m| m.info.clone())
+        .expect("own info");
+    assert_eq!(info.name, "d2");
+    assert_eq!(info.tags, ["lab"]);
+    timeout(T, a.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_tags_of_is_visible_in_members_immediately() {
+    let d = tempfile::tempdir().unwrap();
+    let a = Node::create_mesh(test_cfg(d.path(), "a").0).await.unwrap();
+    let me = a.node_id();
+    a.set_tags_of(me, vec!["lab".into()]).await.unwrap();
+    let members = a.members();
+    let info = members
+        .iter()
+        .find(|m| m.id == me)
+        .and_then(|m| m.info.clone())
+        .expect("own info");
+    assert_eq!(info.tags, ["lab"]);
+    timeout(T, a.shutdown()).await.unwrap();
+}
+
+#[test]
+fn unknown_role_file_is_incompatible() {
+    use mesh_core::local::read_own_role;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("role.json"), r#"{"joined_as":"overlord"}"#).unwrap();
+    match read_own_role(dir.path()) {
+        Err(NodeError::Incompatible { file, .. }) => assert_eq!(file, "role.json"),
+        other => panic!("role.json: {other:?}"),
+    }
+    std::fs::write(dir.path().join("mesh.json"), "not json {").unwrap();
+    match read_genesis(dir.path()) {
+        Err(NodeError::Incompatible { file, .. }) => assert_eq!(file, "mesh.json"),
+        other => panic!("mesh.json: {other:?}"),
+    }
+}

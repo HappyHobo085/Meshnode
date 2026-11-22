@@ -14,6 +14,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use mesh_core::NodeHandle;
 use mesh_services::Services;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -39,6 +40,14 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BODY: u64 = 64 * 1024 * 1024;
 /// How long shutdown waits for in-flight connections before cutting them off.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Lingering close: how long a finished connection keeps reading (and discarding) after
+/// its FIN. Far above a loopback round trip plus client scheduling, short enough that a
+/// client which never stops sending holds a connection slot only briefly.
+const LINGER_TIME: Duration = Duration::from_secs(2);
+/// Lingering close: the most it discards. Covers the tail a client already has in flight
+/// when it sees the response (socket buffers are a few MiB), while bounding the work a
+/// client that ignores the response can make the gateway do.
+const LINGER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// The server's time limits; tests shorten them.
 #[derive(Clone, Copy)]
@@ -235,22 +244,52 @@ async fn serve_conn(
     let _ = stream.set_nodelay(true);
     let timeouts = shared.timeouts;
     let svc = service_fn(move |req| handle(shared.clone(), mapped.clone(), req));
-    let conn = http1::Builder::new()
+    let mut conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(timeouts.header_read)
         .keep_alive(true)
         .serve_connection(TokioIo::new(stream), svc);
-    tokio::pin!(conn);
     let mut closing = false;
     loop {
         tokio::select! {
             _ = &mut conn => break,
             _ = cancel.cancelled(), if !closing => {
                 closing = true;
-                conn.as_mut().graceful_shutdown();
+                std::pin::Pin::new(&mut conn).graceful_shutdown();
             }
         }
     }
+    // On shutdown, close at once: the linger must not stretch the drain.
+    if closing {
+        return;
+    }
+    let stream = conn.into_parts().io.into_inner();
+    tokio::select! {
+        _ = linger(stream) => {}
+        _ = cancel.cancelled() => {}
+    }
+}
+
+/// Lingering close (as nginx and Apache do). Closing a socket that still has unread
+/// request data makes the OS send a reset, and a reset can discard a response the client
+/// has received but not yet read (Windows does) -- e.g. a `413` sent while the client is
+/// still uploading. So: send our FIN, then read and discard until the client closes, or
+/// [`LINGER_TIME`] or [`LINGER_MAX_BYTES`] runs out, whichever comes first.
+async fn linger(mut stream: TcpStream) {
+    // hyper has flushed and shut down its write side already when it ended cleanly;
+    // after an error it may not have, so do it here (a repeat is harmless).
+    let _ = stream.shutdown().await;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut left = LINGER_MAX_BYTES;
+    let _ = timeout(LINGER_TIME, async {
+        while left > 0 {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
 }
 
 type Resp = Response<Full<Bytes>>;

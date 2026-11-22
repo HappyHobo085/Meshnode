@@ -406,3 +406,16 @@ fn status_serializes_for_the_webview() {
         })
     );
 }
+
+#[tokio::test]
+async fn incompatible_data_is_its_own_error() {
+    let _g = serial().await;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("meshd.toml"), "relay = [unterminated\n").unwrap();
+    let err = mesh_ffi::start(dir_str(&dir)).await.unwrap_err();
+    assert!(matches!(err, FfiError::Incompatible { .. }), "{err:?}");
+    assert!(err.to_string().contains("meshd.toml"), "{err}");
+    let recorded = std::fs::read_to_string(dir.path().join("start-error.txt")).unwrap();
+    assert_eq!(recorded.trim_end(), err.to_string().trim_end());
+    assert_eq!(mesh_ffi::status().state, FfiState::Stopped);
+}

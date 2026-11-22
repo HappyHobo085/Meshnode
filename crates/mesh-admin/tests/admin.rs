@@ -150,6 +150,8 @@ fn expected_response(req: &AdminRequest) -> AdminResponse {
             rtt_ms: Some(12),
             last_seen_ms: Some(1000),
             lag: 0,
+            version: Some("0.1.0".into()),
+            incompatible: false,
         }]),
         R::Services => AdminResponse::Services(vec![ServiceInfoView {
             name: "site".into(),

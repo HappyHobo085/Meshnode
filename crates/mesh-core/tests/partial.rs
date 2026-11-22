@@ -794,11 +794,15 @@ async fn advertise_before_hello_is_protocol_error() {
     let mut huge = VersionVector::default();
     huge.set(x, 1_000);
     raw.send(&SyncMsg::Advertise { vv: huge }).await;
-    raw.send(&SyncMsg::Covered {
+    // The session ends on the Advertise itself and drops its read half, so this write may
+    // find the pipe already closed; either way the Covered must raise nothing.
+    let covered = SyncMsg::Covered {
         origin: x,
         upto: 500,
-    })
-    .await;
+    };
+    if let Err(e) = write_frame(&mut raw.w, &covered).await {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     assert!(matches!(end_of(join).await, SessionEnd::Protocol(_)));
     assert_eq!(a.inner().version_vector().unwrap(), before);
 }

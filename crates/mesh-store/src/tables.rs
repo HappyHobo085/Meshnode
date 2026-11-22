@@ -54,7 +54,8 @@ pub(crate) mod meta {
     pub const SYNCED_SELF_SEQ: &str = "synced_self_seq";
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+/// The store schema this build reads and writes.
+pub const SCHEMA_VERSION: u64 = 1;
 
 /// One origin's current winner for a key (`reg` value; origin is in the key).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

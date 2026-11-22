@@ -23,3 +23,9 @@ services/*/target/
 crates/mesh-client-ffi/jvm-test/build/
 crates/mesh-client-ffi/jvm-test/.gradle/
 crates/mesh-client-ffi/jvm-test/.kotlin/
+# Staged by scripts/build-desktop-packages.sh (Tauri externalBin).
+apps/desktop/src-tauri/binaries/
+# Android release signing (sub-spec 8b §4): keystores and the local properties file naming one.
+*.jks
+*.keystore
+apps/android/keystore.properties

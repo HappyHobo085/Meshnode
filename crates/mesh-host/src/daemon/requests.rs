@@ -121,7 +121,10 @@ impl Daemon {
         let inner = &*self.inner;
         let mut s = StatusInfo {
             state: self.state(),
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_version: match inner.opts.host.product_version.as_str() {
+                "" => env!("CARGO_PKG_VERSION").into(),
+                v => v.into(),
+            },
             data_dir: inner.data_dir.display().to_string(),
             node_id: None,
             mesh_id: None,
@@ -597,6 +600,8 @@ fn member_view(m: MemberStatus, me: NodeId) -> MemberInfoView {
         rtt_ms: m.rtt_ms,
         last_seen_ms: m.last_seen_ms,
         lag: m.lag,
+        version: m.version.map(|v| v.product).filter(|p| !p.is_empty()),
+        incompatible: m.incompatible,
     }
 }
 

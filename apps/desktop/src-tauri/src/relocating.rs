@@ -92,6 +92,8 @@ impl RelocatingTransport {
             None => ConnectionDto {
                 kind: ConnectionKindDto::None,
                 other_running: false,
+                start_error: self.start_error(),
+                no_access: self.no_access(),
             },
             Some(l) => ConnectionDto {
                 kind: match l.kind {
@@ -99,8 +101,27 @@ impl RelocatingTransport {
                     ConnectionKind::User => ConnectionKindDto::User,
                 },
                 other_running: l.other_running,
+                start_error: None,
+                no_access: false,
             },
         }
+    }
+
+    /// Why a candidate's daemon last refused to start (its `start-error.txt`), in the
+    /// candidates' order.
+    fn start_error(&self) -> Option<String> {
+        lock(&self.locator)
+            .candidates
+            .iter()
+            .find_map(|c| mesh_admin::start_error(&c.data_dir))
+    }
+
+    /// Whether this user is denied the system service's admin endpoint.
+    fn no_access(&self) -> bool {
+        lock(&self.locator)
+            .candidates
+            .iter()
+            .any(|c| c.kind == ConnectionKind::System && mesh_admin::access_denied(&c.data_dir))
     }
 
     /// The located endpoint, locating first if nothing is.

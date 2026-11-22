@@ -143,6 +143,10 @@ pub struct MemberDto {
     #[ts(type = "number")]
     pub lag: u64,
     pub accent_hue: u16,
+    /// The member's product version, once known.
+    pub version: Option<String>,
+    /// The member runs a version this node cannot sync with.
+    pub incompatible: bool,
 }
 
 impl From<MemberInfoView> for MemberDto {
@@ -160,6 +164,8 @@ impl From<MemberInfoView> for MemberDto {
             last_seen_ms: m.last_seen_ms,
             lag: m.lag,
             accent_hue: accent_hue(&m.id),
+            version: m.version,
+            incompatible: m.incompatible,
         }
     }
 }
@@ -408,10 +414,17 @@ pub enum ConnectionKindDto {
 
 /// The desktop app's connection: which daemon, and whether a second, separate one runs
 /// too (both the service and a per-user daemon answer).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDto {
     pub kind: ConnectionKindDto,
     pub other_running: bool,
+    /// With no daemon (`None`): why its last start was refused, from a candidate data
+    /// directory's `start-error.txt` (incompatible data, spec 8b §5.2).
+    pub start_error: Option<String>,
+    /// With no daemon (`None`): the system service's data directory is there but this user
+    /// may not reach its admin endpoint (Linux: not in the `meshnode` group, or not logged in
+    /// again since joining it).
+    pub no_access: bool,
 }

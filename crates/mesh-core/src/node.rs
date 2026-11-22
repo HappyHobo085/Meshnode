@@ -10,8 +10,8 @@ use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
 use mesh_proto::{
-    InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, RemovalRecord, Role,
-    Scope,
+    InviteTicket, MemberInfo, MeshGenesis, MeshId, NodeAddrBytes, NodeId, PeerVersion,
+    RemovalRecord, Role, Scope,
 };
 use mesh_store::StoreError;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
@@ -37,8 +37,9 @@ use crate::membership::{
 use crate::peers::{CatchUp, PeerEnv, PeerManager, SignOut, SyncHandler};
 use crate::reactor::{Reactor, ReactorCtx};
 use crate::transport::{
-    ALPN_JOIN, ALPN_SYNC, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
+    ALPN_JOIN, ALPN_SYNC, ALPN_VERSION, Extra, ExtraConns, Gate, addr_to_bytes, build_endpoint,
 };
+use crate::version::{VersionHandler, local_version, sync_alpn};
 
 const STORE_FILE: &str = "store.redb";
 const EVENT_CAPACITY: usize = 1024;
@@ -75,6 +76,12 @@ pub struct MemberStatus {
     pub last_seen_ms: Option<u64>,
     /// Ops this node holds that the member may lack.
     pub lag: u64,
+    /// The member's versions, once a `meshnode/version` probe succeeded (this node's own
+    /// for itself); the last known one while the member is offline.
+    pub version: Option<PeerVersion>,
+    /// `version` cannot sync with this node's (another `sync` protocol or store schema):
+    /// the member shows as "incompatible version" rather than just offline.
+    pub incompatible: bool,
 }
 
 /// What [`Node::wake`] saw.
@@ -89,6 +96,9 @@ pub struct WakeOutcome {
     pub timed_out: bool,
 }
 
+/// How long `set_info`/`set_tags_of` wait for the membership snapshot to show their write.
+const INFO_VISIBLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A running mesh node. Call [`Node::shutdown`] to stop it; dropping it only cancels its
 /// tasks.
 pub struct Node {
@@ -97,6 +107,8 @@ pub struct Node {
 
 pub(crate) struct Inner {
     pub(crate) cfg: NodeConfig,
+    /// This node's own versions (what the version probe serves).
+    version: Arc<PeerVersion>,
     pub(crate) genesis: MeshGenesis,
     pub(crate) me: NodeId,
     pub(crate) endpoint: Endpoint,
@@ -151,8 +163,13 @@ impl Inner {
                     rtt_ms: None,
                     last_seen_ms: None,
                     lag: 0,
+                    version: None,
+                    incompatible: false,
                 };
-                if *id != self.me {
+                if *id == self.me {
+                    s.version = Some((*self.version).clone());
+                } else {
+                    (s.version, s.incompatible) = self.peers.version(id);
                     if let Some(rtt) = self.peers.link(id) {
                         s.online = true;
                         s.rtt_ms = rtt;
@@ -293,7 +310,8 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Extra protocols must not replace a built-in one or each other (iroh's `Router` keeps
 /// only the last handler per ALPN).
 fn check_extra_protocols(cfg: &NodeConfig) -> Result<(), NodeError> {
-    let mut seen: Vec<&[u8]> = vec![ALPN_SYNC, ALPN_JOIN, iroh_blobs::ALPN];
+    let sync = sync_alpn(cfg);
+    let mut seen: Vec<&[u8]> = vec![&sync, ALPN_SYNC, ALPN_JOIN, ALPN_VERSION, iroh_blobs::ALPN];
     for (alpn, _) in &cfg.extra_protocols {
         if seen.contains(&alpn.as_slice()) {
             return Err(NodeError::ProtocolConflict(format!(
@@ -453,6 +471,10 @@ pub(crate) async fn start(
     .map_err(join_err)?
     .map_err(|e| match e {
         StoreError::WrongMesh => NodeError::WrongMesh,
+        e @ StoreError::IncompatibleSchema { .. } => NodeError::Incompatible {
+            file: "store".into(),
+            detail: e.to_string(),
+        },
         e => NodeError::Store(e),
     })?;
     debug!(scope = ?store.scope(), "store opened");
@@ -505,6 +527,7 @@ pub(crate) async fn start(
     }
 
     check_extra_protocols(&cfg)?;
+    let version = Arc::new(local_version(&cfg));
     let endpoint = build_endpoint(&cfg, &key).await?;
     let peers = PeerManager::new(
         PeerEnv {
@@ -526,6 +549,8 @@ pub(crate) async fn start(
             )),
             on_catch_up: cfg.on_catch_up.clone(),
             pulls: pulls.clone(),
+            sync_alpn: sync_alpn(&cfg),
+            version: version.clone(),
         },
         cancel.child_token(),
     );
@@ -554,8 +579,14 @@ pub(crate) async fn start(
     .await?;
     let mut router = Router::builder(endpoint.clone())
         .accept(
-            ALPN_SYNC,
+            sync_alpn(&cfg),
             Gate::new(SyncHandler(peers.clone()), membership_rx.clone())
+                .with_provisional(peers.provisional()),
+        )
+        // Gated like `sync/1`: only members learn this node's versions.
+        .accept(
+            ALPN_VERSION,
+            Gate::new(VersionHandler::new(&version), membership_rx.clone())
                 .with_provisional(peers.provisional()),
         )
         .accept(
@@ -637,6 +668,7 @@ pub(crate) async fn start(
 
     let inner = Arc::new(Inner {
         cfg,
+        version,
         genesis,
         me,
         endpoint,
@@ -983,9 +1015,7 @@ impl Node {
             tags: tags.unwrap_or(cur.tags),
         };
         info.validate()?;
-        self.store()
-            .set(MESH_NS, &info_key(&me), encode_info(&info))
-            .await
+        self.write_info_and_wait(me, info).await
     }
 
     /// Replaces the tags of member `id` (any member may change tags).
@@ -1003,9 +1033,37 @@ impl Node {
         };
         info.tags = tags;
         info.validate()?;
+        self.write_info_and_wait(id, info).await
+    }
+
+    /// Writes `info/<id>` and waits (bounded by [`INFO_VISIBLE_TIMEOUT`]) until the membership
+    /// snapshot shows it, so `members()` reads its own write. A timeout or shutdown is not an
+    /// error: the store write already succeeded.
+    async fn write_info_and_wait(&self, id: NodeId, info: MemberInfo) -> Result<(), NodeError> {
+        // Subscribe before the write so the reactor's update cannot be missed.
+        let mut rx = self.inner.membership.subscribe();
         self.store()
             .set(MESH_NS, &info_key(&id), encode_info(&info))
-            .await
+            .await?;
+        let visible = async {
+            loop {
+                if rx.borrow_and_update().info(&id) == Some(&info) {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        };
+        tokio::select! {
+            _ = self.inner.cancel.cancelled() => {}
+            r = timeout(INFO_VISIBLE_TIMEOUT, visible) => {
+                if r.is_err() {
+                    warn!(member = ?id, "membership did not show the info write in time");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stops every task, closes every connection and the endpoint, and releases the store
@@ -1030,15 +1088,29 @@ impl Node {
         if timeout(STOP_TIMEOUT, inner.blobs.shutdown()).await.is_err() {
             warn!("blob store shutdown timed out");
         }
-        let store = Arc::downgrade(inner.store.raw());
+        let mut store = inner.store.raw().clone();
         drop(inner);
-        // A blocking store call still in flight holds the store open until it returns.
+        // A blocking store call still in flight (its caller was dropped) holds the store open
+        // until it returns. Wait to hold the last reference and close the store here: the
+        // file lock is released only once the database's drop has finished, and a strong
+        // count of 0 seen from a `Weak` would not wait for a drop running on another thread.
         let deadline = Instant::now() + RELEASE_TIMEOUT;
-        while store.strong_count() > 0 && Instant::now() < deadline {
+        loop {
+            match Arc::try_unwrap(store) {
+                Ok(s) => {
+                    // Closing flushes the file: off the async runtime.
+                    if tokio::task::spawn_blocking(move || drop(s)).await.is_err() {
+                        warn!("closing the store failed");
+                    }
+                    return;
+                }
+                Err(s) if Instant::now() < deadline => store = s,
+                Err(_) => {
+                    warn!("store still in use after shutdown");
+                    return;
+                }
+            }
             sleep(Duration::from_millis(10)).await;
-        }
-        if store.strong_count() > 0 {
-            warn!("store still in use after shutdown");
         }
     }
 }

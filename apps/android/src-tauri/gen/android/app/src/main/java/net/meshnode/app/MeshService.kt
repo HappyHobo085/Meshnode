@@ -139,10 +139,11 @@ class MeshService : Service() {
       userStop()
       return START_NOT_STICKY
     }
-    val userStopped = Prefs(this).userStopped
-    if (intent == null && userStopped) {
-      // A sticky restart after the user stopped it (not a startForegroundService): stay
-      // stopped.
+    val prefs = Prefs(this)
+    val userStopped = prefs.userStopped
+    if (intent == null && (userStopped || prefs.refusedIncompatible)) {
+      // A sticky restart after the user stopped it, or after incompatible data was refused
+      // (not a startForegroundService): stay stopped.
       stopSelfResult(lastStartId)
       return START_NOT_STICKY
     }
@@ -169,7 +170,10 @@ class MeshService : Service() {
 
   override fun onTaskRemoved(rootIntent: Intent?) {
     super.onTaskRemoved(rootIntent)
-    if (!Prefs(this).userStopped) Alarms.scheduleRestart(this, RESTART_DELAY_MS)
+    val prefs = Prefs(this)
+    if (!prefs.userStopped && !prefs.refusedIncompatible) {
+      Alarms.scheduleRestart(this, RESTART_DELAY_MS)
+    }
   }
 
   override fun onDestroy() {
@@ -238,6 +242,7 @@ class MeshService : Service() {
       try {
         dir.mkdirs()
         val s = start(dir.path)
+        Prefs(this@MeshService).refusedIncompatible = false
         if (s.state == FfiState.STOPPED) {
           // A later stop() won: stopped, not running.
           stopWon = true
@@ -247,6 +252,12 @@ class MeshService : Service() {
         }
       } catch (e: CancellationException) {
         throw e
+      } catch (e: FfiException.Incompatible) {
+        // Data from an incompatible version: no automatic retry until the app is opened.
+        nodeUp = false
+        Prefs(this@MeshService).refusedIncompatible = true
+        text = NotificationText.failed(e.message ?: e.javaClass.simpleName)
+        Log.w(TAG, "start refused: incompatible data")
       } catch (e: FfiException) {
         nodeUp = false
         text = NotificationText.failed(e.message ?: e.javaClass.simpleName)
@@ -499,8 +510,15 @@ class MeshService : Service() {
       val app = context.applicationContext
       val prefs = Prefs(app)
       if (RestartPolicy.clearsUserStopped(trigger)) prefs.userStopped = false
+      if (RestartPolicy.clearsRefusedIncompatible(trigger)) prefs.refusedIncompatible = false
       val running = instance?.isNodeRunning() ?: false
-      if (!RestartPolicy.shouldStart(trigger, prefs.userStopped, running)) return false
+      val allowed = RestartPolicy.shouldStart(
+        trigger,
+        prefs.userStopped,
+        prefs.refusedIncompatible,
+        running,
+      )
+      if (!allowed) return false
       if (instance == null && backgroundStartRefused(app, trigger)) {
         // Android would refuse it: say so instead of trying.
         Log.w(TAG, "$trigger: a background start would be refused; posting the alert")
@@ -558,10 +576,14 @@ class ServiceControl(context: Context) : FfiServiceControl {
   private val app = context.applicationContext
   private val main = Handler(Looper.getMainLooper())
 
-  /** Start pressed: clear `user_stopped` and start the service. */
+  /** Start pressed: clear `user_stopped` and `refused_incompatible`, start the service. */
   override fun startService() {
     try {
-      Prefs(app).userStopped = false
+      val prefs = Prefs(app)
+      prefs.userStopped = false
+      if (RestartPolicy.clearsRefusedIncompatible(RestartPolicy.Trigger.USER_START)) {
+        prefs.refusedIncompatible = false
+      }
       MeshService.launch(app, MeshService.ACTION_START)
     } catch (t: Throwable) {
       Log.e("Meshnode", "service_start failed", t)

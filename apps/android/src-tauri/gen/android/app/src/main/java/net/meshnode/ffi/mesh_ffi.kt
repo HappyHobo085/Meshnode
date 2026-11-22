@@ -2611,6 +2611,12 @@ sealed class FfiException(message: String): kotlin.Exception(message) {
         
         class Start(message: String) : FfiException(message)
         
+    /**
+     * The data (or `meshd.toml`) was written by an incompatible Meshnode version: the
+     * app must not retry on its own (spec 8b §5.2).
+     */
+        class Incompatible(message: String) : FfiException(message)
+        
         class NotRunning(message: String) : FfiException(message)
         
         class Decode(message: String) : FfiException(message)
@@ -2633,9 +2639,10 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             1 -> FfiException.NotInitialised(FfiConverterString.read(buf))
             2 -> FfiException.AlreadyRunning(FfiConverterString.read(buf))
             3 -> FfiException.Start(FfiConverterString.read(buf))
-            4 -> FfiException.NotRunning(FfiConverterString.read(buf))
-            5 -> FfiException.Decode(FfiConverterString.read(buf))
-            6 -> FfiException.Panic(FfiConverterString.read(buf))
+            4 -> FfiException.Incompatible(FfiConverterString.read(buf))
+            5 -> FfiException.NotRunning(FfiConverterString.read(buf))
+            6 -> FfiException.Decode(FfiConverterString.read(buf))
+            7 -> FfiException.Panic(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
         
@@ -2659,16 +2666,20 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 buf.putInt(3)
                 Unit
             }
-            is FfiException.NotRunning -> {
+            is FfiException.Incompatible -> {
                 buf.putInt(4)
                 Unit
             }
-            is FfiException.Decode -> {
+            is FfiException.NotRunning -> {
                 buf.putInt(5)
                 Unit
             }
-            is FfiException.Panic -> {
+            is FfiException.Decode -> {
                 buf.putInt(6)
+                Unit
+            }
+            is FfiException.Panic -> {
+                buf.putInt(7)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

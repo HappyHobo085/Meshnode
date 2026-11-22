@@ -32,6 +32,7 @@ pub fn unit_file(binary: &Path, data: &Path) -> String {
          UMask=0027\n\
          ExecStart={exec}\n\
          Restart=always\n\
+         RestartPreventExitStatus=4\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -125,22 +126,33 @@ mod installer {
     use super::{data_dir_from_unit, unit_file, valid_user_name};
 
     const UNIT_PATH: &str = "/etc/systemd/system/meshnode.service";
+    /// Where the deb/rpm installs its unit.
+    const PACKAGE_UNIT_PATH: &str = "/usr/lib/systemd/system/meshnode.service";
     /// The data directory systemd creates through `StateDirectory=meshnode`.
     const STATE_DIRECTORY: &str = "/var/lib/meshnode";
 
     fn is_installed() -> bool {
-        Path::new(UNIT_PATH).exists()
+        Path::new(UNIT_PATH).exists() || Path::new(PACKAGE_UNIT_PATH).exists()
     }
 
     pub fn installed() -> Result<Installed, ServiceError> {
-        let unit = read_registration(Path::new(UNIT_PATH))?;
-        Ok(Installed::from_registration(
-            unit.as_deref(),
-            data_dir_from_unit,
-        ))
+        installed_from(&[Path::new(UNIT_PATH), Path::new(PACKAGE_UNIT_PATH)])
     }
 
-    pub fn install(data: &Path) -> Result<(), ServiceError> {
+    /// The first of `units` that exists, read back.
+    pub(in super::super) fn installed_from(units: &[&Path]) -> Result<Installed, ServiceError> {
+        for unit in units {
+            if let Some(text) = read_registration(unit)? {
+                return Ok(Installed::from_registration(
+                    Some(&text),
+                    data_dir_from_unit,
+                ));
+            }
+        }
+        Ok(Installed::No)
+    }
+
+    pub fn install(data: &Path, _admin_user: Option<&str>) -> Result<(), ServiceError> {
         if is_installed() {
             return Err(ServiceError::AlreadyInstalled);
         }
@@ -201,7 +213,8 @@ mod installer {
     }
 
     pub fn uninstall() -> Result<(), ServiceError> {
-        if !is_installed() {
+        // Only the unit meshd wrote; the package's own unit is the package manager's.
+        if !Path::new(UNIT_PATH).exists() {
             return Err(ServiceError::NotInstalled);
         }
         run("systemctl", &["disable", "--now", SERVICE_NAME])?;
@@ -242,6 +255,59 @@ mod installer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_installed_finds_package_unit() {
+        use super::super::Installed;
+        use super::installer::installed_from;
+
+        let root = tempfile::tempdir().unwrap();
+        let own = root.path().join("etc.service");
+        let package = root.path().join("usr.service");
+        let units = [own.as_path(), package.as_path()];
+        assert_eq!(installed_from(&units).unwrap(), Installed::No);
+        std::fs::write(
+            &package,
+            unit_file(Path::new("/usr/bin/meshd"), Path::new("/var/lib/meshnode")),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_from(&units).unwrap(),
+            Installed::DataDir("/var/lib/meshnode".into())
+        );
+        // The unit meshd installed wins.
+        std::fs::write(&own, unit_file(Path::new("/x"), Path::new("/srv/mesh"))).unwrap();
+        assert_eq!(
+            installed_from(&units).unwrap(),
+            Installed::DataDir("/srv/mesh".into())
+        );
+    }
+
+    /// The deb/rpm ship this committed unit (spec §3.2); it must stay what `unit_file` writes.
+    #[test]
+    fn committed_unit_matches_unit_file() {
+        let committed = include_str!("../../../desktop/src-tauri/packaging/linux/meshnode.service");
+        assert_eq!(
+            committed,
+            unit_file(Path::new("/usr/bin/meshd"), Path::new("/var/lib/meshnode")),
+            "regenerate apps/desktop/src-tauri/packaging/linux/meshnode.service from unit_file"
+        );
+    }
+
+    #[test]
+    fn unit_prevents_restart_on_incompatible() {
+        let unit = unit_file(
+            Path::new("/usr/local/bin/meshd"),
+            Path::new("/var/lib/meshnode"),
+        );
+        let service = unit
+            .split("[Service]\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a [Service] section");
+        assert!(service.contains("RestartPreventExitStatus=4\n"), "{unit}");
+    }
 
     #[test]
     fn data_dir_is_read_back_from_the_unit() {

@@ -3343,6 +3343,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-blobs",
+ "libc",
  "mesh-hlc",
  "mesh-proto",
  "mesh-store",
@@ -3377,6 +3378,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-forward"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "iroh",
+ "mesh-core",
+ "mesh-proto",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mesh-gateway"
 version = "0.1.0"
 dependencies = [
@@ -3388,6 +3403,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "mesh-core",
+ "mesh-forward",
  "mesh-proto",
  "mesh-services",
  "serde",
@@ -3440,6 +3456,7 @@ dependencies = [
  "mesh-hlc",
  "postcard",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -3473,6 +3490,7 @@ dependencies = [
  "bytes",
  "http",
  "mesh-core",
+ "mesh-forward",
  "mesh-proto",
  "mesh-runtime",
  "serde",

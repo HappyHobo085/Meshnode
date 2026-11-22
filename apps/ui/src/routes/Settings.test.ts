@@ -57,7 +57,12 @@ beforeEach(() => {
   api.configSet.mockResolvedValue({ restartRequired: true });
   api.resetIdentity.mockResolvedValue(running({ state: "uninitialised" }));
   api.declareFresh.mockResolvedValue(undefined);
-  api.desktop.connection.mockResolvedValue({ kind: "system", otherRunning: false });
+  api.desktop.connection.mockResolvedValue({
+    kind: "system",
+    otherRunning: false,
+    startError: null,
+    noAccess: false,
+  });
   api.android.powerPolicyGet.mockResolvedValue("balanced");
   api.android.powerPolicySet.mockResolvedValue(undefined);
   api.probe.mockImplementation(
@@ -334,7 +339,12 @@ it("reset_identity_requires_typed_name", async () => {
 });
 
 it("settings_shows_the_second_node_notice_when_both_run", async () => {
-  api.desktop.connection.mockResolvedValue({ kind: "system", otherRunning: true });
+  api.desktop.connection.mockResolvedValue({
+    kind: "system",
+    otherRunning: true,
+    startError: null,
+    noAccess: false,
+  });
   await mount();
   expect(screen.getByText(/second, separate node is running as you/)).toBeInTheDocument();
 });

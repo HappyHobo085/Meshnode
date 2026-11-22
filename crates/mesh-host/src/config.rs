@@ -135,7 +135,7 @@ impl Default for GatewaySection {
     fn default() -> Self {
         GatewaySection {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
-            ports: BTreeMap::from([(7801, "sync".to_string())]),
+            ports: BTreeMap::new(),
         }
     }
 }

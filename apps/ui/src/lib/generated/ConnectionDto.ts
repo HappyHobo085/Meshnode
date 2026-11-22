@@ -5,4 +5,15 @@ import type { ConnectionKindDto } from "./ConnectionKindDto";
  * The desktop app's connection: which daemon, and whether a second, separate one runs
  * too (both the service and a per-user daemon answer).
  */
-export type ConnectionDto = { kind: ConnectionKindDto, otherRunning: boolean, };
+export type ConnectionDto = { kind: ConnectionKindDto, otherRunning: boolean, 
+/**
+ * With no daemon (`None`): why its last start was refused, from a candidate data
+ * directory's `start-error.txt` (incompatible data, spec 8b §5.2).
+ */
+startError: string | null, 
+/**
+ * With no daemon (`None`): the system service's data directory is there but this user
+ * may not reach its admin endpoint (Linux: not in the `meshnode` group, or not logged in
+ * again since joining it).
+ */
+noAccess: boolean, };

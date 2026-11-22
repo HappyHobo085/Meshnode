@@ -275,6 +275,26 @@ fn other_node_key_on_open_is_corrupt() {
 }
 
 #[test]
+fn open_refuses_newer_schema() {
+    use mesh_store::{SCHEMA_VERSION, test_hooks::set_schema};
+    let (dir, clock) = setup();
+    let path = db_path(dir.path(), 1);
+    drop(store(dir.path(), 1, &clock));
+    for found in [SCHEMA_VERSION + 1, 0] {
+        set_schema(&path, found).unwrap();
+        let e = Store::open(&path, MESH, key(1), clock.clone())
+            .err()
+            .expect("incompatible schema refused");
+        assert!(
+            matches!(e, StoreError::IncompatibleSchema { found: f, supported }
+                if f == found && supported == SCHEMA_VERSION),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("store schema"));
+    }
+}
+
+#[test]
 fn store_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Store<ManualClock>>();

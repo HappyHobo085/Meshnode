@@ -14,7 +14,10 @@ import net.meshnode.ffi.wake
 class AlarmReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     val app = context.applicationContext
-    if (Prefs(app).userStopped) return // Start re-arms it (MeshService.onCreate).
+    val prefs = Prefs(app)
+    // Start re-arms it (MeshService.onCreate); after an incompatible-data refusal no node
+    // runs to wake until the app is opened.
+    if (prefs.userStopped || prefs.refusedIncompatible) return
     Alarms.scheduleTick(app)
     val pending = goAsync()
     val lock = app.getSystemService(PowerManager::class.java)

@@ -33,9 +33,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-    TokenUser,
+    GetTokenInformation, LookupAccountNameW, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE, SidTypeUser,
+    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -46,8 +46,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::core::GUID;
 
 use super::eventlog::{self, Event, EventLog};
-use super::{Installed, SERVICE_NAME, ServiceError, ServiceStatus, io_err};
-use crate::{Daemon, MeshdConfig, logging};
+use super::{
+    Installed, SERVICE_NAME, ServiceError, ServiceExit, ServiceStatus, apply_admin_sid, io_err,
+};
+use crate::{Daemon, DaemonError, MeshdConfig, logging};
 
 /// The service's display name.
 pub const DISPLAY_NAME: &str = "Meshnode";
@@ -246,20 +248,35 @@ fn open(manager: &ServiceManager, access: ServiceAccess) -> Result<Option<Servic
     }
 }
 
-pub fn install(data: &Path) -> Result<(), ServiceError> {
+pub fn install(data: &Path, admin_user: Option<&str>) -> Result<(), ServiceError> {
     let scm = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     if open(&scm, ServiceAccess::QUERY_STATUS)?.is_some() {
         return Err(ServiceError::AlreadyInstalled);
     }
     let exe = install_binary()?;
     protect_data_dir(data)?;
-    // The admin pipe also admits the installing user (spec §5.2).
+    // The admin pipe also admits the installing user (spec §5.2): the account the MSI names,
+    // else the one this process runs as. An SID already recorded (an upgrade) stays.
     let mut cfg = MeshdConfig::load_or_default(data)?;
-    let sid = current_user_sid().map_err(io_err("reading the installing user's SID"))?;
+    let recorded = match admin_user {
+        Some(account) => apply_admin_sid(&mut cfg, || {
+            account_sid(account).map_err(|_| {
+                ServiceError::Failed(format!("cannot resolve the installing user {account}"))
+            })
+        })
+        .map(drop),
+        None => apply_admin_sid(&mut cfg, || {
+            current_user_sid().map_err(io_err("reading the installing user's SID"))
+        })
+        .map(drop),
+    };
     // Only an account SID is accepted; anything else is skipped, so the pipe stays closed
-    // to the installing user (the CLI then needs an elevated shell).
-    if let Err(e) = cfg.set("admin.windows_user_sid", &sid) {
-        eprintln!("warning: the installing user's SID {sid} is not recorded: {e}");
+    // to the installing user (the CLI then needs an elevated shell). An account the MSI
+    // named that cannot be resolved fails the install instead.
+    match (recorded, admin_user) {
+        (Ok(()), _) => {}
+        (Err(e), Some(_)) => return Err(e),
+        (Err(e), None) => eprintln!("warning: the installing user is not recorded: {e}"),
     }
     cfg.save(data)?;
     eventlog::register().map_err(io_err("registering the Meshnode Event Log source"))?;
@@ -292,6 +309,8 @@ fn configure_and_start(service: &Service) -> Result<(), ServiceError> {
         .update_failure_actions(failure_actions())
         .map_err(scm_err("setting the restart-on-failure actions"))?;
     // A failed start ends in Stopped with an error code rather than a crash; restart then too.
+    // Incompatible data reports NO_ERROR instead, which this flag leaves alone
+    // (`super::service_exit`).
     service
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(scm_err("setting the restart-on-failure actions"))?;
@@ -511,6 +530,20 @@ fn stop_and_wait(service: &Service) -> Result<(), ServiceError> {
             .map_err(scm_err("querying the meshnode service"))
     };
     let mut state = query()?;
+    // A stop request is refused (ERROR_SERVICE_CANNOT_ACCEPT_CTRL) while the service is still
+    // starting, e.g. when an MSI rollback stops the service its upgrade just started: wait
+    // for the start to end first.
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while state == ServiceState::StartPending {
+        if Instant::now() >= deadline {
+            return Err(ServiceError::Failed(format!(
+                "the meshnode service did not finish starting within {} s",
+                STOP_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(POLL);
+        state = query()?;
+    }
     if state == ServiceState::Stopped {
         return Ok(());
     }
@@ -682,10 +715,14 @@ fn service_main(_arguments: Vec<OsString>) {
     // A panic in the daemon's own code ends the service as a failure (the SCM restarts it).
     let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
         ctx.runtime.block_on(async {
-            let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| e.to_string())?;
+            let cfg = MeshdConfig::load_or_default(&ctx.data).map_err(|e| {
+                let e = DaemonError::from(e);
+                crate::record_start_failure(&ctx.data, &e);
+                e
+            })?;
             let _log = logging::init(&ctx.data, &cfg.log_level);
             // Opening the node can take a while: show the SCM progress meanwhile.
-            let start = Daemon::start(ctx.data.clone(), cfg);
+            let start = Daemon::start_opts(ctx.data.clone(), cfg, crate::host_options());
             tokio::pin!(start);
             let mut ticks = tokio::time::interval(START_CHECKPOINT_EVERY);
             ticks.tick().await;
@@ -703,7 +740,7 @@ fn service_main(_arguments: Vec<OsString>) {
                 Ok(d) => d,
                 Err(e) => {
                     error!("meshd failed to start: {e}");
-                    return Err(e.to_string());
+                    return Err(e);
                 }
             };
             set(ServiceState::Running, ServiceExitCode::NO_ERROR);
@@ -719,7 +756,7 @@ fn service_main(_arguments: Vec<OsString>) {
                     set_pending(ServiceState::StopPending, 1);
                 })
                 .await;
-            Ok::<(), String>(())
+            Ok::<(), DaemonError>(())
         })
     }));
 
@@ -737,12 +774,21 @@ fn service_main(_arguments: Vec<OsString>) {
             report(Event::Stopped, "Meshnode stopped.");
             set(ServiceState::Stopped, ServiceExitCode::NO_ERROR);
         }
-        Ok(Err(message)) => {
-            report(
-                Event::StartFailed,
-                &format!("Meshnode failed to start: {message}"),
-            );
-            set(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+        Ok(Err(e)) => {
+            // Incompatible data stops with NO_ERROR so the failure actions do not restart
+            // it (see `service_exit`); the reason is in the Event Log and start-error.txt.
+            let (exit, log_event) = super::service_exit(&e);
+            if log_event {
+                report(
+                    Event::StartFailed,
+                    &format!("Meshnode failed to start: {e}"),
+                );
+            }
+            let exit = match exit {
+                ServiceExit::NoError => ServiceExitCode::NO_ERROR,
+                ServiceExit::ServiceSpecific(code) => ServiceExitCode::ServiceSpecific(code),
+            };
+            set(ServiceState::Stopped, exit);
         }
     }
 }
@@ -803,6 +849,57 @@ pub fn current_user_sid() -> io::Result<String> {
         // SAFETY: the call above filled `buf` with a TOKEN_USER whose SID points into `buf`.
         sid_string(unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid })
     })
+}
+
+/// The string SID of the user account `account` (`DOMAIN\\user`, `user` or a UPN), by
+/// `LookupAccountNameW`. Only a user account resolves; a group or alias is an error.
+pub fn account_sid(account: &str) -> io::Result<String> {
+    let name = wide(account);
+    let mut sid_len = 0u32;
+    let mut domain_len = 0u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a size query: null buffers with zero lengths; `name` is NUL-terminated and
+    // the out pointers are valid. The local system is searched (null system name).
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if sid_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `u64` elements keep the SID buffer aligned.
+    let mut sid = vec![0u64; (sid_len as usize).div_ceil(8)];
+    let mut domain = vec![0u16; domain_len.max(1) as usize];
+    // SAFETY: the buffers hold the sizes the first call reported (the lengths are passed
+    // in); `name` and the out pointers are valid.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if kind != SidTypeUser {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{account} is not a user account"),
+        ));
+    }
+    sid_string(sid.as_mut_ptr().cast())
 }
 
 /// Runs `f` with this process's token, open for querying.
@@ -1003,6 +1100,18 @@ mod tests {
         (format!("O:{me}{dacl}(A;OICI;FA;;;{me})"), me)
     }
 
+    /// How SDDL writes a local account's SID: the machine's built-in Administrator (RID 500,
+    /// the account CI runners use) and Guest (RID 501) print as the aliases `LA` and `LG`.
+    fn sddl_token(sid: &str) -> &str {
+        if sid.starts_with("S-1-5-21-") && sid.ends_with("-500") {
+            "LA"
+        } else if sid.starts_with("S-1-5-21-") && sid.ends_with("-501") {
+            "LG"
+        } else {
+            sid
+        }
+    }
+
     #[test]
     fn data_dir_sddl_sets_owner_and_protected_dacl() {
         assert!(DATA_DIR_SDDL.starts_with("O:BAD:P"));
@@ -1015,7 +1124,10 @@ mod tests {
         let (sddl, me) = test_sddl();
         prepare_data_dir(&sub, &sddl).unwrap();
         let got = security_sddl(&sub);
-        assert!(got.starts_with(&format!("O:{me}D:P")), "{got}");
+        assert!(
+            got.starts_with(&format!("O:{}D:P", sddl_token(&me))),
+            "{got}"
+        );
         for ace in ["(A;OICI;FA;;;LS)", "(A;OICI;FA;;;BA)"] {
             assert!(got.contains(ace), "{got}");
         }
@@ -1039,7 +1151,7 @@ mod tests {
 
         prepare_data_dir(&sub, &sddl).unwrap();
         let got = security_sddl(&child);
-        assert!(got.starts_with(&format!("O:{me}")), "{got}");
+        assert!(got.starts_with(&format!("O:{}", sddl_token(&me))), "{got}");
         assert!(!got.contains(";;;WD)"), "{got}");
         assert!(!got.contains("D:P"), "the child inherits again: {got}");
         for ace in ["(A;ID;FA;;;LS)", "(A;ID;FA;;;BA)"] {

@@ -6,6 +6,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo: the debug target dirs otherwise fill the runner's disk (and the rust-cache
+  # upload pushes desktop-ui past its timeout). Panic messages keep their file:line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   test:
@@ -15,6 +18,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # The hosted image's preinstalled .NET, GHC, Android SDK and CodeQL are unused here and
+      # leave too little disk for the Rust target dirs.
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -24,32 +32,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # The library crates must also build warning-free without their test hooks.
-      - run: cargo clippy -p mesh-runtime -p mesh-services --lib -- -D warnings
+      # The library crates must also build warning-free without their test hooks (mesh-host
+      # builds mesh-gateway without them, so an import only a test-hooks item uses shows here).
+      - run: cargo clippy -p mesh-runtime -p mesh-services -p mesh-gateway -p mesh-host --lib -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # services/aegis-sync (its own workspace): the release build, the single-node harness and
-  # the two-node mesh tests, and the vendored aegis-sync-core check. No Aegis checkout here,
-  # so the check only validates the commit hash recorded in vendor/VENDORED.md.
-  aegis-sync:
+  # The one product version in the six files that carry it (spec §3), and the check's own test.
+  version:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            services/aegis-sync
-      - run: cargo fmt --check --manifest-path services/aegis-sync/Cargo.toml
-      - run: cargo clippy --locked --release --target wasm32-wasip2 --all-targets --manifest-path services/aegis-sync/Cargo.toml -- -D warnings
-      - run: bash scripts/build-services.sh
-      - run: cargo test -p mesh-services --test aegis_sync --test aegis_sync_mesh -j 2
-      - run: bash scripts/sync-aegis-core.sh --check
+      - run: bash scripts/check-version.sh
+      - run: bash scripts/check-version.sh --self-test
 
   # Sub-spec 8a: the client SDK (mesh-client), the forwarding crate it shares with the
   # gateway (mesh-forward) and the Kotlin wrapper's Rust tests (mesh-client-ffi). The tests
@@ -92,6 +87,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools  # the default also asks for "tools", which the SDK repository no longer has
       - run: sdkmanager "ndk;${NDK_VERSION}"
       - run: echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
       - run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
@@ -195,8 +192,13 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
+      # The hosted image's preinstalled .NET, GHC, Android SDK and CodeQL are unused here and
+      # leave too little disk for the Rust target dirs.
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -235,6 +237,136 @@ jobs:
         env:
           MESHD_BIN: ${{ github.workspace }}/target/debug/meshd${{ runner.os == 'Windows' && '.exe' || '' }}
 
+  # Sub-spec 8b: the desktop deb and rpm. Built as the current version and as 0.0.1 (a scratch
+  # worktree, never committed), inspected without installing, then the install -> upgrade ->
+  # remove -> reinstall -> purge lifecycle runs in rootless podman containers with systemd
+  # (debian:13 and fedora:41, the script's defaults). The packages need glibc >= 2.39, which
+  # ubuntu-latest (24.04) has. The first run builds the test images (slow, network).
+  linux-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TAURI_CLI_VERSION: "2.12.4"
+      # One target dir for both builds: dependencies are compiled once.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build dependencies (WebKitGTK, rpm, jq, podman)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm jq podman
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+        working-directory: apps/ui
+      - run: cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
+      - name: Build the current packages
+        shell: bash  # -eo pipefail: a failed build must fail the step, not only the grep after tee
+        run: |
+          scripts/check-version.sh
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/new.txt"
+          grep '\.deb$' "$RUNNER_TEMP/new.txt" > "$RUNNER_TEMP/new.deb.txt"
+          grep '\.rpm$' "$RUNNER_TEMP/new.txt" > "$RUNNER_TEMP/new.rpm.txt"
+      # The upgrade test needs an older build: 0.0.1 from this commit in a scratch worktree.
+      - name: Build the 0.0.1 packages
+        shell: bash  # -eo pipefail: a failed build must fail the step, not only the grep after tee
+        run: |
+          OLD="$RUNNER_TEMP/meshnode-old"
+          git worktree add "$OLD" HEAD
+          cd "$OLD"
+          scripts/set-version.sh 0.0.1
+          cargo update -w --offline
+          cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+          ln -s "$GITHUB_WORKSPACE/apps/ui/node_modules" apps/ui/node_modules
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/old.txt"
+          grep '\.deb$' "$RUNNER_TEMP/old.txt" > "$RUNNER_TEMP/old.deb.txt"
+          grep '\.rpm$' "$RUNNER_TEMP/old.txt" > "$RUNNER_TEMP/old.rpm.txt"
+      - name: Inspect the packages
+        run: scripts/inspect-linux-packages.sh "$(cat "$RUNNER_TEMP/new.rpm.txt")" "$(cat "$RUNNER_TEMP/new.deb.txt")"
+      - name: Lifecycle test (install, upgrade, remove, reinstall, purge)
+        run: |
+          scripts/test-linux-packages.sh \
+            "$(cat "$RUNNER_TEMP/old.rpm.txt")" "$(cat "$RUNNER_TEMP/new.rpm.txt")" \
+            "$(cat "$RUNNER_TEMP/old.deb.txt")" "$(cat "$RUNNER_TEMP/new.deb.txt")"
+      - name: Collect the current packages
+        run: |
+          mkdir "$RUNNER_TEMP/out"
+          cp "$(cat "$RUNNER_TEMP/new.rpm.txt")" "$(cat "$RUNNER_TEMP/new.deb.txt")" "$RUNNER_TEMP/out/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshnode-linux-packages
+          path: ${{ runner.temp }}/out/*
+
+  # Sub-spec 8b: the Windows MSI, the same way: the current version and 0.0.1 (a scratch
+  # worktree, never committed), its tables inspected (scripts/inspect-msi.ps1), then the
+  # install -> upgrade -> downgrade refused -> uninstall -> reinstall lifecycle
+  # (scripts/test-msi.ps1) on the runner itself: it is disposable and elevated. Git Bash runs
+  # the build script; Tauri downloads WiX on the first build.
+  windows-msi:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TAURI_CLI_VERSION: "2.12.4"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+        working-directory: apps/ui
+      - run: cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
+      # One target dir for both builds (dependencies compiled once), as a C:/... path that
+      # Git Bash globs and cargo reads alike.
+      - run: echo "CARGO_TARGET_DIR=$(cygpath -m "$GITHUB_WORKSPACE")/target" >> "$GITHUB_ENV"
+      - name: Build the current MSI
+        run: |
+          scripts/check-version.sh
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/new.txt"
+          cygpath -w "$(grep '\.msi$' "$RUNNER_TEMP/new.txt")" > "$RUNNER_TEMP/new.msi.txt"
+      - name: Build the 0.0.1 MSI
+        run: |
+          OLD="$RUNNER_TEMP/meshnode-old"
+          git worktree add "$OLD" HEAD
+          cd "$OLD"
+          scripts/set-version.sh 0.0.1
+          cargo update -w --offline
+          cargo update -w --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+          (cd apps/ui && npm ci)
+          scripts/build-desktop-packages.sh | tee "$RUNNER_TEMP/old.txt"
+          cygpath -w "$(grep '\.msi$' "$RUNNER_TEMP/old.txt")" > "$RUNNER_TEMP/old.msi.txt"
+      - name: Inspect the MSI
+        shell: pwsh
+        run: scripts/inspect-msi.ps1 (Get-Content "$env:RUNNER_TEMP/new.msi.txt")
+      - name: Lifecycle test (install, upgrade, downgrade refused, uninstall, reinstall)
+        shell: pwsh
+        run: scripts/test-msi.ps1 (Get-Content "$env:RUNNER_TEMP/old.msi.txt") (Get-Content "$env:RUNNER_TEMP/new.msi.txt") -LogDir "$env:RUNNER_TEMP/msi-logs" -Purge
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: meshnode-msi-logs
+          path: ${{ runner.temp }}/msi-logs/*
+      - name: Collect the current MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory "$env:RUNNER_TEMP/out" | Out-Null
+          Copy-Item (Get-Content "$env:RUNNER_TEMP/new.msi.txt") "$env:RUNNER_TEMP/out/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshnode-msi
+          path: ${{ runner.temp }}/out/*
+
   android-apk:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -243,12 +375,17 @@ jobs:
       TAURI_CLI_VERSION: "2.12.4"
       NDK_VERSION: "27.2.12479018"
     steps:
+      # The release build fills the disk; .NET, GHC and CodeQL are unused (the Android SDK stays).
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools  # the default also asks for "tools", which the SDK repository no longer has
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -279,9 +416,10 @@ jobs:
         run: |
           apps/android/gen-bindings.sh
           git diff --exit-code -- apps/android/src-tauri/gen/android/app/src/main/java/net/meshnode/ffi/mesh_ffi.kt
-      # Release (stripped, thin LTO) arm64 APK; unsigned (release signing is sub-spec 8).
+      # Release (stripped, thin LTO) arm64 APK, unsigned: CI has no signing key (the owner's
+      # release is signed locally, see build-apk.sh).
       - name: Build the release APK
-        run: apps/android/build-apk.sh --release
+        run: apps/android/build-apk.sh --release --unsigned
       # JNA and the UniFFI bindings are looked up by name: R8 must not rename them
       # (keep rules in app/proguard-rules.pro).
       - name: R8 keeps JNA and the bindings

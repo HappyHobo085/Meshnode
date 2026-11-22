@@ -26,14 +26,46 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["deb", "rpm", "msi"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "allowDowngrades": false,
+      "wix": {
+        "upgradeCode": "1123e229-ab63-4446-9683-3f337ecd48e3",
+        "fragmentPaths": ["packaging/windows/service.wxs"],
+        "componentRefs": ["MeshnodePackageMarker"]
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libc6 (>= 2.39)"],
+        "files": {
+          "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
+          "/usr/share/meshnode/packaged": "packaging/linux/packaged"
+        },
+        "preInstallScript": "packaging/linux/scripts/preinst.sh",
+        "postInstallScript": "packaging/linux/scripts/postinst.sh",
+        "preRemoveScript": "packaging/linux/scripts/prerm.sh",
+        "postRemoveScript": "packaging/linux/scripts/postrm.sh"
+      },
+      "rpm": {
+        "depends": ["libc.so.6(GLIBC_2.39)(64bit)"],
+        "files": {
+          "/usr/lib/systemd/system/meshnode.service": "packaging/linux/meshnode.service",
+          "/usr/share/meshnode/packaged": "packaging/linux/packaged"
+        },
+        "preInstallScript": "packaging/linux/scripts/preinst.sh",
+        "postInstallScript": "packaging/linux/scripts/postinst.sh",
+        "preRemoveScript": "packaging/linux/scripts/prerm.sh",
+        "postRemoveScript": "packaging/linux/scripts/postrm.sh"
+      }
+    }
   }
 }

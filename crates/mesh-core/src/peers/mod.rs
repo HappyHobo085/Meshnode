@@ -24,7 +24,7 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
 use mesh_hlc::WallClock;
-use mesh_proto::{MeshId, NodeAddrBytes, NodeId, VersionVector};
+use mesh_proto::{MeshId, NodeAddrBytes, NodeId, PeerVersion, VersionVector};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -189,6 +189,10 @@ pub(crate) struct PeerEnv {
     pub on_catch_up: Option<CatchUpHook>,
     /// Completed pulls from Full peers (re-bootstrap completion, ruling I2).
     pub pulls: Arc<crate::sync::FullPulls>,
+    /// The ALPN sync sessions are dialled on (`ALPN_SYNC` but for a test override).
+    pub sync_alpn: Vec<u8>,
+    /// This node's own version, what a peer's is compared with.
+    pub version: Arc<PeerVersion>,
 }
 
 #[derive(Clone)]
@@ -249,14 +253,19 @@ struct SlotState {
     /// The application close code the peer gave when the last session ended, if any.
     #[cfg(any(test, feature = "test-hooks"))]
     peer_close: Option<u64>,
+    /// The peer's version from its latest successful `meshnode/version` probe.
+    version: Option<PeerVersion>,
+    /// That version cannot sync with this node's.
+    incompatible: bool,
 }
 
 /// The address to dial `peer` at, built from the known address records. Without any, the
-/// target is still dialled when discovery can resolve it.
+/// target is still dialled when the endpoint can resolve it (`resolvable`: discovery, or a
+/// live connection whose path the endpoint knows).
 fn dial_target(
     peer: NodeId,
     records: impl IntoIterator<Item = Option<NodeAddrBytes>>,
-    discovery: bool,
+    resolvable: bool,
 ) -> Option<EndpointAddr> {
     let id = endpoint_id_of(&peer).ok()?;
     let mut target = EndpointAddr::new(id);
@@ -267,7 +276,7 @@ fn dial_target(
             Err(e) => debug!(peer = %peer.short(), error = %e, "bad address ignored"),
         }
     }
-    (!target.addrs.is_empty() || discovery).then_some(target)
+    (!target.addrs.is_empty() || resolvable).then_some(target)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -421,13 +430,16 @@ impl PeerManager {
 
     /// Dials `id` on `alpn` with the address knowledge the slots use, within `limit`.
     /// The connection is the caller's; it does not touch the `sync/1` slot.
+    /// A peer with a live session is dialled even without an address record: the endpoint
+    /// already has a path to it (a joiner that dialled in is online before its
+    /// `_mesh/addr` record has replicated here).
     pub(crate) async fn connect_within(
         &self,
         id: NodeId,
         alpn: &[u8],
         limit: Duration,
     ) -> Result<Connection, NodeError> {
-        let (addr, hint) = {
+        let (addr, hint, live) = {
             let st = self.lock();
             if st.stopped || self.0.cancel.is_cancelled() {
                 return Err(NodeError::ShuttingDown);
@@ -438,12 +450,13 @@ impl PeerManager {
                     (
                         s.addr.clone(),
                         s.hint.clone().or_else(|| st.hints.get(&id).cloned()),
+                        s.live.is_some(),
                     )
                 }
-                None => (None, st.hints.get(&id).cloned()),
+                None => (None, st.hints.get(&id).cloned(), false),
             }
         };
-        let target = dial_target(id, [addr, hint], self.0.env.discovery)
+        let target = dial_target(id, [addr, hint], self.0.env.discovery || live)
             .ok_or_else(|| NodeError::Iroh("no known address for peer".into()))?;
         match timeout(limit, self.0.env.endpoint.connect(target, alpn)).await {
             Ok(Ok(c)) => Ok(c),
@@ -652,6 +665,18 @@ impl PeerManager {
             slot.metrics.rtt_ms.store(ms, Ordering::SeqCst);
         }
         Some(rtt)
+    }
+
+    /// The peer's last known version, and whether it is incompatible with this node's.
+    pub fn version(&self, id: &NodeId) -> (Option<PeerVersion>, bool) {
+        let st = self.lock();
+        match st.slots.get(id) {
+            Some(slot) => {
+                let s = slot.lock();
+                (s.version.clone(), s.incompatible)
+            }
+            None => (None, false),
+        }
     }
 
     /// An incoming `sync/1` connection that passed the gate.

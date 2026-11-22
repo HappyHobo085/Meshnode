@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
-use meshd::{Daemon, MeshdConfig, logging};
+use meshd::{Daemon, DaemonError, MeshdConfig, logging};
 
 use commands::CliError;
 
@@ -61,15 +61,29 @@ async fn run_service(data: &Path) -> Result<(), CliError> {
 }
 
 async fn run_foreground(data: &Path) -> Result<(), CliError> {
-    let cfg = MeshdConfig::load_or_default(data).map_err(|e| CliError::failed(e.to_string()))?;
+    let cfg = MeshdConfig::load_or_default(data).map_err(|e| {
+        let e = DaemonError::from(e);
+        meshd::record_start_failure(data, &e);
+        start_error(e)
+    })?;
     std::fs::create_dir_all(data)
         .map_err(|e| CliError::failed(format!("data directory {}: {e}", data.display())))?;
     let _log = logging::init(data, &cfg.log_level);
-    let daemon = Daemon::start(data.to_path_buf(), cfg)
+    let daemon = Daemon::start_opts(data.to_path_buf(), cfg, meshd::host_options())
         .await
-        .map_err(|e| CliError::failed(e.to_string()))?;
+        .map_err(start_error)?;
     daemon.run_until(shutdown_signal()).await;
     Ok(())
+}
+
+/// A failed start: exit status 4 for incompatible data (systemd's
+/// `RestartPreventExitStatus=4` keeps it from restarting), else 1.
+fn start_error(e: DaemonError) -> CliError {
+    if e.is_incompatible() {
+        CliError::incompatible(e.to_string())
+    } else {
+        CliError::failed(e.to_string())
+    }
 }
 
 /// Ctrl-C, or SIGTERM on Unix.

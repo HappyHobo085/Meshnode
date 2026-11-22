@@ -43,7 +43,12 @@ beforeEach(() => {
   api.members.mockResolvedValue([]);
   api.services.mockResolvedValue([]);
   api.configGet.mockResolvedValue([]);
-  api.desktop.connection.mockResolvedValue({ kind: "system", otherRunning: false });
+  api.desktop.connection.mockResolvedValue({
+    kind: "system",
+    otherRunning: false,
+    startError: null,
+    noAccess: false,
+  });
   api.desktop.locateMeshd.mockResolvedValue("meshd.exe");
   api.desktop.defaultDeviceName.mockResolvedValue("DESK");
   api.android.nodeRunning.mockResolvedValue(false);
@@ -90,7 +95,12 @@ it("app_sends_android_to_node_stopped", async () => {
 
 it("app_shows_the_second_node_notice_once", async () => {
   api.status.mockResolvedValue(running());
-  api.desktop.connection.mockResolvedValue({ kind: "system", otherRunning: true });
+  api.desktop.connection.mockResolvedValue({
+    kind: "system",
+    otherRunning: true,
+    startError: null,
+    noAccess: false,
+  });
   app = render(App);
   await settle();
   expect(screen.getByText(/A second, separate node is running as you/)).toBeInTheDocument();

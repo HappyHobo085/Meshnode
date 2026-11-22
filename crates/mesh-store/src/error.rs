@@ -26,6 +26,11 @@ pub enum StoreError {
     /// ([`crate::Store::scope`]) does not replicate it (sub-spec 8a §3). Nothing was written.
     #[error("namespace `{ns}` is outside this store's replication scope")]
     OutOfScope { ns: String },
+    /// The file was written by a Meshnode build with another store schema version.
+    #[error(
+        "data was written by an incompatible Meshnode version (store schema {found}, this build reads {supported}); install a matching version"
+    )]
+    IncompatibleSchema { found: u64, supported: u64 },
     #[error(transparent)]
     Proto(#[from] ProtoError),
 }

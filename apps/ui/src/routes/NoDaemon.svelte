@@ -46,6 +46,38 @@
     }
   }
 
+  /** Why the daemon last refused to start (incompatible data), when it left that word. */
+  let startError: string | null = $state(null);
+  /** The service is installed but this account may not reach it (Linux: not in the group). */
+  let noAccess = $state(false);
+  /** An action's problem first; otherwise the daemon's own refusal; otherwise no access. */
+  const shown: Problem | null = $derived(
+    problem ??
+      (startError
+        ? { title: "Meshnode refused to start", detail: startError, hint: null }
+        : noAccess
+          ? {
+              title: "This account can't reach the Meshnode service",
+              detail: "The service is installed, but your account isn't in the meshnode group yet.",
+              hint: "Join it once with sudo usermod -aG meshnode $USER, then log in again.",
+            }
+          : null),
+  );
+
+  async function loadStartError() {
+    try {
+      ({ startError, noAccess } = await api.desktop.connection());
+    } catch {
+      // No connection info: the screen works without it.
+    }
+  }
+
+  // Each failed status poll (the banner is set again) re-reads it, so a refusal that
+  // happens while this screen is open shows up, and a cleared one goes away.
+  $effect(() => {
+    if ($banner !== null) void loadStartError();
+  });
+
   onMount(() => {
     api
       .platform()
@@ -123,38 +155,44 @@
   <div class="hero">
     <span class="mark" aria-hidden="true"><Icon name="mesh" size={28} /></span>
     <h1>Meshnode isn't running on this computer</h1>
-    <p class="lede">
-      This app manages Meshnode but doesn't run it. Start it here, or install it so it starts with
-      the computer.
-    </p>
+    {#if !noAccess}
+      <p class="lede">
+        This app manages Meshnode but doesn't run it. Start it here, or install it so it starts with
+        the computer.
+      </p>
+    {/if}
   </div>
 
-  <div class="options">
-    <div class="option primary">
-      <div class="text">
-        <h2>Run without installing</h2>
-        <p>
-          Starts Meshnode as you, now. It keeps running after you close this app, until you sign out
-          or restart.
-        </p>
+  <!-- Without access to the installed service, running or installing here would make a second
+       node beside it: only the hint below is shown. -->
+  {#if !noAccess}
+    <div class="options">
+      <div class="option primary">
+        <div class="text">
+          <h2>Run without installing</h2>
+          <p>
+            Starts Meshnode as you, now. It keeps running after you close this app, until you sign
+            out or restart.
+          </p>
+        </div>
+        <Button
+          variant="primary"
+          onclick={runUser}
+          disabled={busy || !meshd}
+          busy={phase === "starting"}>Run without installing</Button
+        >
       </div>
-      <Button
-        variant="primary"
-        onclick={runUser}
-        disabled={busy || !meshd}
-        busy={phase === "starting"}>Run without installing</Button
-      >
-    </div>
-    <div class="option">
-      <div class="text">
-        <h2>Install as a service</h2>
-        <p>Starts with the computer, for every user. Asks for administrator permission.</p>
+      <div class="option">
+        <div class="text">
+          <h2>Install as a service</h2>
+          <p>Starts with the computer, for every user. Asks for administrator permission.</p>
+        </div>
+        <Button onclick={install} disabled={busy || !meshd} busy={phase === "installing"}
+          >Install as a service</Button
+        >
       </div>
-      <Button onclick={install} disabled={busy || !meshd} busy={phase === "installing"}
-        >Install as a service</Button
-      >
     </div>
-  </div>
+  {/if}
 
   {#if phase === "starting" || phase === "waiting"}
     <p class="progress" role="status">
@@ -167,46 +205,48 @@
     </p>
   {/if}
 
-  {#if problem}
+  {#if shown}
     <div class="problem" role="alert">
       <Icon name="alert" size={18} />
       <div>
-        <strong>{problem.title}</strong>
-        {#if problem.detail}<p>{problem.detail}</p>{/if}
-        {#if problem.log}
+        <strong>{shown.title}</strong>
+        {#if shown.detail}<p>{shown.detail}</p>{/if}
+        {#if shown.log}
           <p class="log">
-            <code>{problem.log}</code>
+            <code>{shown.log}</code>
             <Button size="sm" variant="ghost" onclick={copyLog}
               ><Icon name="copy" size={14} />Copy path</Button
             >
           </p>
         {/if}
-        {#if problem.hint}<p class="hint">{problem.hint}</p>{/if}
+        {#if shown.hint}<p class="hint">{shown.hint}</p>{/if}
       </div>
     </div>
   {/if}
 
-  <footer class="meshd">
-    {#if meshd === undefined}
-      <p>Looking for meshd…</p>
-    {:else if meshd === null}
-      <p>
-        <Icon name="alert" size={16} />
-        <span>meshd wasn't found next to this app or on your PATH. Choose it to continue.</span>
-      </p>
-    {:else}
-      <p>
-        <Icon name="file" size={16} />
-        <span>Using <code class="truncate" title={meshd}>{meshd}</code></span>
-      </p>
-    {/if}
-    <Button
-      size="sm"
-      variant={meshd === null ? "primary" : "ghost"}
-      onclick={locateMeshd}
-      disabled={busy}>Locate meshd…</Button
-    >
-  </footer>
+  {#if !noAccess}
+    <footer class="meshd">
+      {#if meshd === undefined}
+        <p>Looking for meshd…</p>
+      {:else if meshd === null}
+        <p>
+          <Icon name="alert" size={16} />
+          <span>meshd wasn't found next to this app or on your PATH. Choose it to continue.</span>
+        </p>
+      {:else}
+        <p>
+          <Icon name="file" size={16} />
+          <span>Using <code class="truncate" title={meshd}>{meshd}</code></span>
+        </p>
+      {/if}
+      <Button
+        size="sm"
+        variant={meshd === null ? "primary" : "ghost"}
+        onclick={locateMeshd}
+        disabled={busy}>Locate meshd…</Button
+      >
+    </footer>
+  {/if}
 </section>
 
 <style>

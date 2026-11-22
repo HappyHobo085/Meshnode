@@ -54,6 +54,7 @@ fn node_config(data: &Path, cfg: &MeshdConfig) -> NodeConfig {
     nc.tags = cfg.tags.clone();
     nc.relay = cfg.relay_choice();
     nc.discovery = cfg.discovery;
+    nc.product_version = meshd::PRODUCT_VERSION.into();
     nc
 }
 

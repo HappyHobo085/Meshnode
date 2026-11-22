@@ -20,7 +20,7 @@ pub enum LockError {
 /// An exclusive lock on a data directory, released when dropped (or when the process ends).
 #[derive(Debug)]
 pub struct DataLock {
-    _file: File,
+    file: File,
 }
 
 impl DataLock {
@@ -38,10 +38,18 @@ impl DataLock {
             .open(&path)
             .map_err(io_err)?;
         match file.try_lock() {
-            Ok(()) => Ok(DataLock { _file: file }),
+            Ok(()) => Ok(DataLock { file }),
             Err(TryLockError::WouldBlock) => Err(LockError::Held(data_dir.to_path_buf())),
             Err(TryLockError::Error(e)) => Err(io_err(e)),
         }
+    }
+}
+
+impl Drop for DataLock {
+    /// Unlocks explicitly: closing the file alone releases the lock only once no copy of
+    /// its descriptor is left, and a process spawned meanwhile holds one until it execs.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -61,5 +69,17 @@ mod tests {
         );
         drop(first);
         DataLock::acquire(dir.path()).unwrap();
+    }
+
+    /// A process spawned while the lock is held shares its open file description until it
+    /// execs; dropping the lock must release it anyway. The clone stands in for that copy.
+    #[test]
+    fn drop_releases_the_lock_while_a_copy_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DataLock::acquire(dir.path()).unwrap();
+        let copy = first.file.try_clone().unwrap();
+        drop(first);
+        DataLock::acquire(dir.path()).unwrap();
+        drop(copy);
     }
 }

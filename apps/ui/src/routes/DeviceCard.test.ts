@@ -88,3 +88,18 @@ it("card_menu_closes_on_escape", async () => {
   expect(screen.queryByRole("menu")).toBeNull();
   expect(button).toHaveAttribute("aria-expanded", "false");
 });
+
+it("incompatible_member_shows_its_version_instead_of_offline", () => {
+  render(DeviceCard, {
+    member: member({
+      id: "cc33",
+      name: "Pi",
+      online: false,
+      lastSeenMs: null,
+      incompatible: true,
+      version: "0.2.0",
+    }),
+  });
+  expect(screen.getByText("Incompatible version (0.2.0)")).toBeInTheDocument();
+  expect(screen.queryByText(/Offline/)).toBeNull();
+});

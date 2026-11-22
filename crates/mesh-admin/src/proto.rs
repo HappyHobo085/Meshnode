@@ -272,6 +272,12 @@ pub struct MemberInfoView {
     pub rtt_ms: Option<u64>,
     pub last_seen_ms: Option<u64>,
     pub lag: u64,
+    /// The member's product version, once known (8b spec §5.4).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The member runs a version this node cannot sync with.
+    #[serde(default)]
+    pub incompatible: bool,
 }
 
 /// One row of `meshd services`.

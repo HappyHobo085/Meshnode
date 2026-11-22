@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 use crate::config::{CONFIG_FILE, ConfigError, HostConfig};
 use crate::lock::{DataLock, LOCK_FILE, LockError};
 use crate::options::HostOptions;
-use crate::paths::{logs_dir, tmp_dir};
+use crate::paths::{self, logs_dir, tmp_dir};
 use crate::power::{CATCH_UP_AFTER, Periodic, Power, PowerState, WakeReason, saver_paused};
 
 mod requests;
@@ -63,6 +63,35 @@ pub enum DaemonError {
     Gateway(#[from] GatewayError),
     #[error("cannot serve the admin API: {0}")]
     Admin(#[from] AdminError),
+}
+
+impl DaemonError {
+    /// True when the data (or `meshd.toml`) was written by an incompatible Meshnode
+    /// version or is invalid for this one: the daemon must refuse, not retry. In
+    /// `meshd.toml` that is an unparsable file or unknown key (`Parse`) and a value this build
+    /// does not accept (`Invalid`, e.g. one a newer build added); failing to read it is not.
+    pub fn is_incompatible(&self) -> bool {
+        matches!(
+            self,
+            DaemonError::Node(NodeError::Incompatible { .. })
+                | DaemonError::Config(ConfigError::Parse { .. } | ConfigError::Invalid { .. })
+        )
+    }
+}
+
+/// After a failed start: when `err` is an incompatible-data refusal, its message goes to
+/// `<data_dir>/start-error.txt` for `meshd status` and the desktop app; any other failure
+/// removes the file, so it never names a stale cause. Hosts that load `meshd.toml`
+/// themselves call this for a load error too.
+pub fn record_start_failure(data_dir: &Path, err: &DaemonError) {
+    let r = if err.is_incompatible() {
+        paths::write_start_error(data_dir, &err.to_string())
+    } else {
+        paths::clear_start_error(data_dir)
+    };
+    if let Err(e) = r {
+        warn!("cannot update {}: {e}", paths::START_ERROR_FILE);
+    }
 }
 
 /// Settings that only tests change.
@@ -228,7 +257,26 @@ impl Daemon {
         Self::start_inner(data_dir, cfg, opts).await
     }
 
+    /// [`Daemon::start_serving`], then `start-error.txt` recorded (an incompatible
+    /// refusal) or removed (a successful start or any other failure).
     async fn start_inner(
+        data_dir: PathBuf,
+        cfg: HostConfig,
+        opts: StartOptions,
+    ) -> Result<Daemon, DaemonError> {
+        let r = Self::start_serving(data_dir.clone(), cfg, opts).await;
+        match &r {
+            Ok(_) => {
+                if let Err(e) = paths::clear_start_error(&data_dir) {
+                    warn!("cannot remove {}: {e}", paths::START_ERROR_FILE);
+                }
+            }
+            Err(e) => record_start_failure(&data_dir, e),
+        }
+        r
+    }
+
+    async fn start_serving(
         data_dir: PathBuf,
         cfg: HostConfig,
         opts: StartOptions,
@@ -581,6 +629,7 @@ impl Inner {
         nc.bind_addr = self.opts.bind_addr;
         nc.timings = self.opts.timings.clone();
         nc.catch_up_on_incoming_after = self.catch_up_after(&power_state);
+        nc.product_version = self.opts.host.product_version.clone();
         if self.power.has_sink() {
             // The incoming-traffic catch-up holds the "catchup" wake lock, like a wake.
             let power = self.power.clone();

@@ -13,7 +13,7 @@ mod power;
 pub use config::{AndroidConfig, ConfigError, HostConfig};
 #[cfg(feature = "test-hooks")]
 pub use daemon::TestOptions;
-pub use daemon::{Daemon, DaemonError, HostStatus, wipe_identity};
+pub use daemon::{Daemon, DaemonError, HostStatus, record_start_failure, wipe_identity};
 pub use mesh_core::WakeOutcome;
 pub use options::HostOptions;
 pub use power::{

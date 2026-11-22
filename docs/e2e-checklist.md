@@ -163,10 +163,10 @@ Record: row C2 (seconds, network).
 
 ## Criterion 3: hosting on both
 
-Build and deploy the Aegis sync service on the desktop (needs `rustup target add wasm32-wasip2` once):
+Build the Aegis sync service from the Aegis repo (`sync-server/wasm`, see its `AGENTS.md`; needs `rustup target add wasm32-wasip2` once) and deploy it on the desktop:
 ```
-scripts/build-services.sh               # prints the path of aegis_sync.wasm
-meshd deploy wasm sync <path to aegis_sync.wasm> --memory-mb 64 --timeout-ms 30000 --max-body 8388608
+cargo build --locked --release --target wasm32-wasip2 --manifest-path <aegis>/sync-server/wasm/Cargo.toml
+meshd deploy wasm sync <aegis>/sync-server/wasm/target/wasm32-wasip2/release/aegis_sync.wasm --memory-mb 64 --timeout-ms 30000 --max-body 8388608
 ```
 Nodes have no port mappings by default. On **each** node map port 7801 to it, then restart that node: `meshd config set gateway.ports 7801=sync` on the desktop (and the laptop), and on the phone Settings, Port mappings, `7801` → `sync`.
 `site` is already deployed (A1). Also deploy a site **from the phone**: Services, Deploy, pick a folder, name `site2`.
@@ -180,7 +180,7 @@ Record: row C3.
 
 ## Criterion 4: real use (Aegis)
 
-Aegis desktop on this PC and Aegis Android on the S23, each using **its own device's** gateway, `http://127.0.0.1:7801`. Build Aegis from its repo as its `AGENTS.md` says. The taps are in `docs/manual-checks/sub-spec-7.md` steps 2–5 (register on the desktop, restore on the phone, approve on the desktop, then sync). If the "Use Meshnode on this device" box does not show, type the URL.
+Aegis desktop on this PC and Aegis Android on the S23, each using **its own device's** gateway, `http://127.0.0.1:7801`. Build Aegis from its repo as its `AGENTS.md` says. The taps are in `docs/manual-checks/sub-spec-7.md` steps 2–5 (register on the desktop, restore on the phone, approve on the desktop, then sync). Type the URL into Aegis's sync settings.
 
 Pass:
 - Bookmarks added on each device appear on the other.

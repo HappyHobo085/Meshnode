@@ -1,5 +1,3 @@
 apps/ui/src/lib/generated/** text eol=lf
-# Vendored Aegis core: exact bytes, no line-ending conversion (scripts/sync-aegis-core.sh --check).
-vendor/aegis-sync-core/** -text
 # Packaged as-is into the deb/rpm (shell scriptlets, the systemd unit compared byte-for-byte by meshd tests).
 apps/desktop/src-tauri/packaging/linux/** text eol=lf

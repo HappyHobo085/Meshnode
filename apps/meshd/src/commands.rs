@@ -765,9 +765,9 @@ mod tests {
         }
     }
 
-    /// The deploy command `docs/manual-checks/sub-spec-7.md` and spec 7 §5.3 give for the Aegis
-    /// sync service sets 64 MB, 30 s and 8 MiB; without the flags the timeout is the daemon's
-    /// 10 s default.
+    /// The deploy command for the Aegis sync service (spec 7 §5.3; the service now lives in the
+    /// Aegis repo, `sync-server/wasm`) sets 64 MB, 30 s and 8 MiB; without the flags the timeout
+    /// is the daemon's 10 s default.
     #[test]
     fn deploy_wasm_limit_flags_set_the_documented_sync_limits() {
         use clap::Parser;

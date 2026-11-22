@@ -1,9 +1,8 @@
 //! Test-only (`test-hooks`): builds the guest fixtures in `tests/fixtures` (a separate cargo workspace) for
-//! `wasm32-wasip2` and hands out their bytes; likewise the real services under `services/`
-//! (each its own workspace).
+//! `wasm32-wasip2` and hands out their bytes.
 //!
-//! Each build runs once per test process into its own target dir under the workspace
-//! target (`fixtures`, `services`), so it never waits on the outer cargo's target-dir lock.
+//! The build runs once per test process into its own target dir under the workspace
+//! target (`fixtures`), so it never waits on the outer cargo's target-dir lock.
 //! An exclusive file lock serializes concurrent test binaries; whoever comes second finds
 //! the build up to date.
 
@@ -25,44 +24,13 @@ fn fixtures_dir() -> &'static Path {
 
 fn build_fixtures() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Cargo.toml");
-    build_wasm(&manifest, "fixtures", &[])
-}
-
-/// The path of `services/aegis-sync` built for `wasm32-wasip2` (release), the way
-/// `scripts/build-services.sh` builds it. Built once per test process, without the core's
-/// test-only `vectors` feature.
-pub fn aegis_sync_wasm() -> PathBuf {
-    static WASM: OnceLock<PathBuf> = OnceLock::new();
-    WASM.get_or_init(|| {
-        let manifest =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/aegis-sync/Cargo.toml");
-        build_wasm(&manifest, "services", &[]).join("aegis_sync.wasm")
-    })
-    .clone()
-}
-
-/// [`aegis_sync_wasm`] built with the service's test-only `test-caps` feature (its server-wide
-/// caps lowered so a test can reach them), into its own target directory so the two builds
-/// never overwrite each other's `aegis_sync.wasm`.
-pub fn aegis_sync_wasm_test_caps() -> PathBuf {
-    static WASM: OnceLock<PathBuf> = OnceLock::new();
-    WASM.get_or_init(|| {
-        let manifest =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/aegis-sync/Cargo.toml");
-        build_wasm(
-            &manifest,
-            "services-test-caps",
-            &["--features", "test-caps"],
-        )
-        .join("aegis_sync.wasm")
-    })
-    .clone()
+    build_wasm(&manifest, "fixtures")
 }
 
 /// Builds the workspace at `manifest` for `wasm32-wasip2` (release) into
-/// `<workspace target>/<subdir>`, with `extra` cargo arguments; returns the directory holding
+/// `<workspace target>/<subdir>`; returns the directory holding
 /// the `.wasm` files.
-fn build_wasm(manifest: &Path, subdir: &str, extra: &[&str]) -> PathBuf {
+fn build_wasm(manifest: &Path, subdir: &str) -> PathBuf {
     let target = workspace_target_dir().join(subdir);
     std::fs::create_dir_all(&target).expect("create wasm target dir");
     let lock = File::create(target.join("build.lock")).expect("create wasm build lock");
@@ -80,7 +48,6 @@ fn build_wasm(manifest: &Path, subdir: &str, extra: &[&str]) -> PathBuf {
             "--manifest-path",
         ])
         .arg(manifest)
-        .args(extra)
         .arg("--target-dir")
         .arg(&target)
         // Host-only settings from the outer build must not leak into the wasm build.

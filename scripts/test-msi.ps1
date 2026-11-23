@@ -217,6 +217,10 @@ Check 'the admin SID is unchanged' ((Get-AdminSid) -eq $mySid)
 Test-Uninstall (Join-Path $LogDir '6-uninstall.log')
 
 if ($Purge) {
+    # node.key grants LocalService only (spec §3.1: owner-only), so even an elevated
+    # Administrator is denied until Administrators take ownership and grant themselves access.
+    takeown /F $data /R /A /D Y | Out-Null
+    icacls $data /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
     Remove-Item -Recurse -Force $data
     Check "purge: $data deleted" (-not (Test-Path $data))
 }

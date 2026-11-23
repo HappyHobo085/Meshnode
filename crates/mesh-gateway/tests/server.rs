@@ -172,6 +172,17 @@ async fn invalid_service_host_404() {
 #[tokio::test]
 async fn status_page_and_json() {
     let mesh = with_counter("<script>alert(1)</script>").await;
+    // The founder's own name reaches the membership snapshot the page reads after
+    // create_mesh returns (the reactor applies the store write), so a slow runner can
+    // render the page before it (seen on Windows CI).
+    let node = &mesh.m[0].node;
+    let me = mesh.id(0);
+    wait_for("founder's own record listed", || async move {
+        node.members()
+            .iter()
+            .any(|m| m.id == me && m.info.is_some())
+    })
+    .await;
     let g = start(&mesh, cfg(&[(0, COUNTER)])).await;
     let a = main_addr(&g);
     for host in [

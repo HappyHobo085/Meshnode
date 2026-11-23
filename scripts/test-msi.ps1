@@ -218,9 +218,12 @@ Test-Uninstall (Join-Path $LogDir '6-uninstall.log')
 
 if ($Purge) {
     # node.key grants LocalService only (spec §3.1: owner-only), so even an elevated
-    # Administrator is denied until Administrators take ownership and grant themselves access.
+    # Administrator is denied until Administrators take ownership and the files go back to
+    # inheriting the data directory's DACL (which grants Administrators full access).
     takeown /F $data /R /A /D Y | Out-Null
-    icacls $data /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Output "takeown exited $LASTEXITCODE" }
+    icacls "$data\*" /reset /T /C /Q
+    if ($LASTEXITCODE -ne 0) { Write-Output "icacls exited $LASTEXITCODE" }
     Remove-Item -Recurse -Force $data
     Check "purge: $data deleted" (-not (Test-Path $data))
 }

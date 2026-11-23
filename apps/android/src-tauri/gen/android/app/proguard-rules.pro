@@ -32,6 +32,13 @@
 -keep class * implements com.sun.jna.** { *; }
 -keepclassmembers class * extends com.sun.jna.Structure { <fields>; }
 -keep class net.meshnode.ffi.** { *; }
+# --- Reflectively created classes whose library rules keep the class but not its
+# no-arg constructor, which R8 full mode (AGP 9's default) then removes: WorkManager's
+# Room database (`WorkDatabase_Impl`, room-runtime 2.6.1 rules) and ML Kit's Firebase
+# component registrars (barcode scanner). Without these the release app dies at startup
+# in androidx.startup.InitializationProvider.
+-keep class * extends androidx.room.RoomDatabase { <init>(); }
+-keep class * implements com.google.firebase.components.ComponentRegistrar { <init>(); }
 # mesh-ffi's raw JNI export (Java_net_meshnode_app_MeshNative_initAndroid).
 -keepclasseswithmembernames class net.meshnode.app.MeshNative {
     native <methods>;

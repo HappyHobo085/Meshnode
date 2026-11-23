@@ -10,6 +10,10 @@ env:
   # upload pushes desktop-ui past its timeout). Panic messages keep their file:line.
   CARGO_PROFILE_DEV_DEBUG: "0"
 
+# Read-only token: CI only builds and tests, and pull requests from forks run this too.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:

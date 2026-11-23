@@ -2,11 +2,13 @@
 
 A self-hosted server mesh across the owner's own devices (Linux, Windows, Android): every host replicates and serves the hosted WASM services and static sites. Design: `docs/superpowers/specs/2026-11-08-meshnode-design.md`.
 
+**Status:** early and pre-1.0 (0.1.0). Formats and protocols may change between releases without migrations (see `CONTRIBUTING.md`), and the installers are unsigned.
+
 ## Build and install
 
 One product version for everything: `scripts/set-version.sh <x.y.z>` sets it, `scripts/check-version.sh` checks it. Release rule: `CONTRIBUTING.md`. Downgrades are not supported on any platform.
 
-The repo sits on a FAT32 disk, so keep build output off it: `export CARGO_TARGET_DIR=~/.cache/meshnode-target`.
+Build output can live outside the checkout (useful when it sits on a slow or FAT32 disk): `export CARGO_TARGET_DIR=~/.cache/meshnode-target`.
 
 ### Linux (rpm, deb)
 
@@ -44,3 +46,11 @@ Install with `adb install <apk>`, upgrade with `adb install -r <apk>` (data kept
 ## Testing
 
 `cargo test --workspace`. Release checks on real devices: `docs/e2e-checklist.md`, results in `docs/e2e-results.md`. Per-sub-spec manual checks: `docs/manual-checks/`.
+
+## Security
+
+Report vulnerabilities privately; see `SECURITY.md`.
+
+## License
+
+Meshnode is licensed under the GNU Affero General Public License v3.0 only (`AGPL-3.0-only`); see `LICENSE`. `patches/ndk-context` is a patched third-party crate under its own MIT/Apache-2.0 licence.

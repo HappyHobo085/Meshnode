@@ -1,10 +1,10 @@
 # Manual check: sub-spec 8a (`mesh-client` SDK and partial replication)
 
-Run by the owner on Windows 11 and the Galaxy S23 (spec `2026-11-12-mesh-client-design.md` §7). Until this is done, master spec §14 row 8a stays "implemented, manual check pending". Step 4 is success criterion 5 of the master spec on real devices (a client keeps working with the desktop node off, served by the phone). The in-process version of it is the automated test `criterion5_client_via_remaining_host`.
+Run by the owner on Windows 11 and the Android phone (spec `2026-11-12-mesh-client-design.md` §7). Until this is done, master spec §14 row 8a stays "implemented, manual check pending". Step 4 is success criterion 5 of the master spec on real devices (a client keeps working with the desktop node off, served by the phone). The in-process version of it is the automated test `criterion5_client_via_remaining_host`.
 
 The build agent ran none of this. It never ran a client against a real mesh, never touched a phone, never loaded the AAR in an Android app, and never pushed. The two new CI jobs (`mesh-client` and `mesh-client-ffi-android`) have **not run anywhere yet**; they run only once the branch is pushed. Check them the first time you push, and treat a red job as a finding.
 
-Start from the mesh of `docs/manual-checks/sub-spec-6.md`: the PC and the S23 paired as **hosts**, both nodes running. This check deploys a static site and adds, then removes, a client member. The client's node id is removed for good at the end, so do not use a mesh you cannot afford to disturb.
+Start from the mesh of `docs/manual-checks/sub-spec-6.md`: the PC and the phone paired as **hosts**, both nodes running. This check deploys a static site and adds, then removes, a client member. The client's node id is removed for good at the end, so do not use a mesh you cannot afford to disturb.
 
 ## Build
 
@@ -65,10 +65,10 @@ Record the date, the machine, the network and the result of each in the table.
 
 | Date | Machine | Network | Step or check | Result | Notes |
 |---|---|---|---|---|---|
-| | PC + S23 | | 1 site on both hosts | | |
+| | PC + phone | | 1 site on both hosts | | |
 | | client machine | | 2 join and fetch | | seconds to output: |
 | | client machine | | 3 open again, 404 passed through | | |
-| | client machine + S23 | | 4 PC node off, fetch via the phone | | seconds: ; phone network: |
+| | Client machine + phone | | 4 PC node off, fetch via the phone | | seconds: ; phone network: |
 | | client machine | | 5 client store holds only `_mesh` | | client / host `store.redb` sizes, before and after: |
 | | PC + client machine | | 6 remove, then refused | | message printed: |
 | | client machine | | second client on the same directory | | |

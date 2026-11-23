@@ -27,7 +27,7 @@ Android, including QR invite/join (master §14 row 6). Decisions taken in brains
 1. All tests in §9 pass on Windows; the CI jobs in §9.5 are green on Linux.
 2. `svelte-check` reports 0 errors; the generated TS types are current (CI drift check).
 3. The Android APK and the desktop app both build and load the same `apps/ui/dist`.
-4. The owner's manual check (§9.6) is run on Windows and the S23; step 2 is success criterion 2 (pairing within
+4. The owner's manual check (§9.6) is run on Windows and the phone; step 2 is success criterion 2 (pairing within
    30 s, on Wi-Fi and on mobile data).
 5. The master spec is back-ported (§10).
 
@@ -314,7 +314,7 @@ Vitest + @testing-library/svelte with `api.ts` mocked:
   `apps/desktop/src-tauri`.
 - `android-apk`: builds `apps/ui` first.
 
-### 9.6 Manual check (`docs/manual-checks/sub-spec-6.md`, owner, Windows + S23)
+### 9.6 Manual check (`docs/manual-checks/sub-spec-6.md`, owner, Windows + phone)
 1. Fresh PC: the UI offers **Run without installing**; Home appears.
 2. Desktop shows an invite QR; the phone scans it; both list each other online within **30 s** — once on Wi-Fi,
    once on mobile data (success criterion 2).

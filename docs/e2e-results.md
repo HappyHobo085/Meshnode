@@ -4,7 +4,7 @@ Filled in by the owner while running `docs/e2e-checklist.md`. One copy of the ta
 
 ## Run: 2026-11-22 (partial, build agent, desktop + Windows VM; no phone)
 
-Run by the build agent at the owner's request, on this desktop and the Windows 11 test VM `meshwin` (libvirt) standing in for the laptop. The phone was not connected, and the owner kept the reboot and power-off steps, so every phone step, C1 and C5 are **not run**. "Pass" below means the agent saw the pass condition; the owner still has to confirm. The owner's own node was stopped for the run and restarted afterwards.
+Run by the build agent at the owner's request, on the Linux desktop and a Windows 11 test VM standing in for the laptop. The phone was not connected, and the owner kept the reboot and power-off steps, so every phone step, C1 and C5 are **not run**. "Pass" below means the agent saw the pass condition; the owner still has to confirm. The owner's own node was stopped for the run and restarted afterwards.
 
 ### Build
 
@@ -21,16 +21,16 @@ Run by the build agent at the owner's request, on this desktop and the Windows 1
 
 | Device | Model | OS and version | Network(s) used |
 |---|---|---|---|
-| Desktop (rpm) | this PC | Nobara Linux 44 KDE, kernel 7.3.4, glibc 2.43 | home LAN |
-| Phone (APK) | Galaxy S23 | not used | |
-| Laptop (MSI, client) | VM `meshwin` | Windows 11 Pro 10.0.26100 | passt user-mode NAT through the desktop |
+| Desktop (rpm) | Linux desktop | Nobara Linux 44, glibc 2.43 | LAN |
+| Phone (APK) | Android phone | not used | |
+| Laptop (MSI, client) | Windows VM | Windows 11 Pro 10.0.26100 | NAT through the desktop |
 
 ### A. Install and upgrade in place
 
 | Step | Pass/fail | Notes |
 |---|---|---|
 | A1 Desktop rpm install 0.0.1 | pass | enabled + active, `meshd 0.0.1`, system user, `service install` refused with the package message; `meshd init --name desktop` from the CLI (app not opened); `site` 200 |
-| A2 Laptop MSI install 0.0.1, admin without elevation | partial | silent install (`msiexec /qn`) over SSH as admin user `mesh`; service `installed, running`; SID matches `whoami /user`; `service install` refused; joined as client, listed online. **Not checked:** the app opening and connecting without elevation (GUI) |
+| A2 Laptop MSI install 0.0.1, admin without elevation | partial | silent install (`msiexec /qn`) over SSH as an admin user; service `installed, running`; SID matches `whoami /user`; `service install` refused; joined as client, listed online. **Not checked:** the app opening and connecting without elevation (GUI) |
 | A3 Phone APK install 0.0.1, joined | not run | no phone |
 | A4 Upgrade to release: desktop | pass | `meshd 0.1.0`, enabled + active, `NRestarts=0`, same members, `site` kept |
 | A4 Upgrade to release: phone | not run | no phone |
@@ -90,7 +90,7 @@ Run by the build agent at the owner's request, on this desktop and the Windows 1
 | Device | Model | OS and version | Network(s) used |
 |---|---|---|---|
 | Desktop (rpm) | | | |
-| Phone (APK) | Galaxy S23 | | |
+| Phone (APK) | Android phone | | |
 | Laptop (MSI, client) | | | |
 
 ### A. Install and upgrade in place

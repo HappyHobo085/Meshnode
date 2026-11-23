@@ -1,6 +1,6 @@
 # Manual check: sub-spec 6 (Tauri management UI)
 
-Run by the owner on Windows 11 and the Galaxy S23 (spec `2026-11-11-tauri-ui-design.md` §9.6). Until this is done, master spec §14 row 6 stays "implemented, manual check pending". Nothing here has been run on a device or with a real webview by the build agent: it never installs services, never answers a UAC prompt and never touches a phone.
+Run by the owner on Windows 11 and the Android phone (spec `2026-11-11-tauri-ui-design.md` §9.6). Until this is done, master spec §14 row 6 stays "implemented, manual check pending". Nothing here has been run on a device or with a real webview by the build agent: it never installs services, never answers a UAC prompt and never touches a phone.
 
 Step 2 is success criterion 2 of the master spec: pairing within 30 s, once on Wi-Fi and once on mobile data.
 
@@ -42,7 +42,7 @@ Each step has a row in the results table. Record the date, the device, the netwo
 Mark each in the results table. None has automated coverage with a real webview or device.
 
 - **C1 Live streams, desktop.** In the desktop app (a webview with zero core permissions), Logs follow, the latency probe and the deploy progress bar (a static folder deploy) each update live. Pass: lines, samples and progress reach the page as they happen; no CSP or permission error in the webview console (F12 in `cargo tauri dev`).
-- **C2 Live streams, Android.** The same three on the S23 (`chrome://inspect` for the console). Pass: as C1.
+- **C2 Live streams, Android.** The same three on the phone (`chrome://inspect` for the console). Pass: as C1.
 - **C3 Desktop dialogs and `open_url`.** **Locate meshd…** opens a file dialog and the choice is remembered after a restart; the deploy sheet's file and folder dialogs work; clicking the gateway URL opens the default browser. Pass: also, a non-local URL such as `http://example.com` is refused; only `http://*.localhost:*` and `http://127.0.0.1:*` open.
 - **C4 `daemon_install` through UAC, and declining.** Accepting is step 10. Also press **Install as system service** and click No on the UAC prompt. Pass: the UI says "Installation cancelled", nothing changes (no service, the No daemon screen stays) and Run without installing still works. Same VM or spare-machine advice as step 10.
 - **C5 Android SAF folder picker, `pick_wasm` and in-process admin.** Deploy a nested folder from the picker (subfolders, 100 or more files, a space and a non-ASCII letter in a file name): all files arrive and the site loads. Deploy a `.wasm` file through the picker (copied to the cache, then deployed). With the node running, every admin call works in-process (Home, Services, Settings). With the node stopped (Stop in the notification), the UI shows **Node stopped** with Start, admin calls say "Start the node", and Start brings the UI back. Cancelling either picker shows no error and no stuck progress.
@@ -55,13 +55,13 @@ Mark each in the results table. None has automated coverage with a real webview 
 | Date | Device | Network | Step or check | Result | Notes |
 |---|---|---|---|---|---|
 | | PC (Windows 11) | | 1 Run without installing | | |
-| | PC + S23 | Wi-Fi | 2 pairing | | seconds: |
-| | PC + S23 | Mobile data | 2 pairing | | seconds: |
-| | S23 | | 3 static site from the phone | | |
+| | PC + phone | Wi-Fi | 2 pairing | | seconds: |
+| | PC + phone | Mobile data | 2 pairing | | seconds: |
+| | Phone | | 3 static site from the phone | | |
 | | | | 4 placement, outbound, undeploy, purge | | |
 | | | | 5 logs | | |
-| | S23 to PC | | 6 latency probe | | p50 / p95 / max: |
-| | S23 | | 7 power policy persists | | |
+| | Phone to PC | | 6 latency probe | | p50 / p95 / max: |
+| | Phone | | 7 power policy persists | | |
 | | | | 8 remove the phone | | seconds: |
 | | | | 9 look and feel | | |
 | | VM or spare PC | | 10 install as service via UAC | | |

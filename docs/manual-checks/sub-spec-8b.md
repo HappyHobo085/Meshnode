@@ -2,7 +2,7 @@
 
 Run by the owner (spec `2026-11-16-packaging-e2e-design.md` §1.4, §7). This covers the steps that need root, a device or Windows. The §1 run itself is `docs/e2e-checklist.md`. Until both are done, master spec §14 row 8b stays "manual check and §1 run pending".
 
-The build agent ran none of this. It never installed a package on this PC, ran adb, started or stopped a service, elevated, or held a keystore. What it did run without root:
+The build agent ran none of this. It never installed a package on the desktop, ran adb, started or stopped a service, elevated, or held a keystore. What it did run without root:
 - `scripts/inspect-linux-packages.sh` on the 0.1.0 rpm and deb (contents, modes, unit, scriptlets, glibc dependency).
 - `scripts/test-linux-packages.sh` with a 0.0.1 and a 0.1.0 build: install, upgrade, remove, reinstall and purge of the rpm (Fedora 41) and the deb (Debian 13) in rootless podman.
 - `apps/android/build-apk.sh --release` without a keystore (fails with "Release signing: … not found") and `--release --unsigned` (an unsigned APK).
@@ -137,9 +137,9 @@ The owner cannot trigger this without a special build: 0.0.1 and 0.1.0 from the 
 | | Laptop | 2.4 downgrade refused | | |
 | | Laptop | 2.5 uninstall, data kept | | |
 | | PC | 3.2 signed release build | | digest: |
-| | S23 | 3.4 install over | | |
-| | S23 | 3.5 wrong key refused (optional) | | |
+| | Phone | 3.4 install over | | |
+| | Phone | 3.5 wrong key refused (optional) | | |
 | | PC | 4.1 incompatible, Linux | | |
 | | Laptop | 4.2 incompatible, Windows | | |
 | | Laptop | 4.2 stopped, no refusal (standard user) | | |
-| | S23 | 4.3 incompatible, Android | | |
+| | Phone | 4.3 incompatible, Android | | |

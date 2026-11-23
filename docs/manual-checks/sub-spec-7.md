@@ -1,10 +1,10 @@
 # Manual check: sub-spec 7 (Aegis sync port)
 
-Run by the owner on Windows 11 and the Galaxy S23 (spec `2026-11-11-aegis-sync-design.md` §8.6). Until this is done, master spec §14 row 7 stays "implemented, manual check pending". Steps 4 and 5 are success criterion 4 of the master spec (Aegis desktop and Aegis Android sync bookmarks through their own device's gateway and converge after airplane mode).
+Run by the owner on Windows 11 and the Android phone (spec `2026-11-11-aegis-sync-design.md` §8.6). Until this is done, master spec §14 row 7 stays "implemented, manual check pending". Steps 4 and 5 are success criterion 4 of the master spec (Aegis desktop and Aegis Android sync bookmarks through their own device's gateway and converge after airplane mode).
 
 Nothing here has been run on a device or with a real Aegis app by the build agent. It never installed services, never touched a phone, and never pushed either repo. The new CI jobs (the `sync-server` and `msrv` changes in Aegis) have **not run anywhere yet**: they only run once the branches are pushed. Look at them the first time you push, and treat a red job as a finding.
 
-The mesh from `docs/manual-checks/sub-spec-6.md` (a PC and the S23 paired, both nodes running) is the starting point. This check deploys a service and registers test devices, so do not use a mesh you cannot afford to disturb.
+The mesh from `docs/manual-checks/sub-spec-6.md` (a PC and the phone paired, both nodes running) is the starting point. This check deploys a service and registers test devices, so do not use a mesh you cannot afford to disturb.
 
 ## Build
 
@@ -34,10 +34,10 @@ The Meshnode desktop app, `meshd` and the Android app are built as in `docs/manu
 
 ### Aegis (desktop and APK)
 
-The Aegis work is on branch `feat/sync-core` in `D:/AI_Apps/Aegis` (HEAD `71e78da` when this was written). **It is not pushed**, so there is no CI build and no release: the desktop app and the APK must be built from that branch on this PC. Check out `feat/sync-core` first. The commands are Aegis's own (`D:/AI_Apps/Aegis/AGENTS.md`):
+The Aegis work is on branch `feat/sync-core` in a local Aegis checkout (HEAD `71e78da` when this was written). **It is not pushed**, so there is no CI build and no release: the desktop app and the APK must be built from that branch on the desktop. Check out `feat/sync-core` first. The commands are Aegis's own (`AGENTS.md` in the Aegis checkout):
 
 ```
-cd D:\AI_Apps\Aegis
+cd <aegis-checkout>
 npm install
 npm run tauri:build
 ```
@@ -46,7 +46,7 @@ Keep `CARGO_TARGET_DIR` off the FAT32 `D:` drive, for example `set CARGO_TARGET_
 
 Android (from `src-tauri/AGENTS.md`, build section, gotchas 8 and 9, and its debug-build warning):
 
-- `npm run android:build -- --target aarch64` builds an arm64-only **debug** APK. It needs **JDK 21** (Gradle 8.14.3 and AGP 8.11.0 fail under JDK 25, and the JDK 17 on this PC may be too old too, so check before you start). Set `JAVA_HOME` to a JDK 21 (for example Android Studio's JBR).
+- `npm run android:build -- --target aarch64` builds an arm64-only **debug** APK. It needs **JDK 21** (Gradle 8.14.3 and AGP 8.11.0 fail under JDK 25, and the JDK 17 on the desktop may be too old too, so check before you start). Set `JAVA_HOME` to a JDK 21 (for example Android Studio's JBR).
 - A debug build installs as **`com.aegis.browser.debug`**, side by side with any release `com.aegis.browser`. Launch the `.debug` one, and confirm `adb shell dumpsys package com.aegis.browser.debug` shows a `lastUpdateTime` that moved after the install; otherwise you may be testing an old binary.
 - A release APK needs `keystore.properties`, or `AEGIS_ALLOW_DEBUG_SIGNED_RELEASE=1` for a debug-key sideload.
 - Install with `adb install -r <apk>` (not run by the agent).
@@ -67,7 +67,7 @@ Record the date, the device, the network and the result of each in the table.
 
 1. **Build and deploy `aegis-sync`; it runs on both nodes.** Build as above and deploy with the full command above (`meshd deploy wasm sync <file> --memory-mb 64 --timeout-ms 30000 --max-body 8388608`), or from the desktop app and then set the limits on the service's Limits screen. Pass: Services lists `sync` on the PC and on the phone within 30 s; `http://127.0.0.1:7801/healthz` answers 200 in the PC browser, and the same URL answers 200 in the phone browser; `meshd services` shows `64 MB / 30000 ms / 8388608 B` for `sync`.
 2. **Aegis desktop: set the URL; register (owner).** Start the Aegis build from `feat/sync-core`. Settings, Sync: type `http://127.0.0.1:7801` into the URL field, then Set up sync (a passphrase is optional) and register. Pass: the URL field holds `http://127.0.0.1:7801`, sync status is OK, and the Devices list shows this device as "(this device) (owner)".
-3. **Aegis on the S23: set the URL; register; approve on the desktop.** First, wait until the phone's Meshnode node has the desktop's registration from step 2. With both nodes online, the desktop Meshnode app's Home must show the phone's card with **Sync: Up to date** (or `meshd members` on the PC shows `0` in the phone's `LAG` column). This means the phone holds every op the PC has. Do not go on before that: a phone node that has not yet seen the account sees a brand-new account, and the phone then joins as a full member **without approval** (spec §5.2), so this step's pass criterion fails in a confusing way. Then on the phone install the Aegis debug APK; Settings, Sync: type `http://127.0.0.1:7801` into the URL field, then restore the **same account** from the recovery phrase of step 2. Pass: the phone shows "waiting for approval"; on the desktop, Settings, Sync, Devices lists the phone as waiting and **Approve** is available. After you press Approve and then **Sync now** on the phone, the phone is an approved member within 60 s. Record the seconds.
+3. **Aegis on the phone: set the URL; register; approve on the desktop.** First, wait until the phone's Meshnode node has the desktop's registration from step 2. With both nodes online, the desktop Meshnode app's Home must show the phone's card with **Sync: Up to date** (or `meshd members` on the PC shows `0` in the phone's `LAG` column). This means the phone holds every op the PC has. Do not go on before that: a phone node that has not yet seen the account sees a brand-new account, and the phone then joins as a full member **without approval** (spec §5.2), so this step's pass criterion fails in a confusing way. Then on the phone install the Aegis debug APK; Settings, Sync: type `http://127.0.0.1:7801` into the URL field, then restore the **same account** from the recovery phrase of step 2. Pass: the phone shows "waiting for approval"; on the desktop, Settings, Sync, Devices lists the phone as waiting and **Approve** is available. After you press Approve and then **Sync now** on the phone, the phone is an approved member within 60 s. Record the seconds.
 4. **Sync bookmarks both ways.** Add a bookmark on the desktop and a different one on the phone; Sync now on each. Pass: each bookmark shows on the other device within 60 s. Delete one on each side and check that the deletes arrive too.
 5. **Airplane mode (success criterion 4).** Turn on airplane mode on the phone (the Meshnode node and Aegis keep running). Edit on both: add 3 or more bookmarks on each, edit one existing bookmark on both, delete one on each. Turn airplane mode off, wait for the Meshnode phone to rejoin (Home shows the PC online), then Sync now on both. Pass: both devices show the **same** bookmark set, with the same winner for the bookmark edited on both. Record the time from reconnect to convergence.
 6. **Revoke the phone from the desktop, then remove it from the mesh.** Aegis revocation alone does not cut off a device that is itself a mesh member (see "Where things are in Aegis", Devices), so this step does both.
@@ -94,15 +94,15 @@ Record the date, the device, the network and the result of each in the table.
 
 | Date | Device | Network | Step or check | Result | Notes |
 |---|---|---|---|---|---|
-| | PC + S23 | | 1 build and deploy; runs on both nodes | | |
+| | PC + phone | | 1 build and deploy; runs on both nodes | | |
 | | PC | | 2 Aegis desktop: URL, register (owner) | | |
-| | S23 | | 3 Aegis phone: URL, register, approve | | seconds to approved: |
-| | PC + S23 | | 4 bookmarks both ways | | |
-| | PC + S23 | | 5 airplane mode, converge | | seconds from reconnect: |
-| | PC + S23 | | 6a revoke the phone in Aegis | | seconds to refusal: |
-| | PC + S23 | | 6b remove the phone from the mesh | | phone shows removed; no new records arrive |
+| | Phone | | 3 Aegis phone: URL, register, approve | | seconds to approved: |
+| | PC + phone | | 4 bookmarks both ways | | |
+| | PC + phone | | 5 airplane mode, converge | | seconds from reconnect: |
+| | PC + phone | | 6a revoke the phone in Aegis | | seconds to refusal: |
+| | PC + phone | | 6b remove the phone from the mesh | | phone shows removed; no new records arrive |
 | | PC (release builds) | localhost | large first sync | | records / seconds: |
-| | S23 | localhost | Android plain HTTP to 127.0.0.1:7801 | | |
+| | Phone | localhost | Android plain HTTP to 127.0.0.1:7801 | | |
 | | PC | | open-registration warning, once per day | | |
 | | GitHub | | new CI jobs, Aegis `sync-server` and `msrv` (after push) | | |
 

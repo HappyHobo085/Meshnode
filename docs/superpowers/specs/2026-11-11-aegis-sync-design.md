@@ -1,7 +1,7 @@
 # Sub-spec 7: Aegis sync port (`aegis-sync-core`, `services/aegis-sync`, Aegis client changes)
 
 > Master spec: `docs/superpowers/specs/2026-11-08-meshnode-design.md` (§11, §14 row 7, success criteria 3–4).
-> Previous sub-spec: `2026-11-11-tauri-ui-design.md`. Second repo: `D:/AI_Apps/Aegis` (GitHub
+> Previous sub-spec: `2026-11-11-tauri-ui-design.md`. Second repo: a local Aegis checkout (GitHub
 > `HappyHobo085/Aegis`), whose `AGENTS.md` files are living docs updated in the same commit as the code.
 
 ## 1. Intent
@@ -165,10 +165,10 @@ in-process; the identical vector set as Aegis.
 Meshnode: a job that installs `wasm32-wasip2`, builds the service, runs §8.2–8.4, and the vendored check. Aegis:
 §2.3.
 
-### 8.6 Manual check (`docs/manual-checks/sub-spec-7.md`, owner, Windows + S23)
+### 8.6 Manual check (`docs/manual-checks/sub-spec-7.md`, owner, Windows + phone)
 1. Build and deploy `aegis-sync` from the desktop UI; it runs on both nodes.
 2. Aegis desktop: accept the Meshnode suggestion; register (owner).
-3. Aegis on the S23: accept the suggestion; register; approve it on desktop.
+3. Aegis on the phone: accept the suggestion; register; approve it on desktop.
 4. Sync bookmarks both ways.
 5. Airplane mode on the phone; edit on both; reconnect; both converge to the same set (success criterion 4).
 6. Revoke the phone from desktop; the phone is refused within 60 s of the change reaching it.

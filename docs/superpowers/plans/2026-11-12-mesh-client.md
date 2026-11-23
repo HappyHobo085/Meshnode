@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Branch `feat/mesh-client` in `D:/AI_Apps/Meshnode`; git needs `-c safe.directory=D:/AI_Apps/Meshnode`. Never push.
+- Branch `feat/mesh-client` in `<meshnode-checkout>`; git needs `-c safe.directory=<meshnode-checkout>`. Never push.
 - Build env: `CARGO_TARGET_DIR=$LOCALAPPDATA/meshnode-target`, `CARGO_INCREMENTAL=0`, `-j 2`. C: fills up — deleting `$LOCALAPPDATA/meshnode-target/debug` is allowed; build Android/FFI in a separate target dir only if needed.
 - Safety: never install/start/stop OS services, never elevate, never touch real data dirs, never run `#[ignore]` tests, never `adb`/touch a device. Never run `tauri android init --force`.
 - Licence `AGPL-3.0-only` for new crates (`license.workspace = true`).
@@ -155,7 +155,7 @@
 - Produces (UniFFI, proc-macro style like `mesh-ffi`): object `MeshClient` with async constructors `join(dir, ticket, options)` / `open(dir, options)`, async `request(service, req: MeshRequest) -> MeshResponse`, `invite(role: MeshRole, ttl_secs: u64) -> String`, `remove(id: String)`, `shutdown()`; sync `status() -> MeshStatus`, `members() -> Vec<MeshMember>`, `services() -> Vec<MeshService>`; `set_listener(listener: Box<dyn MeshClientListener>)` delivering `MeshEvent`; records `MeshRequest { method, path, headers: Vec<MeshHeader>, body: Vec<u8> }`, `MeshResponse { status: u16, headers, body }`; error `MeshClientException` mirroring `ClientError`. Package `net.meshnode.client`, cdylib `mesh_client_ffi`.
 - `scripts/gen-client-bindings.sh [--check]`: builds the host cdylib, generates Kotlin into `crates/mesh-client-ffi/kotlin`, `--check` diffs against the committed copy (UNIFFI_NO_FORMAT=1 as in `apps/android/gen-bindings.sh`).
 - `scripts/build-client-aar.sh`: `cargo ndk -t arm64-v8a -t x86_64 build --release -p mesh-client-ffi`, then zips `jni/<abi>/libmesh_client_ffi.so`, `classes.jar` (compiled bindings) and a minimal `AndroidManifest.xml` into `dist/mesh-client.aar`.
-- **JVM test decision (pins spec §6.4):** first try a JVM test that loads the HOST cdylib (Windows `mesh_client_ffi.dll` / Linux `.so`) via `jna.library.path`, starts nothing itself, and calls `MeshClient.join` with an invalid ticket expecting `MeshClientException.InvalidTicket`, plus `open` on an empty dir expecting `NotJoined` (proves loading, async bridging and error mapping without an in-process mesh). If the JVM toolchain is unavailable offline on this PC, the fallback is a Rust test of every exported function plus `--check` on the bindings; record which in the report.
+- **JVM test decision (pins spec §6.4):** first try a JVM test that loads the HOST cdylib (Windows `mesh_client_ffi.dll` / Linux `.so`) via `jna.library.path`, starts nothing itself, and calls `MeshClient.join` with an invalid ticket expecting `MeshClientException.InvalidTicket`, plus `open` on an empty dir expecting `NotJoined` (proves loading, async bridging and error mapping without an in-process mesh). If the JVM toolchain is unavailable offline on the desktop, the fallback is a Rust test of every exported function plus `--check` on the bindings; record which in the report.
 
 - [ ] **Step 1: Failing tests:** Rust `ffi_join_invalid_ticket_maps_error`, `ffi_request_roundtrip` (in-process host + SDK through the FFI types), `ffi_listener_receives_events`; the JVM test above.
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement**, generate bindings, build the Android `.so` for both ABIs once (`cargo ndk`), build the AAR once.

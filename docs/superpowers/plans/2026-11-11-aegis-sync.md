@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Two repos.** Meshnode `D:/AI_Apps/Meshnode` branch `feat/aegis-sync`; Aegis `D:/AI_Apps/Aegis` branch `feat/sync-core` (create from `main`). Git in each needs `-c safe.directory=<repo>`. **Never push either repo.** Aegis `AGENTS.md` files are living docs: update the relevant one in the same commit as the code.
+- **Two repos.** Meshnode `<meshnode-checkout>` branch `feat/aegis-sync`; Aegis (a local checkout) branch `feat/sync-core` (create from `main`). Git in each needs `-c safe.directory=<repo>`. **Never push either repo.** Aegis `AGENTS.md` files are living docs: update the relevant one in the same commit as the code.
 - Meshnode build env: `CARGO_TARGET_DIR=$LOCALAPPDATA/meshnode-target`, `CARGO_INCREMENTAL=0`, `-j 2`; C: is nearly full — deleting `$LOCALAPPDATA/meshnode-target/debug` is allowed. Aegis sync-server builds in its own `sync-server/target` (D: is FAT32 — if that fails, use `CARGO_TARGET_DIR=$LOCALAPPDATA/aegis-sync-target`).
 - Aegis sync-server CI uses `--locked`; regenerate `sync-server/Cargo.lock` once when the workspace is created and commit it. No new crates in the core beyond what the server's lockfile already holds; the core has **no axum, no tokio**.
 - `rust-version` of the core = the server's (`1.90.0`); Aegis's `msrv` job must read the core's too.
@@ -125,7 +125,7 @@
 
 - [ ] **Step 1:** Write the script with a self-test (`bash scripts/sync-aegis-core.sh --self-test` creates a temp git repo, copies, then `--check` passes and a tampered file fails).
 - [ ] **Step 2:** Run the self-test — FAIL, then implement — PASS.
-- [ ] **Step 3:** Vendor from `D:/AI_Apps/Aegis`; `--check` passes. Licence edits; `cargo metadata` shows no crate with a different licence except the vendored third-party ones.
+- [ ] **Step 3:** Vendor from a local Aegis checkout; `--check` passes. Licence edits; `cargo metadata` shows no crate with a different licence except the vendored third-party ones.
 - [ ] **Step 4: Run** fmt, root clippy, `cargo test --workspace --all-features -j 2` — PASS.
 - [ ] **Step 5: Commit** `chore: relicense Meshnode AGPL-3.0-only; vendor aegis-sync-core`.
 
@@ -172,5 +172,5 @@
 
 - [ ] **Step 1:** Write the manual check (spec §8.6 six steps; exact actions; pass criteria; results table; build/deploy commands; where Aegis's sync settings live; how to approve and revoke; note that the Aegis branch is unpushed and the APK must be built from it).
 - [ ] **Step 2:** Back-ports and reconciliations.
-- [ ] **Step 3:** Full verification: Meshnode fmt, root clippy, `cargo test --workspace --all-features -j 2`, the aegis-sync tests, `scripts/sync-aegis-core.sh --check D:/AI_Apps/Aegis`; Aegis `cargo test --locked --manifest-path sync-server/Cargo.toml` and its client tests.
+- [ ] **Step 3:** Full verification: Meshnode fmt, root clippy, `cargo test --workspace --all-features -j 2`, the aegis-sync tests, `scripts/sync-aegis-core.sh --check <aegis-checkout>`; Aegis `cargo test --locked --manifest-path sync-server/Cargo.toml` and its client tests.
 - [ ] **Step 4: Commit** `docs: sub-spec 7 manual check and back-ports`.

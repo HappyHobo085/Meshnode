@@ -1,6 +1,6 @@
 # Manual check: sub-spec 5 (Android shell)
 
-Run by the owner on the Galaxy S23 (Android 17) with a desktop mesh (sub-spec 5 §8.3). Until this is done, master spec §14 row 5 stays "implemented, manual check pending". Nothing in this document has been run on a device yet: the build agent never installs on any device.
+Run by the owner on the Android phone (Android 17) with a desktop mesh (sub-spec 5 §8.3). Until this is done, master spec §14 row 5 stays "implemented, manual check pending". Nothing in this document has been run on a device yet: the build agent never installs on any device.
 
 ## Build and install
 
@@ -71,7 +71,7 @@ The default is off (`[android] periodic_wake_s = 0` in `meshd.toml`). If in step
 
 | Date | Device / Android | Step or check | Pass/fail | Notes |
 |---|---|---|---|---|
-| | S23 / 17 | 1 install, onboarding | | |
+| | Phone / Android 17 | 1 install, onboarding | | |
 | | | 2 join | | |
 | | | 3 static site | | |
 | | | 4 reboot reconnect | | seconds |

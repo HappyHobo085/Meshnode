@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Workspace root `D:\AI_Apps\Meshnode\Cargo.toml`, `resolver = "3"`, crates under `crates/`. `spikes/` is **not** a workspace member (add `exclude = ["spikes"]`).
+- Workspace root `<meshnode-checkout>\Cargo.toml`, `resolver = "3"`, crates under `crates/`. `spikes/` is **not** a workspace member (add `exclude = ["spikes"]`).
 - `edition = "2024"`, `rust-version = "1.85"` in `[workspace.package]`; all dependency versions declared once in `[workspace.dependencies]`.
 - `MAX_SKEW_MS = 300_000`; `SETTLE = 7 days`; tombstone GC age = 90 days; stale threshold = 80 days; pending ops dropped after 24 h.
 - Size limits (checked on decode **and** on local writes): `ns` ≤ 64 bytes, `key`/`set` ≤ 512 bytes, `order` ≤ 64 bytes, `value`/`member` ≤ 1 MiB (1_048_576). **`ns`, `key` and `set` must not contain a `0x00` byte** (needed by the key encoding; added here, enforced in proto validation).
@@ -22,7 +22,7 @@
 - Ticket text: `"mesh1"` + base32 (RFC 4648, lower-case, no padding) of `1u8 ‖ postcard(InviteTicket) ‖ crc32(IEEE, big-endian, over the preceding bytes)`.
 - No `unwrap()`/`expect()` in non-test code paths that handle on-disk or network data; return `StoreError`/`ProtoError`.
 - Must compile for `aarch64-linux-android` (`cargo ndk -t arm64-v8a build -p mesh-store`).
-- Commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Git needs `-c safe.directory=D:/AI_Apps/Meshnode` on this machine.
+- Commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Git needs `-c safe.directory=<meshnode-checkout>` on this machine.
 
 ## Review Focus
 

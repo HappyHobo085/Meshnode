@@ -14,7 +14,7 @@ foreground service, boot/watchdog, and the power policy (master §14 row 5). Dec
 - **Approach A:** move `meshd`'s `Daemon` into a shared crate `mesh-host`; `mesh-ffi` wraps it; the Tauri app's
   Rust `cdylib` links `mesh-ffi`, so the Kotlin service and the webview share one `.so` and one node.
 
-**Assumptions (designer, not owner):** the owner's Galaxy S23 (Android 17) is the manual-check device; the
+**Assumptions (designer, not owner):** an Android 17 phone is the manual-check device; the
 phone joins a mesh founded on desktop (init on the phone is possible through the admin API but not exposed in
 the placeholder page); debug signing only.
 
@@ -22,7 +22,7 @@ the placeholder page); debug signing only.
 1. All tests in §8 pass on Windows; Linux CI is green, including the APK build job.
 2. After the move to `mesh-host`, every `meshd` test that existed at the start passes with only import-path
    changes; `meshd` behaviour is unchanged.
-3. The owner's manual check (§8.3) on the S23 is run and its results table filled in. The probe numbers decide
+3. The owner's manual check (§8.3) on the phone is run and its results table filled in. The probe numbers decide
    the `periodic_wake_s` default (§5.3).
 4. The master spec is back-ported (§9).
 
@@ -174,7 +174,7 @@ Probe output includes `connect=` (the fresh dial, reported separately from the e
 ### 8.2 Kotlin (JVM unit tests, no device)
 Restart decision table; notification text formatting.
 
-### 8.3 Manual check (`docs/manual-checks/sub-spec-5.md`, owner, S23)
+### 8.3 Manual check (`docs/manual-checks/sub-spec-5.md`, owner, phone)
 1. Install the debug APK; onboarding grants.
 2. Join an existing desktop mesh via the invite box.
 3. Desktop deploys a static site; the phone serves it at `http://<site>.mesh.localhost:7777` (phone browser).

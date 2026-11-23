@@ -14,7 +14,7 @@
 
 - Workspace: `edition = "2024"`, `rust-version = "1.90"`; new deps in `[workspace.dependencies]` with `.workspace = true`; Windows-only deps under `[target.'cfg(windows)'.dependencies]`.
 - Every task ends with `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all --check` passing; library crates also warning-free without features.
-- Git needs `git -c safe.directory=D:/AI_Apps/Meshnode`; branch `feat/gateway-admin-meshd`. Commit trailers as given by your own system instructions.
+- Git needs `git -c safe.directory=<meshnode-checkout>`; branch `feat/gateway-admin-meshd`. Commit trailers as given by your own system instructions.
 - All store access from async code via `StoreHandle`; no blocking file or socket calls on the async runtime (use tokio APIs or `spawn_blocking`).
 - Frames: `mesh_core::frame` codec (`u32` BE length + version byte + postcard). `httpfwd` frame cap 64 MiB + 64 KiB; admin frame cap 64 MiB.
 - Values: gateway `127.0.0.1:7777`, default port map `7801 → "sync"`; 256 connections; 30 s header read; 60 s keep-alive; 64 MiB request-body cap; forward attempts 3, per-attempt timeout = `request_timeout_ms + 5 s`, forwarding semaphore 64; `httpfwd` stream read timeout 30 s, ≤ 256 streams per connection; ≤ 128 headers, ≤ 64 KiB header bytes, path ≤ 8 KiB; admin ≤ 16 connections, `FileData` ≤ 64 MiB, static upload ≤ 1 GiB, `LogsTail` ≤ 10 000 lines; shutdown bound 20 s; logs 7 daily files; memory budget default half of RAM capped at 4096 MiB.

@@ -14,7 +14,7 @@
 
 - Workspace: `edition = "2024"`, `rust-version = "1.90"`; new deps in `[workspace.dependencies]`, referenced with `.workspace = true`. wasmtime, wasmtime-wasi, wasmtime-wasi-http pinned to `50.0` (the spike's versions).
 - Every task ends with `cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all --check` passing.
-- Git needs `git -c safe.directory=D:/AI_Apps/Meshnode`; branch `feat/runtime-services`. Commit trailers as given by your own system instructions.
+- Git needs `git -c safe.directory=<meshnode-checkout>`; branch `feat/runtime-services`. Commit trailers as given by your own system instructions.
 - `mesh-runtime` must not depend on `mesh-core` or `mesh-store`. `mesh-services` uses only `mesh-core`'s public API (plus Task 7's additions).
 - All store access from async code goes through `StoreHandle`; service KV writes only through its gated write methods.
 - Defaults: `Limits { memory_mb: 64, request_timeout_ms: 10_000, max_body_bytes: 8 * 1024 * 1024 }`, `Placement::AllHosts`, outbound empty, `max_in_flight = 64`, epoch tick 10 ms, deployer rescan 60 s, retry backoff 5 s → 300 s, blob GC hourly with a 24 h grace, static file cap 64 MiB, stdio line cap 4 KiB, `list-keys`/`set-members` host-side limit cap 1000.

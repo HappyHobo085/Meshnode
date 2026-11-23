@@ -16,7 +16,7 @@ Decisions the owner took in brainstorming (2026-11-16):
 - **Keys and builds are local.** Signing keys live on the owner's machines, outside the repo. No CI secrets,
   no GitHub Releases; the repo has no remote.
 - **The MSI is built on the owner's Windows install** (dual-boot on the same PC).
-- **E2E hardware:** this Nobara desktop (the Linux host node), the Galaxy S23 (Android host), and a Windows
+- **E2E hardware:** the Linux desktop (the Linux host node), the Android phone (Android host), and a Windows
   laptop (the MSI install and the client-role device for criterion 5).
 - **Upgrade in place, data kept**, on every platform.
 - **Compatibility across versions: detect and refuse cleanly**, no migrations and no mixed-version wire
@@ -32,7 +32,7 @@ Decisions the owner took in brainstorming (2026-11-16):
   signature), and every device starts from fresh data. The first 8b release is the baseline that later
   upgrades must keep. *(settled from the 8a decision; the checklist says so.)*
 
-Context: development moved from Windows (`D:\AI_Apps\Meshnode`) to Linux (`/mnt/storage/AI_Apps/Meshnode`,
+Context: development moved from Windows to Linux (same checkout, on the
 same FAT32 disk) on 2026-11-16. Windows-side builds keep the old rules: `CARGO_TARGET_DIR=%LOCALAPPDATA%\
 meshnode-target`, delete its `debug` folder before and after big runs, never run elevated tests on the
 owner's PC.
@@ -216,8 +216,8 @@ refuse, and the release rule (§5.1) must say how a future format change is dete
 ## 6. The §1 end-to-end run
 
 - `docs/e2e-checklist.md`: one section per §1 criterion, mapped to the three devices:
-  - **Desktop host:** this Nobara PC, installed from the `.rpm`.
-  - **Phone host:** the S23, release APK (sideloaded).
+  - **Desktop host:** the Linux desktop, installed from the `.rpm`.
+  - **Phone host:** the phone, release APK (sideloaded).
   - **Client:** the Windows laptop, installed from the MSI, joined with a client-role invite (criterion 5:
     desktop powered off, the laptop reaches every service by forwarding through the phone).
   - Criterion 2 includes the phone on mobile data at least once; criterion 7 is the 24 h screen-off battery
@@ -230,7 +230,7 @@ refuse, and the release rule (§5.1) must say how a future format change is dete
   manual check instead).
 - `docs/e2e-results.md`: the template (date, versions, device/OS, per-criterion pass/fail, measurements,
   notes). The implementer fills in nothing in it.
-- The implementer **never** runs adb, installs packages on this PC, starts/stops services, elevates, or runs
+- The implementer **never** runs adb, installs packages on the desktop, starts/stops services, elevates, or runs
   `#[ignore]` tests.
 
 ## 7. Verification without root or devices

@@ -8,8 +8,8 @@ Steps that need root, adb or Administrator are the owner's. `meshd` commands on 
 
 | Device | Role | Artifact | Notes |
 |---|---|---|---|
-| Desktop: this Nobara PC | host, founder | `.rpm` | Linux needs glibc 2.39 or later (Debian 13+, Ubuntu 24.04+, Fedora 40+) |
-| Phone: Galaxy S23 | host | release-signed APK, sideloaded | package `net.meshnode.app` |
+| Desktop: Linux | host, founder | `.rpm` | Linux needs glibc 2.39 or later (Debian 13+, Ubuntu 24.04+, Fedora 40+) |
+| Phone: Android | host | release-signed APK, sideloaded | package `net.meshnode.app` |
 | Laptop: Windows laptop | client (criterion 5) | MSI, unsigned | the user who runs the installer gets admin access |
 
 Order: 0, A, criteria 2, 1, 3, 4, 5, 7, 6, then Z. Criterion 1 needs the paired phone; criterion 6 removes the phone, so it runs last.
@@ -51,7 +51,7 @@ cp apps/android/keystore.properties.example apps/android/keystore.properties
 
 Then edit `apps/android/keystore.properties` and set `storePassword` and `keyPassword`. The keystore is PKCS12, so both are the password you gave keytool. `apps/android/keystore.properties` and `*.jks` are gitignored; never commit them. To keep the properties file outside the repo, point `MESHNODE_KEYSTORE_PROPERTIES` at it.
 
-**Back up `~/.config/meshnode/release.jks` and its password now**, somewhere off this PC. If you lose it, there are no more updates: only uninstall, which deletes the phone's data.
+**Back up `~/.config/meshnode/release.jks` and its password now**, somewhere off this machine. If you lose it, there are no more updates: only uninstall, which deletes the phone's data.
 
 ### 0.3 Build the artifacts
 
@@ -60,7 +60,7 @@ The repo is on FAT32, so keep the cargo target directory off it: `export CARGO_T
 The upgrade check (part A) needs an older build. Build 0.0.1 from the same commit in a scratch worktree, so the main checkout is never edited, then build the release in the main checkout:
 
 ```
-REPO=/mnt/storage/AI_Apps/Meshnode
+REPO="$(git rev-parse --show-toplevel)"   # run from the Meshnode checkout
 OLD="${TMPDIR:-/tmp}/meshnode-old"
 (
   set -e                                # any failure stops here, before anything runs in the main checkout
@@ -180,7 +180,7 @@ Record: row C3.
 
 ## Criterion 4: real use (Aegis)
 
-Aegis desktop on this PC and Aegis Android on the S23, each using **its own device's** gateway, `http://127.0.0.1:7801`. Build Aegis from its repo as its `AGENTS.md` says. The taps are in `docs/manual-checks/sub-spec-7.md` steps 2–5 (register on the desktop, restore on the phone, approve on the desktop, then sync). Type the URL into Aegis's sync settings.
+Aegis desktop on the desktop and Aegis Android on the phone, each using **its own device's** gateway, `http://127.0.0.1:7801`. Build Aegis from its repo as its `AGENTS.md` says. The taps are in `docs/manual-checks/sub-spec-7.md` steps 2–5 (register on the desktop, restore on the phone, approve on the desktop, then sync). Type the URL into Aegis's sync settings.
 
 Pass:
 - Bookmarks added on each device appear on the other.

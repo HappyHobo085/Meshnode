@@ -21,7 +21,7 @@
 - Reserved `httpfwd` service `_ping` → `204`. Saver + screen off: inbound `httpfwd` → `503 Service not yet replicated`.
 - Data dir on Android: `context.filesDir/meshnode`.
 - Desktop behaviour of `meshd` must not change. `cargo test --workspace --all-features -j 4`, clippy `-D warnings` (with and without features), `cargo fmt --check` stay green after every task.
-- Build env: D: is FAT32 — use `CARGO_TARGET_DIR=%LOCALAPPDATA%\meshnode-target`. Git: `git -c safe.directory=D:/AI_Apps/Meshnode`.
+- Build env: D: is FAT32 — use `CARGO_TARGET_DIR=%LOCALAPPDATA%\meshnode-target`. Git: `git -c safe.directory=<meshnode-checkout>`.
 - **Safety:** this is the owner's real Windows PC. Never install/start/stop/uninstall OS services, never write to system locations, never run `--ignored` tests. No device or emulator is required for any task; never `adb install` onto a device.
 - Commit trailers: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01VKLL6Rs4i1E9FwhqtXKgyB`.
 

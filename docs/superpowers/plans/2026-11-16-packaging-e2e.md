@@ -14,7 +14,7 @@
 
 - Branch `feat/packaging-e2e`. Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. NEVER push (no remote).
 - Linux build env: the repo is on FAT32 (`/mnt/storage`), so `export CARGO_TARGET_DIR=$HOME/.cache/meshnode-target CARGO_INCREMENTAL=0`; use `-j 4`.
-- Windows build env (Tasks 8, 12 only, on the owner's Windows install): `CARGO_TARGET_DIR=%LOCALAPPDATA%\meshnode-target`, delete its `debug` before and after big runs; git needs `-c safe.directory=D:/AI_Apps/Meshnode`.
+- Windows build env (Tasks 8, 12 only, on the owner's Windows install): `CARGO_TARGET_DIR=%LOCALAPPDATA%\meshnode-target`, delete its `debug` before and after big runs; git needs `-c safe.directory=<meshnode-checkout>`.
 - Never: install packages on the host PC, start/stop OS services, elevate/sudo, adb or touch a device, run `#[ignore]` tests, `tauri android init --force`, run Aegis src-tauri's full `cargo test`.
 - Never create, read or print a real keystore, key password or key path. No secrets in repo, logs or artifacts.
 - Product version source: `apps/meshd/Cargo.toml` `version` (today `0.1.0`); desktop and Android `Cargo.toml` + `tauri.conf.json` must equal it.
@@ -231,7 +231,7 @@
 
 **Content requirements:**
 - CONTRIBUTING release rule — spec §5.1 verbatim intent, naming `mesh_store::SCHEMA_VERSION`, the `/N` ALPNs, and that `meshnode/version` is frozen and JSON-extensible.
-- `docs/e2e-checklist.md` — spec §6: one section per §1 criterion 1–7, devices (Nobara desktop `.rpm`, S23 release APK, Windows laptop MSI as client), exact commands/taps, expected result, where to record. Preamble: fresh start (uninstall the debug APK first; it deletes its data), keystore creation command (`keytool -genkeypair -v -keystore ~/.config/meshnode/release.jks -alias meshnode -keyalg RSA -keysize 4096 -validity 10000`) + **back it up**, `sudo usermod -aG meshnode $USER` + re-login, SmartScreen "More info → Run anyway", rpm manual purge command. Install/upgrade-in-place/uninstall per artifact.
+- `docs/e2e-checklist.md` — spec §6: one section per §1 criterion 1–7, devices (Linux desktop `.rpm`, phone release APK, Windows laptop MSI as client), exact commands/taps, expected result, where to record. Preamble: fresh start (uninstall the debug APK first; it deletes its data), keystore creation command (`keytool -genkeypair -v -keystore ~/.config/meshnode/release.jks -alias meshnode -keyalg RSA -keysize 4096 -validity 10000`) + **back it up**, `sudo usermod -aG meshnode $USER` + re-login, SmartScreen "More info → Run anyway", rpm manual purge command. Install/upgrade-in-place/uninstall per artifact.
 - `docs/e2e-results.md` — template only (date, versions, devices/OS, per-criterion pass/fail, battery measurement, notes). Implementer fills in nothing.
 - `docs/manual-checks/sub-spec-8b.md` — what needs root/device/Windows: MSI install/upgrade/uninstall on the laptop (admin access works without elevation after install), APK signed build + install-over-upgrade, an incompatible-store refusal on each surface (copy a store, bump schema with a documented dev command), the container-test limitation if any.
 - [ ] **Step 1:** Write; every command in the docs must be one that exists (check `--help` / the scripts from Tasks 1–9).

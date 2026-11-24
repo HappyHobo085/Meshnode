@@ -5,7 +5,9 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, HANDLE,
+};
 use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::Security::{
     ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
@@ -29,17 +31,34 @@ fn wide(p: &Path) -> Vec<u16> {
 /// Renames `from` to `to` and returns only once the rename is on disk
 /// (`MOVEFILE_WRITE_THROUGH`). Without `replace` it fails with `AlreadyExists` if `to`
 /// exists.
+///
+/// While another handle has `to` open (a reader, an antivirus scan), replacing it fails
+/// with `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION` until that handle closes, so
+/// those are retried for up to about two seconds.
 pub(crate) fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+    const ATTEMPTS: u32 = 40;
     let mut flags = MOVEFILE_WRITE_THROUGH;
     if replace {
         flags |= MOVEFILE_REPLACE_EXISTING;
     }
     let (from, to) = (wide(from), wide(to));
-    // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive the call.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
-        return Err(io::Error::last_os_error());
+    let mut attempt = 1;
+    loop {
+        // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive the call.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } != 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        let transient = matches!(
+            err.raw_os_error().map(|c| c as u32),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+        );
+        if !transient || attempt == ATTEMPTS {
+            return Err(err);
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    Ok(())
 }
 
 /// The current process user's `TOKEN_USER` (its SID points into the returned buffer).

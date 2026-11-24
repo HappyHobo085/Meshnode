@@ -389,8 +389,12 @@ async fn service_kv_error_mapping() {
     let kv = ServiceKv::new(b.store().clone(), "web".into());
     kv.set("k", b"v".to_vec()).await.unwrap();
 
-    a.remove(b.node_id()).await.unwrap();
-    wait_until("b learns of removal", T, || {
+    // b signs itself out, so the removal record is its own. Removing b from a would race:
+    // a may close b with `REMOVED` before the record syncs, and b then stays
+    // `RefusedAsRemoved` with writes still allowed (node-core spec §3.3), which is not what
+    // this test checks.
+    b.remove(b.node_id()).await.unwrap();
+    wait_until("b shows its own sign-out", T, || {
         matches!(b.status(), NodeStatus::Removed { .. })
     })
     .await;

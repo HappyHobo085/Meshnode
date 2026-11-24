@@ -251,7 +251,9 @@ fn service_with(
                 data.display()
             );
             #[cfg(target_os = "linux")]
-            if std::env::var("SUDO_USER").is_ok_and(|u| !u.is_empty() && u != "root") {
+            if std::env::var("SUDO_USER").is_ok_and(|u| !u.is_empty() && u != "root")
+                || std::env::var("PKEXEC_UID").is_ok_and(|u| !u.is_empty() && u != "0")
+            {
                 say!("Log in again to use meshd's commands without sudo (group meshnode).");
             }
         }

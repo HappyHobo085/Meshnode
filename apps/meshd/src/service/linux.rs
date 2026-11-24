@@ -1,6 +1,6 @@
 //! systemd (spec §6.4): the binary in `/usr/local/bin/meshd`, a system user and group
-//! `meshnode` (the installing `$SUDO_USER` joins the group, which opens the admin socket to
-//! them), and the unit `/etc/systemd/system/meshnode.service`.
+//! `meshnode` (the installing user, `$SUDO_USER` or pkexec's `$PKEXEC_UID`, joins the group,
+//! which opens the admin socket to them), and the unit `/etc/systemd/system/meshnode.service`.
 //!
 //! [`unit_file`] is pure and compiled everywhere; the installer is Linux-only.
 
@@ -112,6 +112,40 @@ pub fn valid_user_name(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// The account that joins the `meshnode` group: `$SUDO_USER`, else the user `$PKEXEC_UID`
+/// names (resolved by `name_of`; pkexec is how the desktop app installs). `None` for root or
+/// when neither is set; an error, before anything changes, for a name unsafe for `usermod`.
+pub fn installing_user(
+    sudo_user: Option<&str>,
+    pkexec_uid: Option<&str>,
+    name_of: impl FnOnce(u32) -> Option<String>,
+) -> Result<Option<String>, String> {
+    let (user, source) = match (
+        sudo_user.filter(|u| !u.is_empty()),
+        pkexec_uid.filter(|u| !u.is_empty()),
+    ) {
+        (Some(user), _) => (user.to_owned(), "SUDO_USER"),
+        (None, Some(uid)) => {
+            let uid: u32 = uid
+                .parse()
+                .map_err(|_| format!("PKEXEC_UID {uid:?} is not a user id"))?;
+            if uid == 0 {
+                return Ok(None);
+            }
+            let name = name_of(uid).ok_or_else(|| format!("PKEXEC_UID {uid} has no account"))?;
+            (name, "PKEXEC_UID")
+        }
+        (None, None) => return Ok(None),
+    };
+    if user == "root" {
+        return Ok(None);
+    }
+    if !valid_user_name(&user) {
+        return Err(format!("{source} names {user:?}, not a valid user name"));
+    }
+    Ok(Some(user))
+}
+
 #[cfg(target_os = "linux")]
 pub(super) use installer::{install, installed, start, status, stop, uninstall};
 
@@ -123,7 +157,7 @@ mod installer {
         INSTALLED_BINARY, install_binary, output, read_registration, remove_file, run, write_file,
     };
     use super::super::{Installed, SERVICE_NAME, ServiceError, ServiceStatus, io_err};
-    use super::{data_dir_from_unit, unit_file, valid_user_name};
+    use super::{data_dir_from_unit, installing_user, unit_file};
 
     const UNIT_PATH: &str = "/etc/systemd/system/meshnode.service";
     /// Where the deb/rpm installs its unit.
@@ -157,19 +191,15 @@ mod installer {
             return Err(ServiceError::AlreadyInstalled);
         }
         // Checked before anything changes; it is passed to usermod.
-        let sudo_user = match std::env::var("SUDO_USER") {
-            Ok(user) if user.is_empty() || user == "root" => None,
-            Ok(user) if valid_user_name(&user) => Some(user),
-            Ok(user) => {
-                return Err(ServiceError::Failed(format!(
-                    "SUDO_USER {user:?} is not a valid user name; nothing was installed"
-                )));
-            }
-            Err(_) => None,
-        };
+        let installing = installing_user(
+            std::env::var("SUDO_USER").ok().as_deref(),
+            std::env::var("PKEXEC_UID").ok().as_deref(),
+            user_name_of,
+        )
+        .map_err(|e| ServiceError::Failed(format!("{e}; nothing was installed")))?;
         install_binary()?;
         ensure_account()?;
-        if let Some(user) = sudo_user {
+        if let Some(user) = installing {
             run("usermod", &["-aG", SERVICE_NAME, "--", &user])?;
         }
         if data != Path::new(STATE_DIRECTORY) {
@@ -187,6 +217,16 @@ mod installer {
         )?;
         run("systemctl", &["daemon-reload"])?;
         run("systemctl", &["enable", "--now", SERVICE_NAME])
+    }
+
+    /// The name of the account `uid` (`getent passwd`), if there is one.
+    fn user_name_of(uid: u32) -> Option<String> {
+        let out = output("getent", &["passwd", &uid.to_string()]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        line.split(':').next().map(str::to_owned)
     }
 
     /// The system user `meshnode` with its own group (reusing a group of that name).
@@ -351,5 +391,27 @@ mod tests {
         ] {
             assert!(!valid_user_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn installing_user_from_sudo_or_pkexec() {
+        let name_of = |uid: u32| (uid == 1000).then(|| "alice".to_owned());
+        let user = |sudo, pkexec| installing_user(sudo, pkexec, name_of);
+        // sudo names the user; it wins over pkexec.
+        assert_eq!(user(Some("bob"), Some("1000")), Ok(Some("bob".into())));
+        // pkexec (the desktop app's install) gives a uid.
+        assert_eq!(user(None, Some("1000")), Ok(Some("alice".into())));
+        assert_eq!(user(Some(""), Some("1000")), Ok(Some("alice".into())));
+        // Root, or neither: nobody joins.
+        assert_eq!(user(Some("root"), None), Ok(None));
+        assert_eq!(user(None, Some("0")), Ok(None));
+        assert_eq!(user(None, None), Ok(None));
+        assert_eq!(user(None, Some("")), Ok(None));
+        // Refused before anything changes.
+        assert!(user(Some("-rf"), None).is_err());
+        assert!(user(None, Some("12x")).is_err());
+        assert!(user(None, Some("4242")).is_err());
+        let bad_name = installing_user(None, Some("1000"), |_| Some("Bad Name".into()));
+        assert!(bad_name.is_err());
     }
 }
